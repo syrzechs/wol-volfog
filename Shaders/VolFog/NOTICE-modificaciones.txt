@@ -128,3 +128,15 @@ Modifications (GPLv3 section 5a), dated
     compensation constant of both composition shaders is the glow of the client (FrameInputs::clientGlowAmount, 0 unless ffxGlow is on and the glow is
     the active screen effect), the GlowCompensation of coa-vfog (renderer.cpp:1374, 1496); the temporal history is dropped when the lit / unlit march
     variant changes or the light texture is made anew. No shader source changed.
+
+2026-10-20  Brief B13 (World of Legends, native volumetric fog, phase 3: MSAA with the readable depth).
+  - Engine/Source/VolFog/VolFogResz.cpp (new, derived from src/msaa_depth.cpp, src/fullscreen_triangle.h, shaders/vf_fullscreen_vs.hlsl and
+    shaders/vf_depth_check.hlsl of 205ade5): the RESZ resolve (ResolveThroughResz: INTZ in stage 0, a dummy point with Z and colour writes off, the writes
+    back on, D3DRS_POINTSIZE = 0x7FA05000) and the self-test (two known depths written to the multisampled depth, resolved, read back through a small
+    R32F target, twice with the halves swapped). Changes: the device state is saved and restored with a D3DSBT_ALL state block (the client creates a pure
+    device; coa-vfog's per-state Get* lists cannot work there), the two tiny shaders are embedded as vs_2_0 / ps_2_0 tokens (fxc output of the same two
+    HLSL files with tex2D, no build step), the small target is unbound before GetRenderTargetData, and the self-test and the per-frame resolve share one
+    code path. The NvAPI path of msaa_depth.cpp is not ported (NVIDIA's SDK is not downloaded); the hook point is documented in VolFogDepth.cpp (WOL_NVAPI).
+  - Engine/Source/VolFog/VolFogDepth.cpp: the "MSAA + copy" mode (INTZ is a copy of the multisampled AutoDepthStencil, refreshed by ResolveDepth() at the
+    start of VolFog::Render()); a D24X8 request becomes D24S8 for the multisampled depth, as coa-vfog does. Not in coa-vfog: the copy mode is refused when
+    d3d9.dll is the system (native) copy, because the RESZ trigger hangs the GPU of the AMD RX 9070 XT there (see the comment in the file).

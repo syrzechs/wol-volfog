@@ -34,7 +34,7 @@ defecto; con 0 la imagen es la del cliente sin el módulo). Licencia: **GPL-3.0-
 
 ```
 LICENSE, NOTICE, README.md, aplicar.ps1, .gitattributes
-patches/                      16 parches en el orden de aplicación (00a-00e prerrequisitos WoL, 01-B1 ... 11-B10)
+patches/                      17 parches en el orden de aplicación (00a-00e prerrequisitos WoL, 01-B1 ... 12-B13)
 cambios-cliente.diff          lo que los parches cambian FUERA del módulo (16 ficheros), en un solo diff
 Engine/Source/VolFog/         el módulo C++ (pase de niebla, modelo, luces, haces, entradas, volcado, textura INTZ)
 Shaders/VolFog/               los HLSL, el CMake de la cadena fxc -> .bls -> MPQ, LICENSE y NOTICE-modificaciones.txt
@@ -64,7 +64,7 @@ Requisitos: Windows, Visual Studio 2022 (x64), CMake, Git, **Windows SDK** (para
    .\aplicar.ps1 -Destino C:\ruta\wowdecomp -Revertir       # deshace los 11 en orden inverso (git apply -R)
    ```
    Orden de los parches: `B1` formatos Gx, `B2` shaders y pase base, `B3` depth INTZ, `B3b` correcciones, `B4B5` CVars y modelo, `B6`
-   marcha y composición, `B7` filtro temporal, `B6b` correcciones, `B8` luces, `B9` haces, `B10` interiores y ajustes. Los parches están
+   marcha y composición, `B7` filtro temporal, `B6b` correcciones, `B8` luces, `B9` haces, `B10` interiores y ajustes, `B13` MSAA con la niebla (el depth legible pasa a ser una copia RESZ del depth multimuestra; solo con DXVK, en D3D9 nativo de AMD el RESZ bloquea la GPU y se vuelve a MSAA 1 con aviso). Los parches están
    en LF (lo que da `git diff` con `core.autocrlf=true`); el script reintenta con `--ignore-whitespace` si tu árbol está en CRLF sin `autocrlf`.
 3. Compila:
    ```powershell
@@ -80,7 +80,7 @@ Requisitos: Windows, Visual Studio 2022 (x64), CMake, Git, **Windows SDK** (para
 
 ### Prerrequisitos
 
-La secuencia `B1…B10` se escribió sobre un `wowdecomp` que ya llevaba los parches previos de World of Legends (`recordar-contrasena`, `topes-2008`, `sombras-4096`, `ui-depth`, `sin-consola`: CVars `wol*`, mapa de sombras, profundidad de la interfaz, sin consola de depuración), y varios hunks dependen de ellos. Van incluidos en `patches/00a…00e` y `aplicar.ps1` los aplica primero; sobre un `wowdecomp` limpio la secuencia completa son 16 parches. Esos cinco parches son código de World of Legends y se publican aquí bajo la misma licencia.
+La secuencia `B1…B10` se escribió sobre un `wowdecomp` que ya llevaba los parches previos de World of Legends (`recordar-contrasena`, `topes-2008`, `sombras-4096`, `ui-depth`, `sin-consola`: CVars `wol*`, mapa de sombras, profundidad de la interfaz, sin consola de depuración), y varios hunks dependen de ellos. Van incluidos en `patches/00a…00e` y `aplicar.ps1` los aplica primero; sobre un `wowdecomp` limpio la secuencia completa son 17 parches. Esos cinco parches son código de World of Legends y se publican aquí bajo la misma licencia.
 
 ## Uso
 

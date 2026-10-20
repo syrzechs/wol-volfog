@@ -3,6 +3,8 @@
 # DayNight::UpdateFog, the CVars). One diff, 16 files, 46 hunks, made on wowdecomp 0e4e9fe plus our other local client patches.
 # Context lines come from that tree: on a clean wowdecomp 41 hunks apply and 5 (CVar registration, next to our other wol* CVars) need
 # placing by hand (git apply --reject). Lines before the first "diff --git" are ignored by git apply.
+# Brief B13 (patch 12): the last sections of this file (CGxDeviceD3d.cpp, CGxDeviceD3d9Ex.cpp, WorldParam_CVar.cpp, again) are the B13 hunks; git apply takes them after the
+# sections above, in file order, so apply the whole file or none of it.
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 468c8c4..c2421a6 100644
 --- a/CMakeLists.txt
@@ -846,3 +848,152 @@ index 999d6de..51d3177 100644
      CWorldParam::cvar_farClipOverride = CVar::Register("farClipOverride", "Override old world graphic settings", 1, "0", CWorldParam::FarClipOverrideCallback, CATEGORY_GRAPHICS, false, nullptr, false);
      CWorldParam::cvar_lod = CVar::Register("lod", "Video option: Toggle Lod", 1, "0", CWorldParam::LodCallback, CATEGORY_GRAPHICS, false, nullptr, false);
      CWorldParam::cvar_mapShadows = CVar::Register("mapShadows", "Video option: Toggle map shadows", 1, "1", CWorldParam::MapShadowsCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+diff --git a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+index afef1ab..ab60768 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+@@ -2249,13 +2249,27 @@ void CGxDeviceD3d::ISetPresentParms(D3DPRESENT_PARAMETERS& d3dpp, const CGxForma
+     // ignored while the depth is wanted (design 1.2). EnableAutoDepthStencil stays on: it is the fallback if the texture fails.
+     // Brief B3b: asks CheckDeviceFormat itself (the caps in VolFog::s_caps do not exist yet on the first device of a run).
+     if (format.m_multisampleCount > 1 && VolFog::WantsReadableDepthFor(this->m_d3d, d3dpp.BackBufferFormat)) {
+-        static const char* const s_multisampleIgnored = "wolVolFog: gxMultisample ignorado (el depth legible no admite MSAA)";
+-        CGxDevice::Log("%s", s_multisampleIgnored);
+-        VolFog::Message(s_multisampleIgnored);
+-        d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+-        d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
+-        d3dpp.MultiSampleQuality = 0;
+-        return;
++        // Brief B13: with RESZ (AMD, DXVK) the MSAA is kept: the multisampled AutoDepthStencil stays the depth of the device and the INTZ
++        // becomes a copy of it that VolFog::ResolveDepth refreshes every frame (VolFogDepth.cpp, VolFogResz.cpp). Without RESZ, or after a
++        // failed self-test of it, the MSAA is dropped as in B3b and the INTZ is the main depth.
++        uint32_t msaaDepthFormat = static_cast<uint32_t>(d3dpp.AutoDepthStencilFormat);
++        const char* msaaMessage = "";
++
++        if (VolFog::PrepareMsaaCopy(this->m_d3d, d3dpp.BackBufferFormat, format.m_window != 0, static_cast<uint32_t>(format.m_multisampleCount), &msaaDepthFormat, &msaaMessage)) {
++            d3dpp.AutoDepthStencilFormat = static_cast<D3DFORMAT>(msaaDepthFormat);
++            CGxDevice::Log("wolVolFog: gxMultisample %d kept (MSAA + RESZ copy of the depth, depth format %d)", static_cast<int>(format.m_multisampleCount), static_cast<int>(d3dpp.AutoDepthStencilFormat));
++        } else {
++            CGxDevice::Log("%s", msaaMessage);
++
++            if (!VolFog::ReszBroken()) {
++                VolFog::Message(msaaMessage); // after a failed self-test the console already said it
++            }
++
++            d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
++            d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
++            d3dpp.MultiSampleQuality = 0;
++            return;
++        }
+     }
+ 
+     if (format.m_multisampleCount <= 1) {
+@@ -2502,7 +2516,9 @@ void CGxDeviceD3d::ISetCaps(const CGxFormat& format) {
+     VolFog::s_caps.abgr16f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr16F]) == D3D_OK;
+     VolFog::s_caps.abgr32f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr32F]) == D3D_OK;
+     VolFog::s_caps.ps30Slots = this->m_d3dCaps.MaxPixelShader30InstructionSlots;
+-    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots);
++    // Brief B13: RESZ, the driver's depth resolve (AMD, Intel; DXVK reports it too). NvAPI (NVIDIA's native driver) is a documented hook point in VolFogDepth.cpp.
++    VolFog::s_caps.resz = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, static_cast<D3DFORMAT>(MAKEFOURCC('R', 'E', 'S', 'Z'))) == D3D_OK;
++    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u RESZ=%d", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots, VolFog::s_caps.resz ? 1 : 0);
+ 
+     this->m_caps.m_colorWrite = (this->m_d3dCaps.PrimitiveMiscCaps & D3DPMISCCAPS_COLORWRITEENABLE) != 0;
+     this->m_caps.m_hwCursor = this->m_d3dCaps.CursorCaps & D3DCURSORCAPS_COLOR;
+@@ -2852,6 +2868,16 @@ int32_t CGxDeviceD3d::DeviceSetFormat(const CGxFormat& format) {
+ 
+     if (this->ICreateWindow(createFormat) && this->ICreateD3dDevice(createFormat) && CGxDevice::DeviceSetFormat(createFormat)) {
+         this->ISetWindowFocus(1);
++
++        // Not in the original client (brief B13): the device came up multisampled and the RESZ self-test of the fog failed (it says so in
++        // gx.log and the console). Build it again at once: ISetPresentParms now drops the MSAA (VolFog::PrepareMsaaCopy refuses after a failed
++        // self-test), so this recursion happens at most once.
++        if (VolFog::TakeDeviceRestart()) {
++            CGxDevice::Log("wolVolFog: rebuilding the device without MSAA");
++
++            return this->DeviceSetFormat(format);
++        }
++
+         return 1;
+     }
+ 
+diff --git a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+index 29c9d1b..3b8dcb5 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+@@ -2255,13 +2255,27 @@ void CGxDeviceD3d9Ex::ISetPresentParms(D3DPRESENT_PARAMETERS& d3dpp, const CGxFo
+     // ignored while the depth is wanted (design 1.2). EnableAutoDepthStencil stays on: it is the fallback if the texture fails.
+     // Brief B3b: asks CheckDeviceFormat itself (the caps in VolFog::s_caps do not exist yet on the first device of a run).
+     if (format.m_multisampleCount > 1 && VolFog::WantsReadableDepthFor(this->m_d3d, d3dpp.BackBufferFormat)) {
+-        static const char* const s_multisampleIgnored = "wolVolFog: gxMultisample ignorado (el depth legible no admite MSAA)";
+-        CGxDevice::Log("%s", s_multisampleIgnored);
+-        VolFog::Message(s_multisampleIgnored);
+-        d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+-        d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
+-        d3dpp.MultiSampleQuality = 0;
+-        return;
++        // Brief B13: with RESZ (AMD, DXVK) the MSAA is kept: the multisampled AutoDepthStencil stays the depth of the device and the INTZ
++        // becomes a copy of it that VolFog::ResolveDepth refreshes every frame (VolFogDepth.cpp, VolFogResz.cpp). Without RESZ, or after a
++        // failed self-test of it, the MSAA is dropped as in B3b and the INTZ is the main depth.
++        uint32_t msaaDepthFormat = static_cast<uint32_t>(d3dpp.AutoDepthStencilFormat);
++        const char* msaaMessage = "";
++
++        if (VolFog::PrepareMsaaCopy(this->m_d3d, d3dpp.BackBufferFormat, format.m_window != 0, static_cast<uint32_t>(format.m_multisampleCount), &msaaDepthFormat, &msaaMessage)) {
++            d3dpp.AutoDepthStencilFormat = static_cast<D3DFORMAT>(msaaDepthFormat);
++            CGxDevice::Log("wolVolFog: gxMultisample %d kept (MSAA + RESZ copy of the depth, depth format %d)", static_cast<int>(format.m_multisampleCount), static_cast<int>(d3dpp.AutoDepthStencilFormat));
++        } else {
++            CGxDevice::Log("%s", msaaMessage);
++
++            if (!VolFog::ReszBroken()) {
++                VolFog::Message(msaaMessage); // after a failed self-test the console already said it
++            }
++
++            d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
++            d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
++            d3dpp.MultiSampleQuality = 0;
++            return;
++        }
+     }
+ 
+     if (format.m_multisampleCount <= 1) {
+@@ -2508,7 +2522,9 @@ void CGxDeviceD3d9Ex::ISetCaps(const CGxFormat& format) {
+     VolFog::s_caps.abgr16f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr16F]) == D3D_OK;
+     VolFog::s_caps.abgr32f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr32F]) == D3D_OK;
+     VolFog::s_caps.ps30Slots = this->m_d3dCaps.MaxPixelShader30InstructionSlots;
+-    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots);
++    // Brief B13: RESZ, the driver's depth resolve (AMD, Intel; DXVK reports it too). NvAPI (NVIDIA's native driver) is a documented hook point in VolFogDepth.cpp.
++    VolFog::s_caps.resz = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, static_cast<D3DFORMAT>(MAKEFOURCC('R', 'E', 'S', 'Z'))) == D3D_OK;
++    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u RESZ=%d", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots, VolFog::s_caps.resz ? 1 : 0);
+ 
+     this->m_caps.m_colorWrite = (this->m_d3dCaps.PrimitiveMiscCaps & D3DPMISCCAPS_COLORWRITEENABLE) != 0;
+     this->m_caps.m_hwCursor = this->m_d3dCaps.CursorCaps & D3DCURSORCAPS_COLOR;
+@@ -2817,6 +2833,16 @@ int32_t CGxDeviceD3d9Ex::DeviceSetFormat(const CGxFormat& format) {
+ 
+     if (this->ICreateWindow(createFormat) && this->ICreateD3dDevice(createFormat) && CGxDevice::DeviceSetFormat(createFormat)) {
+         this->ISetWindowFocus(1);
++
++        // Not in the original client (brief B13): the device came up multisampled and the RESZ self-test of the fog failed (it says so in
++        // gx.log and the console). Build it again at once: ISetPresentParms now drops the MSAA (VolFog::PrepareMsaaCopy refuses after a failed
++        // self-test), so this recursion happens at most once.
++        if (VolFog::TakeDeviceRestart()) {
++            CGxDevice::Log("wolVolFog: rebuilding the device without MSAA");
++
++            return this->DeviceSetFormat(format);
++        }
++
+         return 1;
+     }
+ 
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index daab4f2..a37cd5f 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -751,8 +751,8 @@ bool CWorldParam::WolVolFogCallback(CVar* var, const char* oldValue, const char*
+     bool changed = oldValue && *oldValue && g_theGxDevicePtr;
+ 
+     if (changed) {
+-        char buffer[160];
+-        SStrPrintf(buffer, sizeof(buffer), "wolVolFog: %d. Caps: INTZ=%s ABGR16F=%s ABGR32F=%s PS3.0 slots=%u", mode, VolFog::s_caps.intz ? "yes" : "no", VolFog::s_caps.abgr16f ? "yes" : "no", VolFog::s_caps.abgr32f ? "yes" : "no", VolFog::s_caps.ps30Slots);
++        char buffer[200];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFog: %d. Caps: INTZ=%s ABGR16F=%s ABGR32F=%s PS3.0 slots=%u RESZ=%s depth=%s", mode, VolFog::s_caps.intz ? "yes" : "no", VolFog::s_caps.abgr16f ? "yes" : "no", VolFog::s_caps.abgr32f ? "yes" : "no", VolFog::s_caps.ps30Slots, VolFog::s_caps.resz ? "yes" : "no", VolFog::DepthIsCopy() ? "MSAA+copy" : VolFog::DepthTexture() ? "main" : "none"); // brief B13: RESZ and the depth mode
+         ConsoleWrite(buffer, DEFAULT_COLOR);
+         CGxDevice::Log("%s", static_cast<const char*>(buffer)); // const char*: a char* would pick the va_list overload
+     }

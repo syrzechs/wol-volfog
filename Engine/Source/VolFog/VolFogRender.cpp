@@ -1158,6 +1158,12 @@ void VolFog::Render() {
         VolFog::SetFrameResult(true, false);
     }
 
+    // Brief B13: in the MSAA + copy mode the INTZ is refreshed from the multisampled depth here, once per frame and before any sub-pass (or
+    // wolVolFogDebug 1) reads it. Nothing happens in the other modes.
+    if (VolFog::s_mode > 0 && !VolFog::HardFailure()) {
+        VolFog::ResolveDepth();
+    }
+
     int32_t debugMode = VolFog::s_debugMode;
 
     if (debugMode == 1 || debugMode == 5) {

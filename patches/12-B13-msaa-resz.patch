@@ -1,0 +1,888 @@
+diff --git a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+index afef1ab..ab60768 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+@@ -2249,13 +2249,27 @@ void CGxDeviceD3d::ISetPresentParms(D3DPRESENT_PARAMETERS& d3dpp, const CGxForma
+     // ignored while the depth is wanted (design 1.2). EnableAutoDepthStencil stays on: it is the fallback if the texture fails.
+     // Brief B3b: asks CheckDeviceFormat itself (the caps in VolFog::s_caps do not exist yet on the first device of a run).
+     if (format.m_multisampleCount > 1 && VolFog::WantsReadableDepthFor(this->m_d3d, d3dpp.BackBufferFormat)) {
+-        static const char* const s_multisampleIgnored = "wolVolFog: gxMultisample ignorado (el depth legible no admite MSAA)";
+-        CGxDevice::Log("%s", s_multisampleIgnored);
+-        VolFog::Message(s_multisampleIgnored);
+-        d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+-        d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
+-        d3dpp.MultiSampleQuality = 0;
+-        return;
++        // Brief B13: with RESZ (AMD, DXVK) the MSAA is kept: the multisampled AutoDepthStencil stays the depth of the device and the INTZ
++        // becomes a copy of it that VolFog::ResolveDepth refreshes every frame (VolFogDepth.cpp, VolFogResz.cpp). Without RESZ, or after a
++        // failed self-test of it, the MSAA is dropped as in B3b and the INTZ is the main depth.
++        uint32_t msaaDepthFormat = static_cast<uint32_t>(d3dpp.AutoDepthStencilFormat);
++        const char* msaaMessage = "";
++
++        if (VolFog::PrepareMsaaCopy(this->m_d3d, d3dpp.BackBufferFormat, format.m_window != 0, static_cast<uint32_t>(format.m_multisampleCount), &msaaDepthFormat, &msaaMessage)) {
++            d3dpp.AutoDepthStencilFormat = static_cast<D3DFORMAT>(msaaDepthFormat);
++            CGxDevice::Log("wolVolFog: gxMultisample %d kept (MSAA + RESZ copy of the depth, depth format %d)", static_cast<int>(format.m_multisampleCount), static_cast<int>(d3dpp.AutoDepthStencilFormat));
++        } else {
++            CGxDevice::Log("%s", msaaMessage);
++
++            if (!VolFog::ReszBroken()) {
++                VolFog::Message(msaaMessage); // after a failed self-test the console already said it
++            }
++
++            d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
++            d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
++            d3dpp.MultiSampleQuality = 0;
++            return;
++        }
+     }
+ 
+     if (format.m_multisampleCount <= 1) {
+@@ -2502,7 +2516,9 @@ void CGxDeviceD3d::ISetCaps(const CGxFormat& format) {
+     VolFog::s_caps.abgr16f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr16F]) == D3D_OK;
+     VolFog::s_caps.abgr32f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr32F]) == D3D_OK;
+     VolFog::s_caps.ps30Slots = this->m_d3dCaps.MaxPixelShader30InstructionSlots;
+-    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots);
++    // Brief B13: RESZ, the driver's depth resolve (AMD, Intel; DXVK reports it too). NvAPI (NVIDIA's native driver) is a documented hook point in VolFogDepth.cpp.
++    VolFog::s_caps.resz = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, static_cast<D3DFORMAT>(MAKEFOURCC('R', 'E', 'S', 'Z'))) == D3D_OK;
++    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u RESZ=%d", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots, VolFog::s_caps.resz ? 1 : 0);
+ 
+     this->m_caps.m_colorWrite = (this->m_d3dCaps.PrimitiveMiscCaps & D3DPMISCCAPS_COLORWRITEENABLE) != 0;
+     this->m_caps.m_hwCursor = this->m_d3dCaps.CursorCaps & D3DCURSORCAPS_COLOR;
+@@ -2852,6 +2868,16 @@ int32_t CGxDeviceD3d::DeviceSetFormat(const CGxFormat& format) {
+ 
+     if (this->ICreateWindow(createFormat) && this->ICreateD3dDevice(createFormat) && CGxDevice::DeviceSetFormat(createFormat)) {
+         this->ISetWindowFocus(1);
++
++        // Not in the original client (brief B13): the device came up multisampled and the RESZ self-test of the fog failed (it says so in
++        // gx.log and the console). Build it again at once: ISetPresentParms now drops the MSAA (VolFog::PrepareMsaaCopy refuses after a failed
++        // self-test), so this recursion happens at most once.
++        if (VolFog::TakeDeviceRestart()) {
++            CGxDevice::Log("wolVolFog: rebuilding the device without MSAA");
++
++            return this->DeviceSetFormat(format);
++        }
++
+         return 1;
+     }
+ 
+diff --git a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+index 29c9d1b..3b8dcb5 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+@@ -2255,13 +2255,27 @@ void CGxDeviceD3d9Ex::ISetPresentParms(D3DPRESENT_PARAMETERS& d3dpp, const CGxFo
+     // ignored while the depth is wanted (design 1.2). EnableAutoDepthStencil stays on: it is the fallback if the texture fails.
+     // Brief B3b: asks CheckDeviceFormat itself (the caps in VolFog::s_caps do not exist yet on the first device of a run).
+     if (format.m_multisampleCount > 1 && VolFog::WantsReadableDepthFor(this->m_d3d, d3dpp.BackBufferFormat)) {
+-        static const char* const s_multisampleIgnored = "wolVolFog: gxMultisample ignorado (el depth legible no admite MSAA)";
+-        CGxDevice::Log("%s", s_multisampleIgnored);
+-        VolFog::Message(s_multisampleIgnored);
+-        d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+-        d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
+-        d3dpp.MultiSampleQuality = 0;
+-        return;
++        // Brief B13: with RESZ (AMD, DXVK) the MSAA is kept: the multisampled AutoDepthStencil stays the depth of the device and the INTZ
++        // becomes a copy of it that VolFog::ResolveDepth refreshes every frame (VolFogDepth.cpp, VolFogResz.cpp). Without RESZ, or after a
++        // failed self-test of it, the MSAA is dropped as in B3b and the INTZ is the main depth.
++        uint32_t msaaDepthFormat = static_cast<uint32_t>(d3dpp.AutoDepthStencilFormat);
++        const char* msaaMessage = "";
++
++        if (VolFog::PrepareMsaaCopy(this->m_d3d, d3dpp.BackBufferFormat, format.m_window != 0, static_cast<uint32_t>(format.m_multisampleCount), &msaaDepthFormat, &msaaMessage)) {
++            d3dpp.AutoDepthStencilFormat = static_cast<D3DFORMAT>(msaaDepthFormat);
++            CGxDevice::Log("wolVolFog: gxMultisample %d kept (MSAA + RESZ copy of the depth, depth format %d)", static_cast<int>(format.m_multisampleCount), static_cast<int>(d3dpp.AutoDepthStencilFormat));
++        } else {
++            CGxDevice::Log("%s", msaaMessage);
++
++            if (!VolFog::ReszBroken()) {
++                VolFog::Message(msaaMessage); // after a failed self-test the console already said it
++            }
++
++            d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
++            d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
++            d3dpp.MultiSampleQuality = 0;
++            return;
++        }
+     }
+ 
+     if (format.m_multisampleCount <= 1) {
+@@ -2508,7 +2522,9 @@ void CGxDeviceD3d9Ex::ISetCaps(const CGxFormat& format) {
+     VolFog::s_caps.abgr16f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr16F]) == D3D_OK;
+     VolFog::s_caps.abgr32f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr32F]) == D3D_OK;
+     VolFog::s_caps.ps30Slots = this->m_d3dCaps.MaxPixelShader30InstructionSlots;
+-    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots);
++    // Brief B13: RESZ, the driver's depth resolve (AMD, Intel; DXVK reports it too). NvAPI (NVIDIA's native driver) is a documented hook point in VolFogDepth.cpp.
++    VolFog::s_caps.resz = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, static_cast<D3DFORMAT>(MAKEFOURCC('R', 'E', 'S', 'Z'))) == D3D_OK;
++    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u RESZ=%d", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots, VolFog::s_caps.resz ? 1 : 0);
+ 
+     this->m_caps.m_colorWrite = (this->m_d3dCaps.PrimitiveMiscCaps & D3DPMISCCAPS_COLORWRITEENABLE) != 0;
+     this->m_caps.m_hwCursor = this->m_d3dCaps.CursorCaps & D3DCURSORCAPS_COLOR;
+@@ -2817,6 +2833,16 @@ int32_t CGxDeviceD3d9Ex::DeviceSetFormat(const CGxFormat& format) {
+ 
+     if (this->ICreateWindow(createFormat) && this->ICreateD3dDevice(createFormat) && CGxDevice::DeviceSetFormat(createFormat)) {
+         this->ISetWindowFocus(1);
++
++        // Not in the original client (brief B13): the device came up multisampled and the RESZ self-test of the fog failed (it says so in
++        // gx.log and the console). Build it again at once: ISetPresentParms now drops the MSAA (VolFog::PrepareMsaaCopy refuses after a failed
++        // self-test), so this recursion happens at most once.
++        if (VolFog::TakeDeviceRestart()) {
++            CGxDevice::Log("wolVolFog: rebuilding the device without MSAA");
++
++            return this->DeviceSetFormat(format);
++        }
++
+         return 1;
+     }
+ 
+diff --git a/Engine/Source/VolFog/VolFog.h b/Engine/Source/VolFog/VolFog.h
+index b99f9f1..f8c641a 100644
+--- a/Engine/Source/VolFog/VolFog.h
++++ b/Engine/Source/VolFog/VolFog.h
+@@ -5,6 +5,8 @@
+ 
+ struct IDirect3D9;
+ struct IDirect3DDevice9;
++struct IDirect3DStateBlock9;
++struct IDirect3DSurface9;
+ struct IDirect3DTexture9;
+ class CGxTex;
+ 
+@@ -18,6 +20,7 @@ namespace VolFog {
+         bool intz = false;          // INTZ readable depth texture (D3DUSAGE_DEPTHSTENCIL + D3DRTYPE_TEXTURE)
+         bool abgr16f = false;       // A16B16G16R16F render target texture
+         bool abgr32f = false;       // A32B32G32R32F plain texture
++        bool resz = false;          // Brief B13: RESZ depth resolve (CheckDeviceFormat with the FOURCC 'RESZ', D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE)
+         uint32_t ps30Slots = 0;     // D3DCAPS9::MaxPixelShader30InstructionSlots
+     };
+ 
+@@ -60,10 +63,43 @@ namespace VolFog {
+     // CheckDeviceFormat on `d3d` for the back buffer format (a D3DFORMAT value, kept as uint32_t to leave d3d9.h out of here).
+     bool WantsReadableDepthFor(IDirect3D9* d3d, uint32_t backBufferFormat);
+ 
++    // Brief B13, MSAA + copy mode. With gxMultisample > 1 the main depth stays the multisampled AutoDepthStencil of the device and the
++    // INTZ texture becomes a plain (not multisampled) copy of it, refreshed once per frame by ResolveDepth() with the RESZ trick of AMD
++    // (DXVK implements it too). Asked by ISetPresentParms of the D3D9 backends after WantsReadableDepthFor said yes and gxMultisample > 1:
++    // true when the MSAA can be kept, and then *depthFormat (a D3DFORMAT value) is the format of the multisampled AutoDepthStencil (a
++    // D24X8 request becomes D24S8, like coa-vfog does; any other format is left alone). False when the driver reports no RESZ (and no
++    // NvAPI copy: see the WOL_NVAPI hook point in VolFogDepth.cpp) or the RESZ self-test of an earlier device failed: the backend then
++    // forces MSAA 1 as in B3b. `message` (never nullptr) is the line for the player in that case. ReszBroken(): the self-test failed on this run.
++    bool PrepareMsaaCopy(IDirect3D9* d3d, uint32_t backBufferFormat, bool windowed, uint32_t multisampleType, uint32_t* depthFormat, const char** message);
++    bool ReszBroken();
++
++    // Brief B13: the device was built with the copy mode and the RESZ self-test failed, so the MSAA cannot be kept. The backends' DeviceSetFormat
++    // asks after a successful build; true once means "rebuild the device now" (ISetPresentParms then drops the MSAA). Cleared by the next
++    // CreateDepthTexture, so a failure in a Reset path (no DeviceSetFormat) waits for the next gxRestart without a double rebuild.
++    bool TakeDeviceRestart();
++
++    // Brief B13: INTZ is a RESZ copy of the multisampled main depth (the copy mode is active on this device).
++    bool DepthIsCopy();
++
++    // Brief B13: refreshes the INTZ copy from the multisampled depth. Called first thing in Render(), at the same point of the frame the
++    // fog always read the depth at. It changes raw device state (texture 0, shaders, three render states and the RESZ point size) and puts
++    // all of it back with a state block, so the client's render-state cache stays true. No-op unless DepthIsCopy().
++    void ResolveDepth();
++
++    // Brief B13, VolFogResz.cpp (the only file that knows the RESZ sequence). ReszSelfTest clears the multisampled depth to two known
++    // values in two halves, resolves it into `intz`, reads a texel of each half back through a small R32F target and does it again with the
++    // halves swapped; true when both rounds read what was written (firstRead / secondRead: the last two texels read). It saves and restores
++    // the render target, the depth-stencil and all the device state (`resolveBlock`: the block the resolves use). ReszResolve is the per-frame resolve; `block` is a D3DSBT_ALL state
++    // block of the device (made by ReszCreateStateBlock), captured before and applied after the resolve.
++    bool ReszSelfTest(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDirect3DSurface9* multisampledDepth, IDirect3DStateBlock9* resolveBlock, float* firstRead, float* secondRead);
++    bool ReszResolve(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDirect3DStateBlock9* block);
++    IDirect3DStateBlock9* ReszCreateStateBlock(IDirect3DDevice9* device);
++
+     // Brief B3, D3D9 backends only (the OpenGL stub never calls them). CreateDepthTexture makes an INTZ texture the size
+     // of the back buffer (rounded up when the device has POW2-only textures) and makes it the depth-stencil surface of
+     // the device; the backend then re-reads it with GetDepthStencilSurface into m_defDepthSurface. It returns false, and
+-    // leaves the device untouched, when the depth is not wanted, the back buffer is multisampled or the texture fails.
++    // leaves the device untouched, when the depth is not wanted, the back buffer is multisampled or the texture fails. Brief B13: with a
++    // multisampled back buffer and RESZ it makes the INTZ a copy (DepthIsCopy()) and returns false as well, since the device keeps its own depth.
+     // ReleaseDepthTexture must run before the device is reset or destroyed (IReleaseD3dResources). Brief B3b: it takes the device
+     // so it can unbind the INTZ first (SetTexture(stage, nullptr) on stages 0-15 and SetDepthStencilSurface(nullptr)); a native D3D9
+     // Reset fails with D3DERR_INVALIDCALL while a D3DPOOL_DEFAULT resource is still bound. nullptr device = just release.
+diff --git a/Engine/Source/VolFog/VolFogDepth.cpp b/Engine/Source/VolFog/VolFogDepth.cpp
+index 2f9d2e5..be99ddf 100644
+--- a/Engine/Source/VolFog/VolFogDepth.cpp
++++ b/Engine/Source/VolFog/VolFogDepth.cpp
+@@ -6,6 +6,7 @@
+ 
+ #if defined(_WIN32)
+ #include <d3d9.h>
++#include <wchar.h>
+ #endif
+ 
+ // Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B3: the main depth buffer as a
+@@ -20,10 +21,18 @@ namespace {
+ #if defined(_WIN32)
+     IDirect3DTexture9* s_texture;
+     IDirect3DSurface9* s_surface;
++    // Brief B13, MSAA + copy mode: s_texture is then the RESZ copy of the multisampled depth, s_surface stays nullptr (the INTZ is not the
++    // depth-stencil of the device) and ResolveDepth() uses the device and the state block below.
++    IDirect3DDevice9* s_device;
++    IDirect3DStateBlock9* s_block;
+ #endif
+     uint32_t s_width;
+     uint32_t s_height;
+     CGxTex* s_wrapper; // kept for the whole run: the pass binds it, the device never owns it
++    bool s_copyMode;           // brief B13
++    bool s_reszBroken;         // brief B13: the RESZ self-test failed once in this run; the MSAA is not kept again
++    bool s_restartRequested;   // brief B13: see TakeDeviceRestart
++    uint32_t s_resolveFailures;
+ }
+ 
+ bool VolFog::WantsReadableDepth() {
+@@ -58,8 +67,138 @@ bool VolFog::WantsReadableDepthFor(IDirect3D9* d3d, uint32_t backBufferFormat) {
+     return d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, static_cast<D3DFORMAT>(backBufferFormat), D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, intz) == D3D_OK;
+ }
+ 
++// Brief B13: the system d3d9.dll (AMD's native driver) must not be asked for RESZ. Measured on the RX 9070 XT (Adrenalin, 2026-10-20) with
++// prueba-b13\resz_test.cpp: CheckDeviceFormat reports RESZ, but the AMD sample sequence (dummy point with the INTZ in stage 0, then
++// SetRenderState(D3DRS_POINTSIZE, 0x7FA05000)) leaves the GPU unable to finish: the next event query or Release never returns, with 2x, 4x and
++// 8x, D24S8 / D24X8 / D16, pure device or not. DXVK implements the same trigger itself (D3D9DeviceEx::ResolveZ) and works. A hang cannot be
++// caught by a self-test, so the copy mode is only offered when d3d9.dll is not the one in the system folder; the environment variable
++// WOL_RESZ_NATIVE=1 lifts the block (for testing other drivers: it can hang the machine's GPU).
++static bool InFolder(const wchar_t* file, const wchar_t* folder) {
++    const wchar_t* slash = wcsrchr(file, L'\\');
++
++    if (!slash) {
++        return false;
++    }
++
++    size_t length = static_cast<size_t>(slash - file);
++
++    return wcslen(folder) == length && _wcsnicmp(file, folder, length) == 0;
++}
++
++static bool NativeD3d9() {
++    static int s_native = -1;
++
++    if (s_native < 0) {
++        wchar_t path[MAX_PATH] = {};
++        wchar_t system[MAX_PATH] = {};
++        wchar_t wow64[MAX_PATH] = {};
++        HMODULE module = GetModuleHandleW(L"d3d9.dll");
++
++        s_native = module && GetModuleFileNameW(module, path, MAX_PATH) && ((GetSystemDirectoryW(system, MAX_PATH) && InFolder(path, system)) || (GetSystemWow64DirectoryW(wow64, MAX_PATH) && InFolder(path, wow64))) ? 1 : 0;
++        // const char*: MSVC lets a string literal (and a ?: of two) convert to char*, which picks the va_list overload of Log (the first run of B13 crashed here)
++        const char* const which = s_native ? "the system (native) driver copy" : "not the system copy (DXVK or another wrapper)";
++        CGxDevice::Log("wolVolFog: d3d9.dll is %s", which);
++    }
++
++    return s_native == 1;
++}
++
++static bool ReszAllowed() {
++    if (!NativeD3d9()) {
++        return true;
++    }
++
++    wchar_t value[8] = {};
++
++    return GetEnvironmentVariableW(L"WOL_RESZ_NATIVE", value, 8) > 0 && value[0] == L'1';
++}
++
++// Hook point WOL_NVAPI (brief B13). On NVIDIA's native D3D9 driver there is no RESZ; coa-vfog copies the multisampled D24S8 depth there with
++// NvAPI_D3D9_StretchRectEx after NvAPI_D3D9_RegisterResource of the two surfaces (coa-vfog src/msaa_depth.cpp: NvapiD3D9, DepthCopy::Attach /
++// Copy). The NvAPI SDK of NVIDIA is not downloaded (licence; decision of Cristian), so nothing of it is compiled today and without RESZ the
++// MSAA is dropped as in B3b. To add it: define WOL_NVAPI, write VolFogNvapi.cpp with VolFog::NvapiProbe(IDirect3D9*) (nvapi.dll loads and
++// initialises on an NVIDIA adapter that is not DXVK), VolFog::NvapiAttach(IDirect3DSurface9* multisampledDepth, IDirect3DTexture9* intz),
++// VolFog::NvapiCopy(IDirect3DDevice9*) and VolFog::NvapiDetach(), declare them in VolFog.h and enable the three WOL_NVAPI blocks of this file
++// (PrepareMsaaCopy, CreateDepthCopy, ResolveDepth); the self-test then runs through the same call.
++
++// Brief B13: the back buffer is multisampled and the driver has RESZ: INTZ becomes a copy of the multisampled depth that the device already has
++// as AutoDepthStencil (the backend made it in ISetPresentParms through PrepareMsaaCopy). Returns false like CreateDepthTexture does when the INTZ is
++// not the depth of the device; DepthTexture() tells whether the copy exists.
++static bool CreateDepthCopy(IDirect3DDevice9* device) {
++    const D3DFORMAT intz = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'));
++    IDirect3DSurface9* depth = nullptr;
++    D3DSURFACE_DESC depthDesc;
++
++    if (FAILED(device->GetDepthStencilSurface(&depth)) || !depth || FAILED(depth->GetDesc(&depthDesc)) || depthDesc.MultiSampleType == D3DMULTISAMPLE_NONE) {
++        if (depth) {
++            depth->Release();
++        }
++
++        CGxDevice::Log("wolVolFog: the multisampled depth of the device is not available, the readable depth waits for gxRestart");
++        VolFog::Message("wolVolFog: pendiente de gxRestart (el back buffer tiene MSAA)");
++
++        return false;
++    }
++
++    IDirect3DTexture9* texture = nullptr;
++    HRESULT result = device->CreateTexture(depthDesc.Width, depthDesc.Height, 1, D3DUSAGE_DEPTHSTENCIL, intz, D3DPOOL_DEFAULT, &texture, nullptr);
++
++    if (FAILED(result) || !texture) {
++        depth->Release();
++        CGxDevice::Log("wolVolFog: CreateTexture(%ux%u, INTZ) for the MSAA copy failed (0x%08X), the readable depth waits for gxRestart", depthDesc.Width, depthDesc.Height, static_cast<unsigned>(result));
++        VolFog::Message("wolVolFog: pendiente de gxRestart (el back buffer tiene MSAA)");
++
++        return false;
++    }
++
++    // Self-test (design 5.3): two known depths written to the multisampled depth, resolved into the INTZ and read back, twice with the halves
++    // swapped. If it fails the MSAA cannot be kept with the fog: s_reszBroken makes the next device single-sampled, and the backend's
++    // DeviceSetFormat rebuilds it right away (TakeDeviceRestart).
++    IDirect3DStateBlock9* block = VolFog::ReszCreateStateBlock(device);
++    float first = -1.0f;
++    float second = -1.0f;
++    bool passed = block != nullptr;
++
++#if defined(WOL_NVAPI)
++    // WOL_NVAPI hook point (1/3): attach `depth` and `texture` to the NvAPI copy here when the driver has no RESZ.
++#endif
++
++    passed = passed && VolFog::ReszSelfTest(device, texture, depth, block, &first, &second);
++
++    if (!passed) {
++        depth->Release();
++
++        if (block) {
++            block->Release();
++        }
++
++        texture->Release();
++        s_reszBroken = true;
++        s_restartRequested = true;
++        CGxDevice::Log("wolVolFog: RESZ self-test failed (%s): the last round read %.4f / %.4f where the multisampled depth held 0.7500 / 0.3125; the MSAA is dropped on the next device", block ? "the resolve did not give the depth back" : "no state block", first, second);
++        VolFog::Message("wolVolFog: RESZ no funciona, MSAA desactivado");
++
++        return false;
++    }
++
++    s_texture = texture;
++    s_surface = nullptr;
++    s_width = depthDesc.Width;
++    s_height = depthDesc.Height;
++    s_device = device;
++    s_block = block;
++    s_copyMode = true;
++    s_resolveFailures = 0;
++    VolFog::SetLightDevice(device); // brief B8: the local light texture is made on this device when the first lights show up
++    CGxDevice::Log("wolVolFog: depth mode MSAA+copy: INTZ %ux%u is a RESZ copy of the %dx multisampled depth (D3DFORMAT %d), self-test passed (last round read %.4f / %.4f)", depthDesc.Width, depthDesc.Height, static_cast<int>(depthDesc.MultiSampleType), static_cast<int>(depthDesc.Format), first, second);
++    depth->Release();
++
++    return false;
++}
++
+ bool VolFog::CreateDepthTexture(IDirect3DDevice9* device) {
+     VolFog::ReleaseDepthTexture(device);
++    s_restartRequested = false; // brief B13: only a failure of this very call asks for a rebuild
+ 
+     if (!device || !VolFog::WantsReadableDepth()) {
+         return false;
+@@ -80,6 +219,11 @@ bool VolFog::CreateDepthTexture(IDirect3DDevice9* device) {
+     }
+ 
+     if (desc.MultiSampleType != D3DMULTISAMPLE_NONE) {
++        // Brief B13: with RESZ the multisampled depth stays the depth of the device and the INTZ is a copy of it.
++        if (VolFog::s_caps.resz && !s_reszBroken && ReszAllowed()) {
++            return CreateDepthCopy(device);
++        }
++
+         // A multisampled back buffer cannot share the depth of a plain texture. This happens on the very first device of a
+         // run (the caps are read after the present parameters) and is solved by gxRestart.
+         CGxDevice::Log("wolVolFog: the back buffer is multisampled (%d), the readable depth waits for gxRestart", static_cast<int>(desc.MultiSampleType));
+@@ -153,9 +297,21 @@ void VolFog::ReleaseDepthTexture(IDirect3DDevice9* device) {
+             device->SetTexture(stage, nullptr);
+         }
+ 
+-        device->SetDepthStencilSurface(nullptr);
++        // Brief B13: in the copy mode the depth-stencil of the device is the multisampled AutoDepthStencil, which Reset handles itself.
++        if (!s_copyMode) {
++            device->SetDepthStencilSurface(nullptr);
++        }
++    }
++
++    // Brief B13: the state block holds references to whatever the device had bound when it was captured, so it goes before the Reset too.
++    if (s_block) {
++        s_block->Release();
++        s_block = nullptr;
+     }
+ 
++    s_device = nullptr;
++    s_copyMode = false;
++
+     if (s_surface) {
+         s_surface->Release();
+         s_surface = nullptr;
+@@ -178,6 +334,91 @@ IDirect3DTexture9* VolFog::DepthTexture() {
+     return s_texture;
+ }
+ 
++bool VolFog::PrepareMsaaCopy(IDirect3D9* d3d, uint32_t backBufferFormat, bool windowed, uint32_t multisampleType, uint32_t* depthFormat, const char** message) {
++    static const char* const s_noResz = "wolVolFog: gxMultisample ignorado (el driver no ofrece RESZ: el depth legible no admite MSAA)";
++    static const char* const s_broken = "wolVolFog: RESZ no funciona, MSAA desactivado";
++    static const char* const s_native = "wolVolFog: gxMultisample ignorado (D3D9 nativo: el RESZ del driver bloquea la GPU; con DXVK si hay MSAA)";
++
++    *message = s_noResz;
++
++    if (VolFog::s_mode <= 0 || !d3d || !depthFormat) {
++        return false;
++    }
++
++    if (s_reszBroken) {
++        *message = s_broken;
++
++        return false;
++    }
++
++    if (!ReszAllowed()) {
++        *message = s_native;
++
++        return false;
++    }
++
++    const D3DFORMAT back = static_cast<D3DFORMAT>(backBufferFormat);
++    const D3DFORMAT resz = static_cast<D3DFORMAT>(MAKEFOURCC('R', 'E', 'S', 'Z'));
++    bool copyable = d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, back, D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, resz) == D3D_OK;
++
++#if defined(WOL_NVAPI)
++    // WOL_NVAPI hook point (2/3): copyable = copyable || VolFog::NvapiProbe(d3d);
++#endif
++
++    if (!copyable) {
++        return false;
++    }
++
++    // The client asks for D24X8 with gxDepthBits 24; the fog's own depth (INTZ) has stencil bits, and so does coa-vfog's multisampled one.
++    if (static_cast<D3DFORMAT>(*depthFormat) == D3DFMT_D24X8 &&
++        d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, back, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_SURFACE, D3DFMT_D24S8) == D3D_OK &&
++        d3d->CheckDeviceMultiSampleType(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, D3DFMT_D24S8, windowed ? TRUE : FALSE, static_cast<D3DMULTISAMPLE_TYPE>(multisampleType), nullptr) == D3D_OK) {
++        *depthFormat = static_cast<uint32_t>(D3DFMT_D24S8);
++    }
++
++    return true;
++}
++
++bool VolFog::ReszBroken() {
++    return s_reszBroken;
++}
++
++bool VolFog::TakeDeviceRestart() {
++    bool requested = s_restartRequested;
++    s_restartRequested = false;
++
++    return requested;
++}
++
++bool VolFog::DepthIsCopy() {
++    return s_copyMode && s_texture != nullptr;
++}
++
++void VolFog::ResolveDepth() {
++    if (!s_copyMode || !s_texture || !s_device || !s_block || VolFog::s_mode <= 0) {
++        return;
++    }
++
++    bool ok = VolFog::ReszResolve(s_device, s_texture, s_block);
++
++#if defined(WOL_NVAPI)
++    // WOL_NVAPI hook point (3/3): when the copy method is NvAPI, ok = VolFog::NvapiCopy(s_device);
++#endif
++
++    if (ok) {
++        s_resolveFailures = 0;
++
++        return;
++    }
++
++    if (++s_resolveFailures == 3) {
++        static const char* const s_failed = "wolVolFog: the RESZ depth copy failed three frames in a row; the client's own fog is back.";
++        CGxDevice::Log("%s", s_failed);
++        VolFog::Message(s_failed);
++        VolFog::SetHardFailure(true);
++    }
++}
++
+ #else
+ 
+ bool VolFog::WantsReadableDepthFor(IDirect3D9*, uint32_t) {
+@@ -195,6 +436,27 @@ IDirect3DTexture9* VolFog::DepthTexture() {
+     return nullptr;
+ }
+ 
++bool VolFog::PrepareMsaaCopy(IDirect3D9*, uint32_t, bool, uint32_t, uint32_t*, const char** message) {
++    *message = "";
++
++    return false;
++}
++
++bool VolFog::ReszBroken() {
++    return false;
++}
++
++bool VolFog::TakeDeviceRestart() {
++    return false;
++}
++
++bool VolFog::DepthIsCopy() {
++    return false;
++}
++
++void VolFog::ResolveDepth() {
++}
++
+ #endif
+ 
+ CGxTex* VolFog::DepthTex() {
+diff --git a/Engine/Source/VolFog/VolFogRender.cpp b/Engine/Source/VolFog/VolFogRender.cpp
+index 4437573..05ea0da 100644
+--- a/Engine/Source/VolFog/VolFogRender.cpp
++++ b/Engine/Source/VolFog/VolFogRender.cpp
+@@ -1158,6 +1158,12 @@ void VolFog::Render() {
+         VolFog::SetFrameResult(true, false);
+     }
+ 
++    // Brief B13: in the MSAA + copy mode the INTZ is refreshed from the multisampled depth here, once per frame and before any sub-pass (or
++    // wolVolFogDebug 1) reads it. Nothing happens in the other modes.
++    if (VolFog::s_mode > 0 && !VolFog::HardFailure()) {
++        VolFog::ResolveDepth();
++    }
++
+     int32_t debugMode = VolFog::s_debugMode;
+ 
+     if (debugMode == 1 || debugMode == 5) {
+diff --git a/Engine/Source/VolFog/VolFogResz.cpp b/Engine/Source/VolFog/VolFogResz.cpp
+new file mode 100644
+index 0000000..de35c25
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogResz.cpp
+@@ -0,0 +1,305 @@
++#include "Engine/Source/VolFog/VolFog.h"
++
++#if defined(_WIN32)
++#include <d3d9.h>
++#include <cmath>
++#endif
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B13: MSAA with the readable depth.
++// Licensed under GPL-3.0-only. Derived from coa-vfog 205ade5 (src/msaa_depth.cpp: ResolveThroughResz, TestDepthCopy, ReadDepthTexels;
++// src/fullscreen_triangle.h; shaders/vf_fullscreen_vs.hlsl and vf_depth_check.hlsl) and modified for this client: the state of the device is
++// saved and restored with a D3DSBT_ALL state block instead of the per-state lists of the original (the client creates a pure device, which has
++// no Get* calls for states and textures), the two shaders are embedded as ps_2_0 / vs_2_0 tokens (no build step), and the self-test and the
++// per-frame resolve share one code path. See Shaders/VolFog/NOTICE-modificaciones.txt.
++//
++// The sequence AMD documents for RESZ (the driver resolves the multisampled depth-stencil of the device into the texture bound at stage 0
++// when the point size render state is set to the magic value) is the one coa-vfog uses; DXVK implements the same trigger in
++// D3D9DeviceEx::ResolveZ (it needs the multisampled depth bound as the depth-stencil and the destination texture in stage 0).
++
++#if defined(_WIN32)
++
++namespace {
++    constexpr DWORD kReszCode = 0x7FA05000;
++    constexpr float kFirstDepth = 0.3125f;   // exact in 24 bits
++    constexpr float kSecondDepth = 0.75f;    // exact in 24 bits
++    constexpr float kTolerance = 0.002f;     // a D24 depth read back through a driver can be off by a few units of the last bit
++    constexpr DWORD kAllColour = 0xF;
++    constexpr UINT kProbeTexels = 2;
++
++    // vs_2_0: mov oPos, v0  (vf_fullscreen_vs.hlsl). fxc 10.1 output without the constant table.
++    const DWORD kVertexTokens[] = {
++        0xFFFE0200,
++        0x0200001F, 0x80000000, 0x900F0000,
++        0x02000001, 0xC00F0000, 0x90E40000,
++        0x0000FFFF
++    };
++
++    // ps_2_0: texld r0, c0.xy, s0 ; oC0 = r0.xxxx  (vf_depth_check.hlsl with tex2D). fxc 10.1 output without the constant table.
++    const DWORD kPixelTokens[] = {
++        0xFFFF0200,
++        0x0200001F, 0x90000000, 0xA00F0800,
++        0x02000001, 0x80030001, 0xA0E40000,
++        0x03000042, 0x800F0000, 0x80E40001, 0xA0E40800,
++        0x02000001, 0x800F0000, 0x80000000,
++        0x02000001, 0x800F0800, 0x80E40000,
++        0x0000FFFF
++    };
++
++    // Covers the clip square of a 1 x 1 viewport (coa-vfog fullscreen_triangle.h).
++    const float kTriangle[3][4] = {
++        { -1.5f, -1.5f, 0.0f, 1.0f },
++        { -1.5f, 4.5f, 0.0f, 1.0f },
++        { 4.5f, -1.5f, 0.0f, 1.0f }
++    };
++
++    template <typename T>
++    void SafeRelease(T*& pointer) {
++        if (pointer) {
++            pointer->Release();
++            pointer = nullptr;
++        }
++    }
++
++    // The sequence itself. Needs a scene to be open and the multisampled depth bound as the depth-stencil of the device.
++    bool TriggerResz(IDirect3DDevice9* device, IDirect3DTexture9* intz) {
++        device->SetTexture(0, intz);
++        device->SetVertexShader(nullptr);
++        device->SetPixelShader(nullptr);
++        device->SetFVF(D3DFVF_XYZ);
++        device->SetRenderState(D3DRS_ZENABLE, FALSE);
++        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
++        device->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
++
++        const float point[3] = {};
++        const bool drawn = SUCCEEDED(device->DrawPrimitiveUP(D3DPT_POINTLIST, 1, point, sizeof(point)));
++
++        // AMD's sample puts the depth and colour writes back before the trigger.
++        device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
++        device->SetRenderState(D3DRS_ZENABLE, TRUE);
++        device->SetRenderState(D3DRS_COLORWRITEENABLE, kAllColour);
++        device->SetRenderState(D3DRS_POINTSIZE, kReszCode);
++
++        return drawn;
++    }
++
++    struct Probe {
++        IDirect3DVertexShader9* vertexShader = nullptr;
++        IDirect3DPixelShader9* pixelShader = nullptr;
++        IDirect3DVertexDeclaration9* declaration = nullptr;
++        IDirect3DTexture9* target = nullptr;
++        IDirect3DSurface9* targetSurface = nullptr;
++        IDirect3DSurface9* system = nullptr;
++
++        Probe() = default;
++        Probe(const Probe&) = delete;
++        Probe& operator=(const Probe&) = delete;
++
++        ~Probe() {
++            SafeRelease(system);
++            SafeRelease(targetSurface);
++            SafeRelease(target);
++            SafeRelease(declaration);
++            SafeRelease(pixelShader);
++            SafeRelease(vertexShader);
++        }
++    };
++
++    bool CreateProbe(IDirect3DDevice9* device, Probe& probe) {
++        static const D3DVERTEXELEMENT9 s_elements[] = {
++            { 0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },
++            D3DDECL_END()
++        };
++
++        return SUCCEEDED(device->CreateVertexShader(kVertexTokens, &probe.vertexShader)) &&
++               SUCCEEDED(device->CreatePixelShader(kPixelTokens, &probe.pixelShader)) &&
++               SUCCEEDED(device->CreateVertexDeclaration(s_elements, &probe.declaration)) &&
++               SUCCEEDED(device->CreateTexture(kProbeTexels, 1, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &probe.target, nullptr)) &&
++               SUCCEEDED(probe.target->GetSurfaceLevel(0, &probe.targetSurface)) &&
++               SUCCEEDED(device->CreateOffscreenPlainSurface(kProbeTexels, 1, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &probe.system, nullptr));
++    }
++
++    // Draws one texel of the INTZ per pixel of the small R32F target (a 1 x 1 viewport per texel, a triangle over it, the pixel shader reads the
++    // texel in c0). Scene open.
++    void DrawTexels(IDirect3DDevice9* device, const Probe& probe, IDirect3DTexture9* intz, const D3DSURFACE_DESC& desc, const UINT (&texels)[kProbeTexels][2]) {
++        device->SetRenderTarget(0, probe.targetSurface);
++        device->SetDepthStencilSurface(nullptr);
++        device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
++        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
++        device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
++        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
++        device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
++        device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
++        device->SetRenderState(D3DRS_COLORWRITEENABLE, kAllColour);
++        device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
++        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
++        device->SetRenderState(D3DRS_FOGENABLE, FALSE);
++        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
++        device->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
++        device->SetVertexShader(probe.vertexShader);
++        device->SetPixelShader(probe.pixelShader);
++        device->SetVertexDeclaration(probe.declaration);
++        device->SetStreamSourceFreq(0, 1);
++        device->SetTexture(0, intz);
++        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
++        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
++        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
++        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
++        device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
++        device->SetSamplerState(0, D3DSAMP_MAXMIPLEVEL, 0);
++        device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
++
++        for (UINT i = 0; i < kProbeTexels; i++) {
++            const D3DVIEWPORT9 texel = { i, 0, 1, 1, 0.0f, 1.0f };
++            const float uv[4] = { (texels[i][0] + 0.5f) / desc.Width, (texels[i][1] + 0.5f) / desc.Height, 0.0f, 0.0f };
++            device->SetViewport(&texel);
++            device->SetPixelShaderConstantF(0, uv, 1);
++            device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, kTriangle, sizeof(kTriangle[0]));
++        }
++    }
++
++    bool CopyOut(IDirect3DDevice9* device, const Probe& probe, float* values) {
++        D3DLOCKED_RECT locked = {};
++
++        if (FAILED(device->GetRenderTargetData(probe.targetSurface, probe.system)) || FAILED(probe.system->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
++            return false;
++        }
++
++        const float* texels = static_cast<const float*>(locked.pBits);
++
++        for (UINT i = 0; i < kProbeTexels; i++) {
++            values[i] = texels[i];
++        }
++
++        probe.system->UnlockRect();
++
++        return true;
++    }
++
++    // One round: both halves of the multisampled depth cleared to known values, resolved, read back.
++    bool Round(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDirect3DSurface9* multisampledDepth, IDirect3DSurface9* colour, IDirect3DStateBlock9* block, const Probe& probe, const D3DSURFACE_DESC& desc, float left, float right, float* read) {
++        const UINT texels[kProbeTexels][2] = { { desc.Width / 4, desc.Height / 2 }, { desc.Width * 3 / 4, desc.Height / 2 } };
++        const bool scene = SUCCEEDED(device->BeginScene());
++
++        device->SetRenderTarget(0, colour);
++        device->SetDepthStencilSurface(multisampledDepth);
++
++        const D3DVIEWPORT9 whole = { 0, 0, desc.Width, desc.Height, 0.0f, 1.0f };
++        device->SetViewport(&whole);
++        device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
++
++        const LONG middle = static_cast<LONG>(desc.Width / 2);
++        const D3DRECT leftHalf = { 0, 0, middle, static_cast<LONG>(desc.Height) };
++        const D3DRECT rightHalf = { middle, 0, static_cast<LONG>(desc.Width), static_cast<LONG>(desc.Height) };
++        device->Clear(1, &leftHalf, D3DCLEAR_ZBUFFER, 0, left, 0);
++        device->Clear(1, &rightHalf, D3DCLEAR_ZBUFFER, 0, right, 0);
++
++        const bool resolved = VolFog::ReszResolve(device, intz, block);
++
++        if (resolved) {
++            DrawTexels(device, probe, intz, desc, texels);
++        }
++
++        if (scene) {
++            device->EndScene();
++        }
++
++        // Like coa-vfog: the small target is unbound before GetRenderTargetData reads it.
++        device->SetRenderTarget(0, colour);
++        device->SetDepthStencilSurface(multisampledDepth);
++
++        return resolved && CopyOut(device, probe, read);
++    }
++}
++
++IDirect3DStateBlock9* VolFog::ReszCreateStateBlock(IDirect3DDevice9* device) {
++    IDirect3DStateBlock9* block = nullptr;
++
++    if (!device || FAILED(device->CreateStateBlock(D3DSBT_ALL, &block))) {
++        return nullptr;
++    }
++
++    return block;
++}
++
++bool VolFog::ReszResolve(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDirect3DStateBlock9* block) {
++    if (!device || !intz || !block || FAILED(block->Capture())) {
++        return false;
++    }
++
++    // Capture / Apply put back texture 0, the shaders, the FVF, stream 0 (the UP draw unbinds it), Z / colour writes and the point size.
++    const bool ok = TriggerResz(device, intz);
++    block->Apply();
++
++    return ok;
++}
++
++bool VolFog::ReszSelfTest(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDirect3DSurface9* multisampledDepth, IDirect3DStateBlock9* resolveBlock, float* firstRead, float* secondRead) {
++    D3DSURFACE_DESC desc = {};
++
++    if (!device || !intz || !multisampledDepth || !resolveBlock || FAILED(multisampledDepth->GetDesc(&desc)) || desc.Width < 4) {
++        return false;
++    }
++
++    IDirect3DSurface9* colour = nullptr;
++
++    if (FAILED(device->GetRenderTarget(0, &colour)) || !colour) {
++        return false;
++    }
++
++    // The whole device state, so that the client finds it as it left it (this runs while the Gx backend builds the device).
++    IDirect3DStateBlock9* saved = VolFog::ReszCreateStateBlock(device);
++    IDirect3DSurface9* depth = nullptr;
++    device->GetDepthStencilSurface(&depth);
++
++    Probe probe;
++    bool passed = false;
++
++    if (saved && CreateProbe(device, probe)) {
++        float read[kProbeTexels] = {};
++        const float rounds[2][2] = { { kFirstDepth, kSecondDepth }, { kSecondDepth, kFirstDepth } };
++
++        passed = true;
++
++        for (int round = 0; round < 2 && passed; round++) {
++            passed = Round(device, intz, multisampledDepth, colour, resolveBlock, probe, desc, rounds[round][0], rounds[round][1], read);
++
++            for (UINT i = 0; i < kProbeTexels; i++) {
++                passed = passed && std::fabs(read[i] - rounds[round][i]) <= kTolerance;
++            }
++
++            if (firstRead) {
++                *firstRead = read[0];
++            }
++
++            if (secondRead) {
++                *secondRead = read[1];
++            }
++        }
++
++        device->SetRenderTarget(0, colour);
++        device->SetDepthStencilSurface(depth);
++        saved->Apply();
++    }
++
++    SafeRelease(saved);
++    SafeRelease(depth);
++    SafeRelease(colour);
++
++    return passed;
++}
++
++#else
++
++IDirect3DStateBlock9* VolFog::ReszCreateStateBlock(IDirect3DDevice9*) {
++    return nullptr;
++}
++
++bool VolFog::ReszResolve(IDirect3DDevice9*, IDirect3DTexture9*, IDirect3DStateBlock9*) {
++    return false;
++}
++
++bool VolFog::ReszSelfTest(IDirect3DDevice9*, IDirect3DTexture9*, IDirect3DSurface9*, IDirect3DStateBlock9*, float*, float*) {
++    return false;
++}
++
++#endif
+diff --git a/Shaders/VolFog/NOTICE-modificaciones.txt b/Shaders/VolFog/NOTICE-modificaciones.txt
+index 9937a6c..75e4044 100644
+--- a/Shaders/VolFog/NOTICE-modificaciones.txt
++++ b/Shaders/VolFog/NOTICE-modificaciones.txt
+@@ -128,3 +128,15 @@ Modifications (GPLv3 section 5a), dated
+     compensation constant of both composition shaders is the glow of the client (FrameInputs::clientGlowAmount, 0 unless ffxGlow is on and the glow is
+     the active screen effect), the GlowCompensation of coa-vfog (renderer.cpp:1374, 1496); the temporal history is dropped when the lit / unlit march
+     variant changes or the light texture is made anew. No shader source changed.
++
++2026-10-20  Brief B13 (World of Legends, native volumetric fog, phase 3: MSAA with the readable depth).
++  - Engine/Source/VolFog/VolFogResz.cpp (new, derived from src/msaa_depth.cpp, src/fullscreen_triangle.h, shaders/vf_fullscreen_vs.hlsl and
++    shaders/vf_depth_check.hlsl of 205ade5): the RESZ resolve (ResolveThroughResz: INTZ in stage 0, a dummy point with Z and colour writes off, the writes
++    back on, D3DRS_POINTSIZE = 0x7FA05000) and the self-test (two known depths written to the multisampled depth, resolved, read back through a small
++    R32F target, twice with the halves swapped). Changes: the device state is saved and restored with a D3DSBT_ALL state block (the client creates a pure
++    device; coa-vfog's per-state Get* lists cannot work there), the two tiny shaders are embedded as vs_2_0 / ps_2_0 tokens (fxc output of the same two
++    HLSL files with tex2D, no build step), the small target is unbound before GetRenderTargetData, and the self-test and the per-frame resolve share one
++    code path. The NvAPI path of msaa_depth.cpp is not ported (NVIDIA's SDK is not downloaded); the hook point is documented in VolFogDepth.cpp (WOL_NVAPI).
++  - Engine/Source/VolFog/VolFogDepth.cpp: the "MSAA + copy" mode (INTZ is a copy of the multisampled AutoDepthStencil, refreshed by ResolveDepth() at the
++    start of VolFog::Render()); a D24X8 request becomes D24S8 for the multisampled depth, as coa-vfog does. Not in coa-vfog: the copy mode is refused when
++    d3d9.dll is the system (native) copy, because the RESZ trigger hangs the GPU of the AMD RX 9070 XT there (see the comment in the file).
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index daab4f2..a37cd5f 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -751,8 +751,8 @@ bool CWorldParam::WolVolFogCallback(CVar* var, const char* oldValue, const char*
+     bool changed = oldValue && *oldValue && g_theGxDevicePtr;
+ 
+     if (changed) {
+-        char buffer[160];
+-        SStrPrintf(buffer, sizeof(buffer), "wolVolFog: %d. Caps: INTZ=%s ABGR16F=%s ABGR32F=%s PS3.0 slots=%u", mode, VolFog::s_caps.intz ? "yes" : "no", VolFog::s_caps.abgr16f ? "yes" : "no", VolFog::s_caps.abgr32f ? "yes" : "no", VolFog::s_caps.ps30Slots);
++        char buffer[200];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFog: %d. Caps: INTZ=%s ABGR16F=%s ABGR32F=%s PS3.0 slots=%u RESZ=%s depth=%s", mode, VolFog::s_caps.intz ? "yes" : "no", VolFog::s_caps.abgr16f ? "yes" : "no", VolFog::s_caps.abgr32f ? "yes" : "no", VolFog::s_caps.ps30Slots, VolFog::s_caps.resz ? "yes" : "no", VolFog::DepthIsCopy() ? "MSAA+copy" : VolFog::DepthTexture() ? "main" : "none"); // brief B13: RESZ and the depth mode
+         ConsoleWrite(buffer, DEFAULT_COLOR);
+         CGxDevice::Log("%s", static_cast<const char*>(buffer)); // const char*: a char* would pick the va_list overload
+     }

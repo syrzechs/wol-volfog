@@ -26,7 +26,7 @@ $Orden = @(
     '00a-recordar-contrasena.patch', '00b-topes-2008.patch', '00c-sombras-4096.patch', '00d-ui-depth.patch', '00e-sin-consola.patch',
     '01-B1-formatos.patch', '02-B2-shaders-pase.patch', '03-B3-depth-intz.patch', '04-B3b-correcciones.patch',
     '05-B4B5-cvars-modelo.patch', '06-B6-marcha-composicion.patch', '07-B7-temporal.patch', '08-B6b-correcciones.patch',
-    '09-B8-luces.patch', '10-B9-haces.patch', '11-B10-interiores-ajustes.patch'
+    '09-B8-luces.patch', '10-B9-haces.patch', '11-B10-interiores-ajustes.patch', '12-B13-msaa-resz.patch'
 )
 $Carpetas = @('Engine\Source\VolFog', 'Shaders\VolFog', 'Tools\VolFog')
 $Ficheros = @('WoW\Source\WorldClient\VolFogWorld.h', 'WoW\Source\WorldClient\VolFogWorld.cpp')

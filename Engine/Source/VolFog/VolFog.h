@@ -5,6 +5,8 @@
 
 struct IDirect3D9;
 struct IDirect3DDevice9;
+struct IDirect3DStateBlock9;
+struct IDirect3DSurface9;
 struct IDirect3DTexture9;
 class CGxTex;
 
@@ -18,6 +20,7 @@ namespace VolFog {
         bool intz = false;          // INTZ readable depth texture (D3DUSAGE_DEPTHSTENCIL + D3DRTYPE_TEXTURE)
         bool abgr16f = false;       // A16B16G16R16F render target texture
         bool abgr32f = false;       // A32B32G32R32F plain texture
+        bool resz = false;          // Brief B13: RESZ depth resolve (CheckDeviceFormat with the FOURCC 'RESZ', D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE)
         uint32_t ps30Slots = 0;     // D3DCAPS9::MaxPixelShader30InstructionSlots
     };
 
@@ -60,10 +63,43 @@ namespace VolFog {
     // CheckDeviceFormat on `d3d` for the back buffer format (a D3DFORMAT value, kept as uint32_t to leave d3d9.h out of here).
     bool WantsReadableDepthFor(IDirect3D9* d3d, uint32_t backBufferFormat);
 
+    // Brief B13, MSAA + copy mode. With gxMultisample > 1 the main depth stays the multisampled AutoDepthStencil of the device and the
+    // INTZ texture becomes a plain (not multisampled) copy of it, refreshed once per frame by ResolveDepth() with the RESZ trick of AMD
+    // (DXVK implements it too). Asked by ISetPresentParms of the D3D9 backends after WantsReadableDepthFor said yes and gxMultisample > 1:
+    // true when the MSAA can be kept, and then *depthFormat (a D3DFORMAT value) is the format of the multisampled AutoDepthStencil (a
+    // D24X8 request becomes D24S8, like coa-vfog does; any other format is left alone). False when the driver reports no RESZ (and no
+    // NvAPI copy: see the WOL_NVAPI hook point in VolFogDepth.cpp) or the RESZ self-test of an earlier device failed: the backend then
+    // forces MSAA 1 as in B3b. `message` (never nullptr) is the line for the player in that case. ReszBroken(): the self-test failed on this run.
+    bool PrepareMsaaCopy(IDirect3D9* d3d, uint32_t backBufferFormat, bool windowed, uint32_t multisampleType, uint32_t* depthFormat, const char** message);
+    bool ReszBroken();
+
+    // Brief B13: the device was built with the copy mode and the RESZ self-test failed, so the MSAA cannot be kept. The backends' DeviceSetFormat
+    // asks after a successful build; true once means "rebuild the device now" (ISetPresentParms then drops the MSAA). Cleared by the next
+    // CreateDepthTexture, so a failure in a Reset path (no DeviceSetFormat) waits for the next gxRestart without a double rebuild.
+    bool TakeDeviceRestart();
+
+    // Brief B13: INTZ is a RESZ copy of the multisampled main depth (the copy mode is active on this device).
+    bool DepthIsCopy();
+
+    // Brief B13: refreshes the INTZ copy from the multisampled depth. Called first thing in Render(), at the same point of the frame the
+    // fog always read the depth at. It changes raw device state (texture 0, shaders, three render states and the RESZ point size) and puts
+    // all of it back with a state block, so the client's render-state cache stays true. No-op unless DepthIsCopy().
+    void ResolveDepth();
+
+    // Brief B13, VolFogResz.cpp (the only file that knows the RESZ sequence). ReszSelfTest clears the multisampled depth to two known
+    // values in two halves, resolves it into `intz`, reads a texel of each half back through a small R32F target and does it again with the
+    // halves swapped; true when both rounds read what was written (firstRead / secondRead: the last two texels read). It saves and restores
+    // the render target, the depth-stencil and all the device state (`resolveBlock`: the block the resolves use). ReszResolve is the per-frame resolve; `block` is a D3DSBT_ALL state
+    // block of the device (made by ReszCreateStateBlock), captured before and applied after the resolve.
+    bool ReszSelfTest(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDirect3DSurface9* multisampledDepth, IDirect3DStateBlock9* resolveBlock, float* firstRead, float* secondRead);
+    bool ReszResolve(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDirect3DStateBlock9* block);
+    IDirect3DStateBlock9* ReszCreateStateBlock(IDirect3DDevice9* device);
+
     // Brief B3, D3D9 backends only (the OpenGL stub never calls them). CreateDepthTexture makes an INTZ texture the size
     // of the back buffer (rounded up when the device has POW2-only textures) and makes it the depth-stencil surface of
     // the device; the backend then re-reads it with GetDepthStencilSurface into m_defDepthSurface. It returns false, and
-    // leaves the device untouched, when the depth is not wanted, the back buffer is multisampled or the texture fails.
+    // leaves the device untouched, when the depth is not wanted, the back buffer is multisampled or the texture fails. Brief B13: with a
+    // multisampled back buffer and RESZ it makes the INTZ a copy (DepthIsCopy()) and returns false as well, since the device keeps its own depth.
     // ReleaseDepthTexture must run before the device is reset or destroyed (IReleaseD3dResources). Brief B3b: it takes the device
     // so it can unbind the INTZ first (SetTexture(stage, nullptr) on stages 0-15 and SetDepthStencilSurface(nullptr)); a native D3D9
     // Reset fails with D3DERR_INVALIDCALL while a D3DPOOL_DEFAULT resource is still bound. nullptr device = just release.
