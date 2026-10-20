@@ -1,0 +1,899 @@
+diff --git a/Engine/Source/VolFog/VolFog.cpp b/Engine/Source/VolFog/VolFog.cpp
+index 6f004dc..91357b6 100644
+--- a/Engine/Source/VolFog/VolFog.cpp
++++ b/Engine/Source/VolFog/VolFog.cpp
+@@ -37,7 +37,7 @@ namespace {
+ }
+ 
+ bool VolFog::Armed() {
+-    return VolFog::s_mode > 0 && VolFog::s_caps.intz && VolFog::s_caps.ps30Slots >= VolFog::kMinPs30Slots && VolFog::DepthTexture() != nullptr && !s_hardFailure && s_lastFrameOk && !s_inLiquid && (VolFog::s_debugMode == 0 || (VolFog::s_debugMode >= 2 && VolFog::s_debugMode <= 4));
++    return VolFog::s_mode > 0 && VolFog::s_caps.intz && VolFog::s_caps.ps30Slots >= VolFog::kMinPs30Slots && VolFog::DepthTexture() != nullptr && !s_hardFailure && s_lastFrameOk && !s_inLiquid && (VolFog::s_debugMode == 0 || (VolFog::s_debugMode >= 2 && VolFog::s_debugMode <= 4) || VolFog::s_debugMode == 6);
+ }
+ 
+ void VolFog::SetFrameResult(bool ok, bool inLiquid) {
+diff --git a/Engine/Source/VolFog/VolFog.h b/Engine/Source/VolFog/VolFog.h
+index 62df286..b99f9f1 100644
+--- a/Engine/Source/VolFog/VolFog.h
++++ b/Engine/Source/VolFog/VolFog.h
+@@ -28,8 +28,8 @@ namespace VolFog {
+     constexpr uint32_t kMinPs30Slots = 2048;
+ 
+     // Brief B2: wolVolFogDebug, set by the CVar in WorldParam_CVar.cpp. 0 = off, 1 depth in grey, 2 raw march buffer (was a magenta tint in B2),
+-    // 3 filtered history (brief B7; was the test grid), 4 normal image without the temporal filter (B7; the beam mask comes with B9),
+-    // 5 test grid (moved here from 3 in B7). B3 and later add the real wolVolFog CVar next to it.
++    // 3 filtered history (brief B7; was the test grid), 4 normal image without the temporal filter (B7),
++    // 5 test grid (moved here from 3 in B7), 6 the light shaft texture (mask after the radial blurs) over the world viewport (brief B9).
+     extern int32_t s_debugMode;
+ 
+     // Brief B3: wolVolFog (0-3), set by the CVar in WorldParam_CVar.cpp. 0 = original client.
+@@ -114,6 +114,9 @@ namespace VolFog {
+     // (the fog then has no density variation). VolFogNoise.cpp.
+     CGxTex* DensityNoiseTex();
+ 
++    // Brief B9: the last frame drew light shafts (mask and blurs ran). For wolVolFogDump.
++    bool RaysDrawn();
++
+     // Draws the fog sub-passes over the world viewport of CGWorldFrame::OnWorldRender, between
+     // DayNight::RenderGlares and PlayerNameUpdateLate. Brief B6: with wolVolFog > 0 (and the INTZ depth) it ray-marches the fog into a
+     // low-resolution target, filters it with the reprojected history of the previous frame (brief B7), copies the scene and composites the
+diff --git a/Engine/Source/VolFog/VolFogDump.cpp b/Engine/Source/VolFog/VolFogDump.cpp
+index 0abb7f2..889efa4 100644
+--- a/Engine/Source/VolFog/VolFogDump.cpp
++++ b/Engine/Source/VolFog/VolFogDump.cpp
+@@ -91,6 +91,14 @@ namespace {
+         std::snprintf(line, sizeof(line), "  fog: active=%d linear=%d lightVisibility=%.4f lightAboveHorizon=%.4f referenceZ=%.2f farLimit=%.2f maxDistance=%.1f horizonStart=%.1f farClip=%.1f", fog.active ? 1 : 0, fog.linear ? 1 : 0, fog.lightVisibility, fog.lightAboveHorizon, fog.referenceZ, fog.farLimit, fog.maxDistance, fog.horizonStart, fog.farClip);
+         Emit(file, line);
+ 
++        // Brief B9: the light shafts of this frame (position of the sun or moon on the screen, visibility, strength) and whether the last frame drew them.
++        VolFog::RayFrame rays = VolFog::ComputeRayFrame(in, fog, settings.godRays);
++
++        std::snprintf(line, sizeof(line), "  rays: wolVolFogGodRays=%.2f body=%s toLightInView=(%.4f, %.4f, %.4f) inFront=%d ndc=(%.3f, %.3f) sunPx=(%.0f, %.0f) onScreen=%d screenFade=%.3f (the shafts draw up to |ndc| 1.6)", settings.godRays, in.lightIsMoon ? "moon" : "sun", rays.toLightInView[0], rays.toLightInView[1], rays.toLightInView[2], rays.inFront ? 1 : 0, rays.ndc[0], rays.ndc[1], rays.sunPx[0], rays.sunPx[1], rays.onScreen ? 1 : 0, rays.screenFade);
++        Emit(file, line);
++        std::snprintf(line, sizeof(line), "  rays: occlusion=%.4f visibility(eased)=%.4f lightVisibility=%.4f -> strength=%.4f (min %.3f) rayColour=(%.3f, %.3f, %.3f) drawnLastFrame=%d  (not used: glareFade=%.4f screenGlow=%.4f)", in.rayOcclusion, rays.visibility, fog.lightVisibility, rays.strength, VolFog::kMinGodRayStrength, fog.rayColor[0], fog.rayColor[1], fog.rayColor[2], VolFog::RaysDrawn() ? 1 : 0, in.glareFade, in.glareScreenGlow);
++        Emit(file, line);
++
+         static const char* const s_layerNames[VolFog::kFogLayers] = { "haze", "low fog", "unused", "distance" };
+ 
+         for (int i = 0; i < VolFog::kFogLayers; ++i) {
+diff --git a/Engine/Source/VolFog/VolFogInputs.cpp b/Engine/Source/VolFog/VolFogInputs.cpp
+index 35dec68..c385c07 100644
+--- a/Engine/Source/VolFog/VolFogInputs.cpp
++++ b/Engine/Source/VolFog/VolFogInputs.cpp
+@@ -42,7 +42,7 @@ bool VolFog::CollectInputs(FrameInputs& out) {
+         && Finite(out.camTarget, 3) && Finite(out.toLight, 3) && Finite(out.toRaySource, 3)
+         && std::isfinite(out.dayFraction) && std::isfinite(out.fogStart) && std::isfinite(out.fogEnd)
+         && std::isfinite(out.zoneFogDistance) && std::isfinite(out.farClip) && std::isfinite(out.clientGlowAmount)
+-        && std::isfinite(out.localLights.interiorBlend);
++        && std::isfinite(out.localLights.interiorBlend) && std::isfinite(out.rayVisibility) && std::isfinite(out.rayOcclusion) && std::isfinite(out.glareFade) && std::isfinite(out.glareScreenGlow);
+ 
+     if (!finite) {
+         std::memset(&out, 0, sizeof(out));
+diff --git a/Engine/Source/VolFog/VolFogInputs.h b/Engine/Source/VolFog/VolFogInputs.h
+index 8a94e08..7dbe33f 100644
+--- a/Engine/Source/VolFog/VolFogInputs.h
++++ b/Engine/Source/VolFog/VolFogInputs.h
+@@ -64,6 +64,16 @@ namespace VolFog {
+         bool glowEffectActive;          // ffxGlow is the active screen effect
+         // Added in brief B8: the scene whose CM2Scene::m_lightGrid holds the point lights of the world (World::s_m2Scene); VolFog::PrepareLights walks it.
+         CM2Scene* worldM2Scene;
++        // Added in brief B9: visibility of the body the shafts start from (the sun, or the moon when lightIsMoon). rayOcclusion is the fraction 0..1 of
++        // the body that the occlusion query of the glare (DNGlare::GetQueryOcclusion, or GetPointOcclusion without a query) sees, as the client itself
++        // uses it for its glare; rayVisibility is that value eased in and out like the glare fade (up 4 / s, down 1.5 / s) so that branches and
++        // clouds do not make the shafts pop. glareFade (DNGlare::m_fade) and glareScreenGlow (m_screenGlow) are only for the dump: they are NOT
++        // used, because the fade of the moon glare includes DNMoonGlare::GetCloudDensityFade (1 - |2 (density - 0.5)|), which is 0 under a clear
++        // sky, exactly when the moon is most visible.
++        float rayOcclusion;
++        float rayVisibility;
++        float glareFade;
++        float glareScreenGlow;
+     };
+ 
+     // The client side (WoW/Source/WorldClient/VolFogWorld.cpp) installs this when the CVars are registered: Engine/ does not depend
+diff --git a/Engine/Source/VolFog/VolFogModel.h b/Engine/Source/VolFog/VolFogModel.h
+index 7c399c0..8faf9de 100644
+--- a/Engine/Source/VolFog/VolFogModel.h
++++ b/Engine/Source/VolFog/VolFogModel.h
+@@ -79,6 +79,24 @@ namespace VolFog {
+     // The tuning with the live wolVolFogDensity.
+     ModelTuning CurrentTuning();
+ 
++    // Brief B9: the light shafts of one frame (GodRayFrame and the sun block of Renderer::RenderPasses in renderer.cpp of coa-vfog 205ade5). The body is
++    // FrameInputs::toRaySource (the visible sun, or the moon); its position on screen comes from the view and projection of the frame
++    // (VolFogRays.cpp), not from GxuXformCalc3dScreenCoords. Shared by the pass and by wolVolFogDump.
++    constexpr float kMinGodRayStrength = 0.005f;    // renderer.cpp kMinGodRayStrength: below this the shafts are not drawn
++
++    struct RayFrame {
++        float toLightInView[3];     // unit vector to the body in view space (x right, y up, z forward)
++        bool inFront;               // z > 0.05
++        float ndc[2];               // projected position, -1..1 across the viewport (only if inFront)
++        float sunPx[2];             // pixels from the top-left corner of the back buffer (only if inFront)
++        bool onScreen;              // inFront and inside the viewport (|ndc| <= 1)
++        float screenFade;           // clamp(1.6 - max(|ndcX|, |ndcY|), 0, 1): the shafts still draw a little beyond the edge, as in coa-vfog
++        float visibility;           // FrameInputs::rayVisibility
++        float strength;             // godRays * fog.lightVisibility * visibility * screenFade; 0 when the body is behind the camera
++    };
++
++    RayFrame ComputeRayFrame(const FrameInputs& in, const FogParams& fog, float godRays);
++
+     FogParams BuildFogParams(const FrameInputs& in, const ModelTuning& cfg);
+ 
+     void Mul4x4(const float* a, const float* b, float* out);
+diff --git a/Engine/Source/VolFog/VolFogRays.cpp b/Engine/Source/VolFog/VolFogRays.cpp
+new file mode 100644
+index 0000000..9e3396b
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogRays.cpp
+@@ -0,0 +1,48 @@
++#include <algorithm>
++#include <cmath>
++#include "Engine/Source/VolFog/VolFogInputs.h"
++#include "Engine/Source/VolFog/VolFogModel.h"
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B9.
++// Licensed under GPL-3.0-only. Derived from the sun block of Renderer::RenderPasses in src/renderer.cpp of coa-vfog 205ade5 (copyright of the authors of
++// CoAVolFog, jealous-sound and the contributors of the Raz0r1337 fork; see Shaders/VolFog/NOTICE-modificaciones.txt). Modified 2026-10-20 (brief B9):
++// in the namespace VolFog over FrameInputs; the strength gets the occlusion visibility of the sun or moon of the client (FrameInputs::rayVisibility).
++
++VolFog::RayFrame VolFog::ComputeRayFrame(const FrameInputs& in, const FogParams& fog, float godRays) {
++    RayFrame r = {};
++
++    VolFog::TransformDirection(in.toRaySource, in.cameraRelativeView, r.toLightInView);
++
++    const float length = std::sqrt(r.toLightInView[0] * r.toLightInView[0] + r.toLightInView[1] * r.toLightInView[1] + r.toLightInView[2] * r.toLightInView[2]);
++
++    if (!(length > 1.0e-6f) || !std::isfinite(length)) {
++        return r;
++    }
++
++    for (int i = 0; i < 3; ++i) {
++        r.toLightInView[i] /= length;
++    }
++
++    r.visibility = std::isfinite(in.rayVisibility) ? std::clamp(in.rayVisibility, 0.0f, 1.0f) : 0.0f;
++    r.inFront = r.toLightInView[2] > 0.05f;
++
++    if (!r.inFront) {
++        return r;
++    }
++
++    // renderer.cpp: ndc = view xy / z * the projection scale + its offset (proj[0], proj[5], proj[8], proj[9]); pixels from the top-left corner of the viewport.
++    const float* proj = in.glProjection;
++    r.ndc[0] = r.toLightInView[0] / r.toLightInView[2] * proj[0] + proj[8];
++    r.ndc[1] = r.toLightInView[1] / r.toLightInView[2] * proj[5] + proj[9];
++    r.sunPx[0] = static_cast<float>(in.viewport.x) + (r.ndc[0] * 0.5f + 0.5f) * static_cast<float>(in.viewport.width);
++    r.sunPx[1] = static_cast<float>(in.viewport.y) + (0.5f - r.ndc[1] * 0.5f) * static_cast<float>(in.viewport.height);
++
++    const float edge = std::max(std::fabs(r.ndc[0]), std::fabs(r.ndc[1]));
++    r.onScreen = edge <= 1.0f;
++    r.screenFade = std::isfinite(edge) ? std::clamp(1.6f - edge, 0.0f, 1.0f) : 0.0f;
++
++    const float strength = godRays * fog.lightVisibility * r.visibility * r.screenFade;
++    r.strength = std::isfinite(strength) ? std::max(strength, 0.0f) : 0.0f;
++
++    return r;
++}
+diff --git a/Engine/Source/VolFog/VolFogRender.cpp b/Engine/Source/VolFog/VolFogRender.cpp
+index b6d3e2a..e41d6b0 100644
+--- a/Engine/Source/VolFog/VolFogRender.cpp
++++ b/Engine/Source/VolFog/VolFogRender.cpp
+@@ -11,6 +11,7 @@
+ #include "Engine/Source/Tempest/C2iVector.h"
+ #include "Engine/Source/Tempest/C44Matrix.h"
+ #include "Engine/Source/Tempest/CRect.h"
++#include "Engine/Source/Tempest/CiRect.h"
+ #include "Engine/Source/VolFog/VolFog.h"
+ #include "Engine/Source/VolFog/VolFogInputs.h"
+ #include "Engine/Source/VolFog/VolFogLights.h"
+@@ -25,6 +26,9 @@
+ // Modified 2026-10-20 (brief B8): the local lights (the lit permutations of the march and the composite, c53, s8) as in Renderer::Draw.
+ // Modified 2026-10-20 (brief B7): temporal filter (history ping-pong, previous depth, reprojection matrix, per-frame jitter) as in
+ // Renderer::FilterWithHistory / Renderer::Draw of renderer.cpp; wolVolFogDebug 3 = filtered history, 4 = no temporal filter, 5 = test grid.
++// Modified 2026-10-20 (brief B9): the light shafts (sun or moon): reduced scene copy, mask, two radial blurs and the final blend, as DrawGodRayMask /
++// DrawGodRaysOverScene of renderer.cpp, over Gx; wolVolFogDebug 6 = the shaft texture. The shafts are blended after the fog, over a second copy of the
++// fogged image (the late path of coa-vfog), not inside the composition shader.
+ 
+ int32_t VolFog::s_debugMode;
+ 
+@@ -33,11 +37,15 @@ namespace {
+     // 2 magenta tint over the world view, 3 test grid. The registers follow the contract of the design (section 3).
+     class DebugPass : public VolFog::Pass {
+         public:
+-        DebugPass() : VolFog::Pass("WolVolFogDebug", 3, "WolVolFogQuad", GxBlend_Alpha) {}
++        DebugPass() : VolFog::Pass("WolVolFogDebug", 4, "WolVolFogQuad", GxBlend_Alpha) {}
++
++        // Permutation 3 (wolVolFogDebug 6, brief B9): the light shaft texture on s1, scaled by m_raysGain (0 = nothing to show, black).
++        CGxTex* m_raysTexture = nullptr;
++        float m_raysGain = 0.0f;
+ 
+         void Execute() override {
+             // The pixel constants c0..c3 belong to whoever draws next: put them back as they were.
+-            float saved[16];
++            float saved[20];
+             memcpy(saved, CGxDevice::s_shadowConstants[0].constants, sizeof(saved));
+ 
+             // wolVolFogDebug 1 (permutation 0) reads the INTZ depth as s0; Render() has checked that it exists.
+@@ -55,6 +63,7 @@ namespace {
+             float c1[4] = { 1.0f, 0.0f, texelX, texelY };
+             float c2[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+             float c3[4] = { 0.0f, 0.0f, 5000.0f, 0.94f };
++            float c4[4] = { this->m_raysGain, 0.0f, 0.0f, 0.0f };
+ 
+             // Contract of the design (section 3) from the projection the world was drawn with and its viewport depth range
+             // (World.cpp: z 0..0.94). The projection is the GL-style matrix of GxuXformCreateProjection_Exact: ndc z = c2 + d2 / z, and the
+@@ -96,7 +105,9 @@ namespace {
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 1, c1, 1);
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 2, c2, 1);
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 3, c3, 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 4, c4, 1);
+             GxRsSet(GxRs_Texture0, depth); // sDepth: POINT, CLAMP (flags of the wrapper); nullptr in the modes that do not read it
++            GxRsSet(GxRs_Texture1, this->m_pixelIndex == 3 ? this->m_raysTexture : nullptr); // sRays (wolVolFogDebug 6)
+ 
+             this->DrawQuad();
+             this->End();
+@@ -105,6 +116,7 @@ namespace {
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 1, &saved[4], 1);
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 2, &saved[8], 1);
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 3, &saved[12], 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 4, &saved[16], 1);
+         }
+     };
+ 
+@@ -133,6 +145,9 @@ namespace {
+         float localControl[4];      // c53 cLocalLightControl: lights uploaded, reach limit, phase g (B8)
+         float variation[4];         // c78 cDensityVariation
+         float composite[3][4];      // c96-c98 cComposite, cGodRayColour, cSun
++        float rayMask[2][4];        // c9-c10 cRayMask, cRaySource (WolVolFogRayMask, B9)
++        float rayBlur[2][2][4];     // c9-c10 cRadialBlur, cRayTarget of each of the two blur passes (WolVolFogRayBlur, B9)
++        float rayComposite[3][4];   // c96-c98 cComposite, cGodRayColour, cSun of WolVolFogRayComposite (B9)
+         float viewToPreviousClip[16]; // c9-c12 cViewToPreviousClip (temporal pass only, B7): current view -> previous clip, row major
+         float temporal[4];          // c13 cTemporal (temporal pass only): history weight, history valid, adaptive lighting, 0
+         float worldToView[16];      // not uploaded: becomes the "previous" view of the next frame
+@@ -143,6 +158,16 @@ namespace {
+     constexpr float kHistoryMaxMove = 30.0f;            // renderer.cpp kHistoryMaxMove: yards of camera movement in one frame (teleport, mount jump)
+     constexpr float kHistoryMinForwardDot = 0.70710678f; // renderer.cpp kHistoryMinForwardDot: turns of more than 45 degrees in one frame
+ 
++    // Light shafts (B9), the constants of renderer.cpp: the ray target is a quarter of the world viewport, the mask is pow(dot(view ray, sun), 8) of the sky
++    // pixels whose luminance is over 0.12, and the blur is 8 taps toward the sun that decay by 0.9, 0.075 of the way to the sun in the first pass and
++    // that over 8 in the second.
++    constexpr uint32_t kRayScale = 4;
++    constexpr float kRayFalloff = 8.0f;
++    constexpr float kRayThreshold = 0.12f;
++    constexpr float kRayStep = 0.075f;
++    constexpr float kRayDecay = 0.9f;
++    constexpr int kRayTaps = 8;
++
+     void NullTexFunc(EGxTexCommand command, uint32_t width, uint32_t height, uint32_t face, uint32_t level, void* userArg, uint32_t& texelStrideInBytes, const void*& texels) {
+     }
+ 
+@@ -265,6 +290,84 @@ namespace {
+             return true;
+         }
+ 
++        // Light shafts, mask (B9, sub-pass 4): the bright sky around the sun or moon from the reduced scene copy and the depth, into `target`.
++        bool DrawRayMask(const FogFrame& f, CGxTex* depth, CGxTex* scene, CGxTex* target) {
++            this->SetPixelPermutation(0);
++            this->Begin();
++
++            GxRenderTargetSet(GxBuffers_Color, target, 0);
++
++            if (target->m_needsCreation) {
++                GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++                this->End();
++
++                return false;
++            }
++
++            GxXformSetViewport(0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f);
++            GxRsSet(GxRs_ColorWrite, 15);
++            GxRsSet(GxRs_ScissorTest, 0);
++
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, &f.common[0][0], 9); // c0-c8: viewport, depth mapping, projection
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 9, &f.rayMask[0][0], 2); // c9-c10 cRayMask, cRaySource
++            FogPass::SetTexture(0, depth); // sDepth
++            FogPass::SetTexture(1, scene); // sDownsampledScene (LINEAR)
++
++            this->DrawQuad();
++
++            GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++            this->End();
++
++            return true;
++        }
++
++        // Light shafts, one radial blur (B9, sub-pass 4): 8 taps from each texel toward the sun, `source` into `target`.
++        bool DrawRayBlur(const float (*blur)[4], CGxTex* source, CGxTex* target) {
++            this->SetPixelPermutation(0);
++            this->Begin();
++
++            GxRenderTargetSet(GxBuffers_Color, target, 0);
++
++            if (target->m_needsCreation) {
++                GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++                this->End();
++
++                return false;
++            }
++
++            GxXformSetViewport(0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f);
++            GxRsSet(GxRs_ColorWrite, 15);
++            GxRsSet(GxRs_ScissorTest, 0);
++
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 9, &blur[0][0], 2); // c9-c10 cRadialBlur, cRayTarget
++            FogPass::SetTexture(0, source); // sSource (LINEAR)
++
++            this->DrawQuad();
++
++            GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++            this->End();
++
++            return true;
++        }
++
++        // Light shafts, blend (B9, sub-pass 6b): `scene` is the copy of the fogged image, `rays` the blurred shafts; writes the world viewport of the back
++        // buffer (the shader returns the scene with the shafts added).
++        void DrawRayComposite(const FogFrame& f, CGxTex* scene, CGxTex* rays) {
++            this->SetPixelPermutation(0);
++            this->Begin();
++
++            GxRsSet(GxRs_ColorWrite, 15);
++            GxRsSet(GxRs_ScissorTest, 0);
++
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, &f.common[0][0], 9);                // c0-c8
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 96, &f.rayComposite[0][0], 3);         // c96-c98 cComposite, cGodRayColour, cSun
++            FogPass::SetTexture(2, rays);  // sGodRays (LINEAR)
++            FogPass::SetTexture(3, scene); // sSceneBeforeFog: here the fogged image
++
++            this->DrawQuad();
++            this->End();
++        }
++
+         // Composite over the back buffer, full resolution inside the world viewport (sub-pass 6).
+         void DrawComposite(const FogFrame& f, uint32_t permutation, CGxTex* depth, CGxTex* fog, CGxTex* march, CGxTex* scene, CGxTex* lights) {
+             this->SetPixelPermutation(permutation);
+@@ -328,16 +431,25 @@ namespace {
+         float prevDensity;
+         int32_t prevMap;
+         double prevSeconds;
++        // Brief B9: light shafts. rays[0] / rays[1] are ARGB8, LINEAR, a quarter of the world viewport (kRayScale); raysOff = shaders or targets not available.
++        FogPass* rayMaskPass;
++        FogPass* rayBlurPass;
++        FogPass* rayCompositePass;
++        CGxTex* rays[2];
++        uint32_t rayWidth;
++        uint32_t rayHeight;
++        bool raysOff;
++        bool raysDrawn;
+     };
+ 
+     FogState s_fog;
+ 
+     std::chrono::steady_clock::time_point s_clockStart = std::chrono::steady_clock::now();
+ 
+-    CGxTex* CreateTargetTexture(uint32_t width, uint32_t height, EGxTexFormat format, const char* name) {
+-        // Exact size (GxTex_NonPow2): the shaders address the targets in texels of 1 / size. Nearest filter, clamp, a render target of the device
+-        // (the device releases it on a reset and makes it again when it is next used).
+-        CGxTexFlags flags(GxTex_Nearest, 0, 0, 0, 0, 1, 1, 0, 0, 0);
++    CGxTex* CreateTargetTexture(uint32_t width, uint32_t height, EGxTexFormat format, const char* name, EGxTexFilter filter = GxTex_Nearest) {
++        // Exact size (GxTex_NonPow2): the shaders address the targets in texels of 1 / size. Nearest filter (Linear for the light shafts, B9), clamp, a
++        // render target of the device (the device releases it on a reset and makes it again when it is next used).
++        CGxTexFlags flags(filter, 0, 0, 0, 0, 1, 1, 0, 0, 0);
+         CGxTex* texture = nullptr;
+ 
+         if (!GxTexCreate(GxTex_NonPow2, width, height, 0, format, format, flags, nullptr, NullTexFunc, name, texture)) {
+@@ -386,6 +498,10 @@ namespace {
+             s_fog.historyHeight = 0;
+             s_fog.historyIndex = 0;
+             s_fog.historyValid = false;
++            s_fog.rays[0] = nullptr;
++            s_fog.rays[1] = nullptr;
++            s_fog.rayWidth = 0;
++            s_fog.rayHeight = 0;
+             s_fog.device = g_theGxDevicePtr;
+             historyReset = true;
+         }
+@@ -447,6 +563,32 @@ namespace {
+         return s_fog.history[0] && s_fog.history[1] && s_fog.historyDepth;
+     }
+ 
++    // Brief B9: the two ping-pong targets of the light shafts (ARGB8, LINEAR: the blur and the blend read them with bilinear filtering, as coa-vfog does).
++    // Called only on frames that draw shafts. EnsureTargets has already dropped the old pointers if the device changed.
++    bool EnsureRayTargets(uint32_t width, uint32_t height) {
++        if (s_fog.rays[0] && s_fog.rays[1] && s_fog.rayWidth == width && s_fog.rayHeight == height) {
++            return true;
++        }
++
++        for (int i = 0; i < 2; i++) {
++            if (s_fog.rays[i]) {
++                GxTexDestroy(s_fog.rays[i]);
++                s_fog.rays[i] = nullptr;
++            }
++        }
++
++        s_fog.rays[0] = CreateTargetTexture(width, height, GxTex_Argb8888, "VolFog rays 0", GxTex_Linear);
++        s_fog.rays[1] = CreateTargetTexture(width, height, GxTex_Argb8888, "VolFog rays 1", GxTex_Linear);
++        s_fog.rayWidth = width;
++        s_fog.rayHeight = height;
++
++        char line[160];
++        std::snprintf(line, sizeof(line), "wolVolFog: light shaft targets %ux%u ARGB8 x2", width, height);
++        Say(line);
++
++        return s_fog.rays[0] && s_fog.rays[1];
++    }
++
+     bool Normalize3(float* v) {
+         float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+ 
+@@ -593,6 +735,67 @@ namespace {
+         return true;
+     }
+ 
++    // Brief B9: the constants of the shaft passes (DrawGodRayMask and DrawGodRaysOverScene of renderer.cpp). The direction to the body and its position
++    // on the screen come from VolFog::ComputeRayFrame; the colour is the one of the fog model (the sun colour, or the direct light colour of the moon).
++    void PackRays(const VolFog::FrameInputs& in, const VolFog::FogParams& fog, const VolFog::RayFrame& r, uint32_t rayWidth, uint32_t rayHeight, FogFrame& f) {
++        const float invWidth = 1.0f / static_cast<float>(rayWidth);
++        const float invHeight = 1.0f / static_cast<float>(rayHeight);
++
++        const float mask[2][4] = {
++            { r.toLightInView[0], r.toLightInView[1], r.toLightInView[2], kRayFalloff },
++            { 0.0f, kRayThreshold, invWidth, invHeight },
++        };
++        std::memcpy(f.rayMask, mask, sizeof(mask));
++
++        float norm = 0.0f;
++
++        for (int k = 0; k < kRayTaps; ++k) {
++            norm += std::pow(kRayDecay, static_cast<float>(k));
++        }
++
++        const float sunU = (r.sunPx[0] - static_cast<float>(in.viewport.x)) / static_cast<float>(in.viewport.width);
++        const float sunV = (r.sunPx[1] - static_cast<float>(in.viewport.y)) / static_cast<float>(in.viewport.height);
++        float step = kRayStep;
++
++        for (int pass = 0; pass < 2; ++pass) {
++            const float blur[2][4] = {
++                { sunU, sunV, step, 1.0f / norm },
++                { static_cast<float>(rayWidth), static_cast<float>(rayHeight), invWidth, invHeight },
++            };
++            std::memcpy(f.rayBlur[pass], blur, sizeof(blur));
++            step /= static_cast<float>(kRayTaps);
++        }
++
++        // cComposite.y = strength (cComposite.x, z, w are unused by the blend), cGodRayColour, cSun.xy = the body in pixels, cSun.w = glow compensation (B10).
++        f.rayComposite[0][1] = r.strength;
++        f.rayComposite[1][0] = fog.rayColor[0];
++        f.rayComposite[1][1] = fog.rayColor[1];
++        f.rayComposite[1][2] = fog.rayColor[2];
++        f.rayComposite[2][0] = r.sunPx[0];
++        f.rayComposite[2][1] = r.sunPx[1];
++    }
++
++    // Sub-pass 4 (B9): the world viewport of the back buffer as it is before the fog, reduced to rays[0] with a LINEAR stretch (StretchRect, as
++    // CopySceneForGodRays), the mask into rays[1], and the two radial blurs (rays[1] -> rays[0] -> rays[1]). False if a target or a pass failed.
++    bool DrawRays(const FogFrame& f, CGxTex* depth, const VolFog::Viewport& vp, uint32_t rayWidth, uint32_t rayHeight) {
++        CiRect destination;
++        destination.minX = 0;
++        destination.minY = 0;
++        destination.maxX = static_cast<int32_t>(rayWidth);
++        destination.maxY = static_cast<int32_t>(rayHeight);
++
++        CiRect source;
++        source.minX = static_cast<int32_t>(vp.x);
++        source.minY = static_cast<int32_t>(vp.y);
++        source.maxX = static_cast<int32_t>(vp.x + vp.width);
++        source.maxY = static_cast<int32_t>(vp.y + vp.height);
++
++        return GxTexStretch(s_fog.rays[0], &destination, &source, 0, 0) != 0
++            && s_fog.rayMaskPass->DrawRayMask(f, depth, s_fog.rays[0], s_fog.rays[1])
++            && s_fog.rayBlurPass->DrawRayBlur(f.rayBlur[0], s_fog.rays[1], s_fog.rays[0])
++            && s_fog.rayBlurPass->DrawRayBlur(f.rayBlur[1], s_fog.rays[0], s_fog.rays[1]);
++    }
++
+     enum FogResult { FogOk, FogTransient, FogFailed };
+ 
+     // FogOk: the frame drew (or legitimately had nothing to draw). FogTransient: nothing could be drawn this frame (no depth yet, no camera): Armed() is
+@@ -600,6 +803,7 @@ namespace {
+     // `debugMode`: 0 normal; 2 the raw march buffer on screen; 3 the filtered history on screen; 4 normal image without the temporal filter (B7).
+     FogResult RenderFog(int32_t debugMode, bool& liquid) {
+         liquid = false;
++        s_fog.raysDrawn = false;
+ 
+         // Brief B7: the history is only good for the very next frame, and only if that one drew everything. It becomes valid again at the end of
+         // a frame that drew with the filter; every early return below (no depth, no camera, underwater, failure) leaves it invalid.
+@@ -715,6 +919,34 @@ namespace {
+             temporal = false;
+         }
+ 
++        // Brief B9: light shafts. They are drawn when wolVolFogGodRays and the visibility of the sun or moon give a strength over kMinGodRayStrength, the
++        // body is in front of the camera and not too far outside the viewport (VolFog::ComputeRayFrame); wolVolFogDebug 6 computes them whatever the
++        // strength is, to show the texture. Not in the transmittance views (2, 3), which show other things.
++        const VolFog::RayFrame rayFrame = VolFog::ComputeRayFrame(in, fog, settings.godRays);
++        const bool rayDebug = debugMode == 6;
++        const bool rayModes = debugMode == 0 || debugMode == 4 || rayDebug;
++        const uint32_t rayWidth = std::max(in.viewport.width / kRayScale, 1u);
++        const uint32_t rayHeight = std::max(in.viewport.height / kRayScale, 1u);
++        bool wantRays = rayModes && !s_fog.raysOff && rayFrame.inFront && rayFrame.screenFade > 0.0f && (rayFrame.strength > VolFog::kMinGodRayStrength || rayDebug);
++
++        if (wantRays) {
++            if (!s_fog.rayMaskPass) {
++                s_fog.rayMaskPass = new FogPass("WolVolFogRayMask", 1);
++                s_fog.rayBlurPass = new FogPass("WolVolFogRayBlur", 1);
++                s_fog.rayCompositePass = new FogPass("WolVolFogRayComposite", 1);
++            }
++
++            if (!s_fog.rayMaskPass->Valid() || !s_fog.rayBlurPass->Valid() || !s_fog.rayCompositePass->Valid()) {
++                Say("wolVolFog: the shaders WolVolFogRayMask / WolVolFogRayBlur / WolVolFogRayComposite are not valid (is Data\\patch-Z.MPQ up to date?); the light shafts stay off.");
++                s_fog.raysOff = true;
++                wantRays = false;
++            } else if (!EnsureRayTargets(rayWidth, rayHeight)) {
++                Say("wolVolFog: the light shaft targets could not be created; the light shafts stay off.");
++                s_fog.raysOff = true;
++                wantRays = false;
++            }
++        }
++
+         FogFrame frame;
+ 
+         // debug view in the composite: 2 = transmittance of the fog it is given (debug 2: the march, debug 3: the filtered history)
+@@ -727,6 +959,10 @@ namespace {
+         frame.localControl[0] = static_cast<float>(lightCount);
+         frame.localControl[1] = lightCount > 0 ? VolFog::LightReachLimit() : 0.0f;
+ 
++        if (wantRays) {
++            PackRays(in, fog, rayFrame, rayWidth, rayHeight, frame);
++        }
++
+         // The constants the fog overwrites belong to whoever draws next: put them back as they were.
+         float saved[kMarchConstants * 4];
+         std::memcpy(saved, CGxDevice::s_shadowConstants[0].constants, sizeof(saved));
+@@ -768,6 +1004,18 @@ namespace {
+             fogTex = s_fog.march; // wolVolFogDebug 2 keeps showing the raw march
+         }
+ 
++        // Sub-pass 4 (B9): the shafts, from the scene as it is before the fog; the stretch reads the back buffer, which the composite has not touched yet.
++        bool raysReady = false;
++
++        if (drawn && wantRays) {
++            raysReady = DrawRays(frame, depth, in.viewport, rayWidth, rayHeight);
++
++            if (!raysReady) {
++                Say("wolVolFog: the light shaft passes could not run (target not created on the device); the light shafts stay off.");
++                s_fog.raysOff = true;
++            }
++        }
++
+         if (drawn) {
+             // Sub-pass 3: the scene as it is before the fog, the world viewport of the back buffer into a texture of exactly that size.
+             C2iVector destination = { 0, 0 };
+@@ -777,9 +1025,19 @@ namespace {
+ 
+             if (drawn) {
+                 s_fog.compositePass->DrawComposite(frame, permutation, depth, fogTex, s_fog.march, s_fog.scene, lightTex);
++
++                // Sub-pass 6b (B9): copy the fogged image once more and blend the shafts over it (the late path of coa-vfog). wolVolFogDebug 6 shows
++                // the shaft texture instead, drawn by VolFog::Render() over this.
++                if (raysReady && !rayDebug && rayFrame.strength > VolFog::kMinGodRayStrength) {
++                    if (GxTexCopy(s_fog.scene, destination, source, size, 0, 0) != 0) {
++                        s_fog.rayCompositePass->DrawRayComposite(frame, s_fog.scene, s_fog.rays[1]);
++                    }
++                }
+             }
+         }
+ 
++        s_fog.raysDrawn = raysReady;
++
+         g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, saved, kMarchConstants);
+ 
+         if (drawn) {
+@@ -825,7 +1083,9 @@ namespace {
+         }
+ 
+         // Brief B7: the grid moved from 3 to 5 (3 is now the filtered history); the permutations of WolVolFogDebug are still 0 depth, 1 tint, 2 grid.
+-        s_debugPass->SetPixelPermutation(mode == 5 ? 2u : static_cast<uint32_t>(mode - 1));
++        s_debugPass->SetPixelPermutation(mode == 5 ? 2u : mode == 6 ? 3u : static_cast<uint32_t>(mode - 1));
++        s_debugPass->m_raysTexture = mode == 6 ? s_fog.rays[1] : nullptr; // brief B9: the shaft texture, black when the frame drew no shafts
++        s_debugPass->m_raysGain = mode == 6 && s_fog.raysDrawn ? 1.0f : 0.0f;
+ 
+         if (!s_debugPass->Valid()) {
+             // Failure policy (design 1.3): say it once, draw nothing, touch nothing else.
+@@ -876,6 +1136,7 @@ void VolFog::Render() {
+         s_fog.hardMessage = false;
+         s_fog.litMessage = false;
+         s_fog.temporalOff = false; // B7: the history targets are made again, and the contents of the old ones are gone
++        s_fog.raysOff = false; // B9: the shaft shaders and targets are tried again
+         s_fog.historyValid = false;
+         VolFog::SetHardFailure(false);
+         VolFog::SetFrameResult(true, false);
+@@ -890,9 +1151,9 @@ void VolFog::Render() {
+     }
+ 
+     if (VolFog::s_mode <= 0) {
+-        if (debugMode >= 2 && debugMode <= 4 && !s_fog.noDepthDebugWarned) {
++        if (((debugMode >= 2 && debugMode <= 4) || debugMode == 6) && !s_fog.noDepthDebugWarned) {
+             s_fog.noDepthDebugWarned = true;
+-            Say("wolVolFogDebug 2-4 show the volumetric fog (2 march buffer, 3 filtered history, 4 no temporal filter): set wolVolFog 1-3 first (and gxRestart).");
++            Say("wolVolFogDebug 2-4 and 6 show the volumetric fog (2 march buffer, 3 filtered history, 4 no temporal filter, 6 light shafts): set wolVolFog 1-3 first (and gxRestart).");
+         }
+ 
+         return;
+@@ -905,6 +1166,10 @@ void VolFog::Render() {
+     bool liquid = false;
+     FogResult result = RenderFog(debugMode, liquid);
+ 
++    if (debugMode == 6 && result == FogOk) {
++        RenderDebugView(6); // brief B9: the shaft texture over the world viewport (black if this frame drew none)
++    }
++
+     if (result == FogOk) {
+         s_fog.consecutiveFailures = 0;
+     } else if (result == FogFailed && !VolFog::HardFailure() && ++s_fog.consecutiveFailures >= 3) {
+@@ -915,3 +1180,7 @@ void VolFog::Render() {
+ 
+     VolFog::SetFrameResult(result == FogOk, liquid);
+ }
++
++bool VolFog::RaysDrawn() {
++    return s_fog.raysDrawn;
++}
+diff --git a/Shaders/VolFog/CMakeLists.txt b/Shaders/VolFog/CMakeLists.txt
+index 922d1d0..8a3eeea 100644
+--- a/Shaders/VolFog/CMakeLists.txt
++++ b/Shaders/VolFog/CMakeLists.txt
+@@ -101,7 +101,7 @@ endfunction ()
+ # B2: quad vertex shader (vf_fullscreen_vs.hlsl as it is) and the debug pixel shader (wolVolFogDebug 1..3).
+ # The remaining vf_*.hlsl are compiled from brief B7 on (design, section 3).
+ volfog_shader(WolVolFogQuad vs vf_fullscreen_vs.hlsl)
+-volfog_shader(WolVolFogDebug ps WolVolFogDebug.hlsl PERMUTATIONS "DEBUG_MODE=1" "DEBUG_MODE=2" "DEBUG_MODE=3")
++volfog_shader(WolVolFogDebug ps WolVolFogDebug.hlsl PERMUTATIONS "DEBUG_MODE=1" "DEBUG_MODE=2" "DEBUG_MODE=3" "DEBUG_MODE=4")
+ 
+ # B6: ray march and composite. Six permutations each, index = (quality - 1) * 2 + localLights: STEPS 16 / 24 / 32 (wolVolFog 1 / 2 / 3)
+ # times LOCAL_LIGHTS 0 / 1 (the macros of vf_integrate.hlsli). B6 draws only the LOCAL_LIGHTS=0 ones; the others are compiled for B8.
+@@ -121,6 +121,12 @@ volfog_shader(WolVolFogComposite ps vf_composite.hlsl PERMUTATIONS
+ volfog_shader(WolVolFogTemporal ps vf_temporal.hlsl)
+ volfog_shader(WolVolFogHistoryDepth ps vf_history_depth.hlsl)
+ 
++# B9: light shafts (god rays). Mask of the bright sky around the sun or moon, radial blur (two passes of the same shader) and the final blend over
++# the fogged image, one permutation each. vf_ray_mask.hlsl, vf_ray_blur.hlsl and vf_ray_composite.hlsl are compiled as they are in coa-vfog.
++volfog_shader(WolVolFogRayMask ps vf_ray_mask.hlsl)
++volfog_shader(WolVolFogRayBlur ps vf_ray_blur.hlsl)
++volfog_shader(WolVolFogRayComposite ps vf_ray_composite.hlsl)
++
+ add_custom_command(
+     OUTPUT ${VOLFOG_MPQ}
+     COMMAND "${VOLFOG_PYTHON}" -I ${VOLFOG_MKMPQ} ${VOLFOG_MPQ} ${VOLFOG_STAGE} ${VOLFOG_BLS_FILES}
+diff --git a/Shaders/VolFog/NOTICE-modificaciones.txt b/Shaders/VolFog/NOTICE-modificaciones.txt
+index 817d8e8..a8be407 100644
+--- a/Shaders/VolFog/NOTICE-modificaciones.txt
++++ b/Shaders/VolFog/NOTICE-modificaciones.txt
+@@ -88,3 +88,30 @@ Modifications (GPLv3 section 5a), dated
+   - vf_march.hlsl, vf_composite.hlsl/.hlsli, vf_integrate.hlsli and vf_local_lights.hlsli are unchanged: the LOCAL_LIGHTS = 1 permutations were already
+     compiled in B6 and are chosen here when at least one light is uploaded.
+   - Engine/Source/VolFog/VolFogRender.cpp: lit permutation (index (quality - 1) * 2 + 1), c53, s8 for the march and the composite.
++
++2026-10-20  Brief B9 (World of Legends, native volumetric fog, phase 3: light shafts and NaN guard).
++  - vf_ray_mask.hlsl, vf_ray_blur.hlsl and vf_ray_composite.hlsl are compiled as they are (CMakeLists.txt, one permutation each: WolVolFogRayMask,
++    WolVolFogRayBlur, WolVolFogRayComposite); no change in the three sources. Registers as in coa-vfog: mask c9 cRayMask (view direction to the body
++    + falloff exponent 8), c10 cRaySource (0, luminance threshold 0.12, 1 / ray width, 1 / ray height), s0 depth, s1 reduced scene; blur c9
++    cRadialBlur (body uv, step fraction, 1 / sum of the tap weights), c10 cRayTarget (ray size, texel); blend c96-c98 cComposite (y = strength),
++    cGodRayColour, cSun (xy = body in pixels), s2 shafts, s3 the image to blend over.
++  - NaN guard. vf_temporal.hlsl: main() is now a wrapper that sends the filter result (TemporalResult(), the old main) through SanitiseHistory():
++    radiance clamped to 0..1024 with a comparison (a NaN fails "x >= 0" and becomes 0, because max(NaN, 0) is not defined the same way on every
++    driver) and the fourth channel saturated; the 16 bit history is read back by the next frame, so a NaN or an infinity written once would stay for
++    good (the B8 report mentions one unexplained dark band; this closes the way for non finite values to persist). vf_composite.hlsli: SanitiseFog()
++    on the fog read back from the march / history right after the exposure (radiance 0..1024, opacity saturated), and SanitiseGodRays() (0..16) in
++    BlendGodRays() in place of max(godRays, 0). Before this brief neither shader bounded its output: BlendGodRays only had max(godRays, 0), and the
++    temporal filter had no guard at all (its clamp() against the neighbourhood range lets a NaN through). Both lines are the only changes in the two files.
++  - WolVolFogDebug.hlsl (new in B2, ours): permutation 4 (DEBUG_MODE=4, wolVolFogDebug 6) shows the shaft texture (s1) over the world viewport, scaled
++    by c4.x (0 = black, used when the frame draws no shafts).
++  - Engine/Source/VolFog/VolFogRender.cpp: the targets (rays[0], rays[1], ARGB8, LINEAR, a quarter of the world viewport), the reduced scene copy
++    (GxTexStretch = StretchRect with a linear filter, CopySceneForGodRays), the mask, the two radial blurs (step 0.075 and 0.075 / 8, 8 taps, decay 0.9,
++    DrawGodRayMask) and the blend (DrawGodRaysOverScene, over a second copy of the fogged image: the late path of coa-vfog, not inside the composition
++    shader) follow renderer.cpp, rewritten over Gx. The silhouette mask (vf_silhouette_mask.hlsl, MarkSilhouetteSamples) is not part of the shafts in coa-vfog:
++    it only serves the sample-split composite of multisampled depth (DrawCompositeBySampleDepth), so it stays unused here (the fog forces MSAA off).
++  - Engine/Source/VolFog/VolFogRays.cpp (new): ComputeRayFrame(), the sun block of Renderer::RenderPasses (position of the body on the screen from the
++    view and projection of the frame, screen fade clamp(1.6 - max(|ndc|), 0, 1), strength). Added: the strength is also multiplied by the occlusion
++    visibility of the sun or moon (FrameInputs::rayVisibility, filled in WoW/Source/WorldClient/VolFogWorld.cpp from DNGlare::GetQueryOcclusion, or
++    GetPointOcclusion without a query, eased up 4 / s and down 1.5 / s). DNGlare::m_screenGlow is not used: the fade of the moon glare is 0 under a
++    clear sky (DNMoonGlare::GetCloudDensityFade), when the moon is most visible.
++  - wolVolFogDump (VolFogDump.cpp) prints two "rays:" lines; wolVolFogDebug 6 is accepted (WorldParam_CVar.cpp) and keeps the fog armed (VolFog.cpp).
+diff --git a/Shaders/VolFog/WolVolFogDebug.hlsl b/Shaders/VolFog/WolVolFogDebug.hlsl
+index 1ab0ab9..3776491 100644
+--- a/Shaders/VolFog/WolVolFogDebug.hlsl
++++ b/Shaders/VolFog/WolVolFogDebug.hlsl
+@@ -1,18 +1,22 @@
+ // Not in the original client (World of Legends): debug pixel shader of the native volumetric fog (wolVolFogDebug),
+ // brief B2. Written for this project, GPL-3.0-only like the rest of Shaders/VolFog (see LICENSE and
+ // NOTICE-modificaciones.txt). The register contract is the one of vf_common.hlsli (coa-vfog 205ade5).
+-// Compiled by fxc as ps_3_0, one permutation per mode: /D DEBUG_MODE=1|2|3 (WolVolFogDebug.bls permutation = mode - 1).
++// Compiled by fxc as ps_3_0, one permutation per mode: /D DEBUG_MODE=1|2|3|4 (WolVolFogDebug.bls permutation = mode - 1).
+ //   1: depth buffer linearised in grey, sky white (reads sDepth, the INTZ depth of brief B3; c3.z = far plane here)
+ //   2: semi-transparent magenta tint over the whole world view
+ //   3: test grid every 64 px (green) with a red border on the world viewport
++//   4: (brief B9, wolVolFogDebug 6) the light shaft texture (mask after the two radial blurs) over the world viewport, scaled by c4.x
++//      (0 when the frame has no shafts); reads sRays (s1)
+ #ifndef DEBUG_MODE
+-#error DEBUG_MODE must be 1, 2 or 3
++#error DEBUG_MODE must be 1, 2, 3 or 4
+ #endif
+ 
+ float4 cWorldViewportPx : register(c0); // xy origin, zw size of the world viewport, in pixels
+ float4 cPixelGrid : register(c1);       // zw = size of one texel of the depth texture
+ float4 cDepthToViewZ : register(c3);    // x depth at infinite z, y depth per 1/z, z max distance, w deepest world depth
++float4 cDebugGain : register(c4);       // x = gain of the light shaft view (mode 4)
+ sampler2D sDepth : register(s0);
++sampler2D sRays : register(s1);
+ 
+ static const float kSkyMinDepth = 0.95;
+ 
+@@ -39,7 +43,10 @@ float4 main(float2 pixel : VPOS) : COLOR0
+     float border = (any(local < 2.0) || any(local > cWorldViewportPx.zw - 3.0)) ? 1.0 : 0.0;
+     float3 colour = lerp(float3(0, 1, 0), float3(1, 0, 0), border);
+     return float4(colour, saturate(grid + border) * 0.85);
++#elif DEBUG_MODE == 4
++    float2 uv = (pixel + 0.5 - cWorldViewportPx.xy) / cWorldViewportPx.zw;
++    return float4(tex2Dlod(sRays, float4(uv, 0, 0)).rgb * cDebugGain.x, 1);
+ #else
+-#error DEBUG_MODE must be 1, 2 or 3
++#error DEBUG_MODE must be 1, 2, 3 or 4
+ #endif
+ }
+diff --git a/Shaders/VolFog/vf_composite.hlsli b/Shaders/VolFog/vf_composite.hlsli
+index c40390a..7df857e 100644
+--- a/Shaders/VolFog/vf_composite.hlsli
++++ b/Shaders/VolFog/vf_composite.hlsli
+@@ -10,6 +10,22 @@ sampler2D sSceneBeforeFog : register(s3);
+ sampler2D sCurrentMarch : register(s4);
+ 
+ static const float kHighlightKnee = 0.8;
++// Modified for World of Legends (2026-10-20, brief B9): value guard for the composition (see NOTICE-modificaciones.txt). The fog read back from
++// the 16 bit march / history targets and the light shafts go through these two limits before they reach the back buffer, so that a NaN or an
++// infinity cannot paint the screen. A comparison is used on top of max/min because max(NaN, 0) is not defined the same way on every driver.
++static const float kMaxFogRadiance = 1024;
++static const float kMaxGodRayRadiance = 16;
++
++float4 SanitiseFog(float4 fog)
++{
++    float3 radiance = (fog.rgb >= 0) ? min(fog.rgb, kMaxFogRadiance) : 0;
++    return float4(radiance, saturate(fog.a));
++}
++
++float3 SanitiseGodRays(float3 godRays)
++{
++    return (godRays >= 0) ? min(godRays, kMaxGodRayRadiance) : 0;
++}
+ static const float kSunMarkerRadius = 6;
+ static const float4 kSunMarkerColour = float4(1, 0, 0, 1);
+ static const float kDebugRadiance = 1;
+@@ -285,7 +301,7 @@ float3 BlendGodRays(float3 colour, float3 godRays)
+     {
+         float glow = ClientGlowToCompensate();
+         float3 displayed = colour * (1 + glow * colour);
+-        displayed += max(1 - displayed, 0) * (1 - exp(-max(godRays, 0)));
++        displayed += max(1 - displayed, 0) * (1 - exp(-SanitiseGodRays(godRays)));
+         colour = BeforeClientGlow(displayed, glow);
+     }
+     return colour;
+@@ -326,6 +342,7 @@ float4 CompositeAtDepth(float2 pixel, float depth)
+     float viewZ = LinearDepth(depth);
+     float4 fog = DepthAwareUpsample(pixel, depth, viewZ);
+     fog.rgb *= Exposure();
++    fog = SanitiseFog(fog);
+ 
+     float2 viewportUv = (pixel - ViewportOrigin()) / ViewportSize();
+     float3 godRays = DisplaySpaceGodRays(viewportUv);
+diff --git a/Shaders/VolFog/vf_temporal.hlsl b/Shaders/VolFog/vf_temporal.hlsl
+index 153db27..5e49f2b 100644
+--- a/Shaders/VolFog/vf_temporal.hlsl
++++ b/Shaders/VolFog/vf_temporal.hlsl
+@@ -138,7 +138,7 @@ float4 SameSurfaceCurrentAverage(float2 lowResTexel, float viewZ, float depthCla
+     return sum / max(weightSum, 1);
+ }
+ 
+-float4 main(float2 lowResTexel : VPOS) : COLOR0
++float4 TemporalResult(float2 lowResTexel)
+ {
+     float2 uv = LowResTexelToUv(lowResTexel);
+     float2 pixel = LowResTexelToFullPixel(lowResTexel);
+@@ -156,3 +156,19 @@ float4 main(float2 lowResTexel : VPOS) : COLOR0
+     float4 history = clamp(reprojected.value, lowest, highest);
+     return lerp(current, history, LightingHistoryWeight(current.rgb, history.rgb));
+ }
++
++// Modified for World of Legends (2026-10-20, brief B9): the filtered value is written to a 16 bit history that the next frame reads back, so a
++// NaN or an infinity would stay in the feedback loop for good. Everything that leaves the filter is bounded: radiance in 0..1024, the fourth
++// channel in 0..1. The comparison sends a NaN to 0 where max(NaN, 0) is not defined the same way on every driver (see NOTICE-modificaciones.txt).
++static const float kMaxHistoryRadiance = 1024;
++
++float4 SanitiseHistory(float4 value)
++{
++    float3 radiance = (value.rgb >= 0) ? min(value.rgb, kMaxHistoryRadiance) : 0;
++    return float4(radiance, saturate(value.a));
++}
++
++float4 main(float2 lowResTexel : VPOS) : COLOR0
++{
++    return SanitiseHistory(TemporalResult(lowResTexel));
++}
+diff --git a/WoW/Source/WorldClient/VolFogWorld.cpp b/WoW/Source/WorldClient/VolFogWorld.cpp
+index bd17d2a..fe2d26b 100644
+--- a/WoW/Source/WorldClient/VolFogWorld.cpp
++++ b/WoW/Source/WorldClient/VolFogWorld.cpp
+@@ -20,11 +20,13 @@
+ #include "WoW/Source/WorldClient/MapObj.h"
+ #include "WoW/Source/WorldClient/MapObjDef.h"
+ #include "WoW/Source/WorldClient/MapObjGroup.h"
++#include "WoW/Source/WorldClient/WorldParam.h"
+ #include "WoW/Source/WorldClient/World.h"
+ 
+ // Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B5.
+ // Modified 2026-10-20 (brief B6b): toLight is the visible sun or moon (= toRaySource, as in coa-vfog), and the fog values come from the copy
+ // of DNInfo::m_fogInterior that DayNight::UpdateFog keeps before pushing the live groups out of range. Brief B8: FrameInputs::worldM2Scene.
++// Brief B9: FrameInputs::rayOcclusion / rayVisibility (the occlusion of the sun or moon glare, eased), glareFade, glareScreenGlow (dump only).
+ // Licensed under GPL-3.0-only. This is the client side of FrameInputs (src/engine.h of coa-vfog 205ade5 reads the same values from
+ // fixed addresses of the 3.3.5 binary; see Shaders/VolFog/NOTICE-modificaciones.txt). Written 2026-10-20 (brief B5).
+ //
+@@ -124,6 +126,30 @@ namespace {
+         std::memcpy(out.toRaySource, out.lightIsMoon ? toMoon : toSun, sizeof(out.toRaySource));
+         std::memcpy(out.toLight, out.toRaySource, sizeof(out.toLight));
+ 
++        // Brief B9: visibility of that body for the shafts (see FrameInputs::rayVisibility): the occlusion of the glare of the sun or the moon, the
++        // same choice as DNGlare::GetOcclusionFade (the query when the glare has one and the occlusion CVar is on, the point test otherwise) but
++        // without its early exits (the client does not even ask for the moon when its glare fade is 0) and without the clouds or the screen glow.
++        // It begins and ends the query of the glare at most once per frame: a second call in the same frame finds the result not ready and returns the
++        // stored pixel count (DNGlare::GetQueryOcclusion), so the dump and the pass do not disturb the client's own call for the sun.
++        DayNight::DNGlare* glare = out.lightIsMoon ? static_cast<DayNight::DNGlare*>(&DayNight::g_moonGlare) : static_cast<DayNight::DNGlare*>(&DayNight::g_sunGlare);
++        float occlusion = 0.0f;
++
++        if (DayNight::GlareBase::m_masterEnable && glare->m_enable && glare->m_planet) {
++            occlusion = glare->m_occlusionQuery && CWorldParam::cvar_occlusion && CWorldParam::cvar_occlusion->m_intValue ? glare->GetQueryOcclusion() : glare->GetPointOcclusion();
++        }
++
++        out.rayOcclusion = std::isfinite(occlusion) ? std::clamp(occlusion, 0.0f, 1.0f) : 0.0f;
++
++        // Easing (the fade rates of InitSunGlare / InitMoonGlare): up 4 / s, down 1.5 / s, from the frame time of the client. Two reads in the same
++        // frame (dump + pass) move it twice by at most a frame's worth.
++        static float s_visibility = 0.0f;
++        const float deltaSec = std::isfinite(info.m_deltaSec) ? std::clamp(info.m_deltaSec, 0.0f, 0.25f) : 0.0f;
++        const float step = (out.rayOcclusion > s_visibility ? 4.0f : 1.5f) * deltaSec;
++        s_visibility = out.rayOcclusion > s_visibility ? std::min(s_visibility + step, out.rayOcclusion) : std::max(s_visibility - step, out.rayOcclusion);
++        out.rayVisibility = s_visibility;
++        out.glareFade = std::isfinite(glare->m_fade) ? std::clamp(glare->m_fade, 0.0f, 1.0f) : 0.0f;
++        out.glareScreenGlow = std::isfinite(glare->m_screenGlow) ? std::clamp(glare->m_screenGlow, 0.0f, 1.0f) : 0.0f;
++
+         const DayNight::VolFogSourceFog& sourceFog = DayNight::s_volFogSourceFog; // brief B6b: the real values of the frame, before UpdateFog pushes the live ones out of range
+         out.fogColor = Pack(sourceFog.m_color);
+         out.sunColor = Pack(info.m_bands.m_sunCloudColors[0]);
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index 291d942..11b7cf4 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -776,17 +776,17 @@ bool CWorldParam::WolVolFogCallback(CVar* var, const char* oldValue, const char*
+ 
+ // Not in the original client. Debug view of the native volumetric fog pass (VolFog::Render, brief B2): 0 draws nothing,
+ // 1 depth in grey (needs the INTZ depth of brief B3), 2 the raw march buffer of the fog (brief B6; was a magenta tint in B2), 3 the filtered
+-// history (brief B7; was the test grid), 4 the image without the temporal filter (B7), 5 test grid (moved from 3 in B7).
++// history (brief B7; was the test grid), 4 the image without the temporal filter (B7), 5 test grid (moved from 3 in B7), 6 the light shaft texture (B9).
+ // The value is read every frame, so no restart is needed.
+ bool CWorldParam::WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
+     int32_t mode = -1;
+ 
+-    if (value && value[0] >= '0' && value[0] <= '5' && value[1] == '\0') {
++    if (value && value[0] >= '0' && value[0] <= '6' && value[1] == '\0') {
+         mode = value[0] - '0';
+     }
+ 
+     if (mode < 0) {
+-        ConsoleWrite("wolVolFogDebug must be 0 (off), 1 (depth), 2 (march buffer), 3 (filtered history), 4 (no temporal filter) or 5 (grid).", DEFAULT_COLOR);
++        ConsoleWrite("wolVolFogDebug must be 0 (off), 1 (depth), 2 (march buffer), 3 (filtered history), 4 (no temporal filter), 5 (grid) or 6 (light shafts).", DEFAULT_COLOR);
+ 
+         return false;
+     }
+@@ -893,7 +893,7 @@ void CWorldParam::RegisterVolFogCVars() {
+     VolFog::s_messageHook = WolVolFogMessage;
+     CWorldParam::cvar_wolVolFog = CVar::Register("wolVolFog", "Native volumetric fog (0 off, 1 low, 2 medium, 3 high); needs gxRestart to turn on or off", 1, "0", CWorldParam::WolVolFogCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Debug view of the native volumetric fog pass (brief B2).
+-    CWorldParam::cvar_wolVolFogDebug = CVar::Register("wolVolFogDebug", "Volumetric fog debug view (0 off, 1 depth, 2 march buffer, 3 filtered history, 4 no temporal filter, 5 grid)", 1, "0", CWorldParam::WolVolFogDebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolVolFogDebug = CVar::Register("wolVolFogDebug", "Volumetric fog debug view (0 off, 1 depth, 2 march buffer, 3 filtered history, 4 no temporal filter, 5 grid, 6 light shafts)", 1, "0", CWorldParam::WolVolFogDebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Brief B4: density, light shafts and scattered point lights; saved, applied at once.
+     CWorldParam::cvar_wolVolFogDensity = CVar::Register("wolVolFogDensity", "Volumetric fog density multiplier (0.0 to 4.0)", 1, "1.0", CWorldParam::WolVolFogDensityCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolVolFogGodRays = CVar::Register("wolVolFogGodRays", "Volumetric fog light shaft strength (0.0 off to 1.0)", 1, "0.0", CWorldParam::WolVolFogGodRaysCallback, CATEGORY_GRAPHICS, false, nullptr, false);

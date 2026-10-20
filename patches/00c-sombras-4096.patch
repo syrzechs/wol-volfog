@@ -1,0 +1,139 @@
+diff --git a/Engine/Source/ShaderEffect/ShadowCache.cpp b/Engine/Source/ShaderEffect/ShadowCache.cpp
+index 0f577b8..572dd9b 100644
+--- a/Engine/Source/ShaderEffect/ShadowCache.cpp
++++ b/Engine/Source/ShaderEffect/ShadowCache.cpp
+@@ -46,6 +46,9 @@ int32_t CShadowCache::s_needsRebuild;
+ // STATIC: 0x00D43150
+ uint32_t CShadowCache::s_shadowSize;
+ 
++// Not in the original client (World of Legends): see ShadowCache.h. Zero keeps the original size.
++uint32_t CShadowCache::s_wolShadowMapSize;
++
+ // STATIC: 0x00D43154
+ EShadowMode CShadowCache::s_shadowMode;
+ 
+@@ -866,6 +869,19 @@ void CShadowCache::Init() {
+         CShadowCache::s_shadowSize = 2048;
+     }
+ 
++    // Not in the original client: wolShadowMapSize (0 by default) overrides the size above. A graphics card that cannot
++    // create a texture that big gets the biggest one it supports (never below the original 1024).
++    if (CShadowCache::s_wolShadowMapSize != 0) {
++        uint32_t wolSize = CShadowCache::s_wolShadowMapSize;
++        uint32_t maxSize = g_theGxDevicePtr->Caps().m_texMaxSize[GxTex_2d];
++
++        while (wolSize > 1024 && wolSize > maxSize) {
++            wolSize >>= 1;
++        }
++
++        CShadowCache::s_shadowSize = wolSize;
++    }
++
+     CShadowCache::InitPcfOffsets();
+ 
+     CShadowCache::s_extDynShadow.m_textures[0] = nullptr;
+diff --git a/Engine/Source/ShaderEffect/ShadowCache.h b/Engine/Source/ShaderEffect/ShadowCache.h
+index 622a3ae..5c6c6ed 100644
+--- a/Engine/Source/ShaderEffect/ShadowCache.h
++++ b/Engine/Source/ShaderEffect/ShadowCache.h
+@@ -77,6 +77,9 @@ class CShadowCache {
+     static C4Vector s_shadowMatrices[12];
+     static float s_shadowScale;
+     static uint32_t s_shadowSize;
++    // Not in the original client (World of Legends): CVar wolShadowMapSize, see patches-cliente/sombras-4096/README-sombras.md.
++    // 0 = the original size (1024, or 2048 in the MEDIUM and >= HIGH modes); otherwise 1024, 2048 or 4096. Set by the WoW layer.
++    static uint32_t s_wolShadowMapSize;
+     static const char* s_shadowModeDescs[NUM_SHADOW_MODES + 1];
+     static const uint32_t s_shadowValues[NUM_SHADOW_MODES + 1];
+     static C3Vector s_sunDir;
+diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
+index 6f62cb6..7d4c04f 100644
+--- a/WoW/Source/WorldClient/WorldParam.h
++++ b/WoW/Source/WorldClient/WorldParam.h
+@@ -40,6 +40,8 @@ class CWorldParam {
+     static CVar* cvar_gxTextureCacheSize;
+     // Not in the original client (World of Legends): see patches-cliente/topes-2008/README-topes.md.
+     static CVar* cvar_wolFarClipFactor;
++    // Not in the original client (World of Legends): see patches-cliente/sombras-4096/README-sombras.md.
++    static CVar* cvar_wolShadowMapSize;
+ 
+     static bool BaseMipCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool BspCacheCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+@@ -77,6 +79,7 @@ class CWorldParam {
+     static bool TexLodBiasCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     // Not in the original client.
+     static bool WolFarClipFactorCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolShadowMapSizeCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool TextureFilteringCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WaterLodCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WorldPoolUsageCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index 03927c6..aa8686c 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -112,6 +112,9 @@ CVar* CWorldParam::cvar_gxTextureCacheSize;
+ // Not in the original client (World of Legends): wolFarclipFactor, see patches-cliente/topes-2008/README-topes.md.
+ CVar* CWorldParam::cvar_wolFarClipFactor;
+ 
++// Not in the original client (World of Legends): wolShadowMapSize, see patches-cliente/sombras-4096/README-sombras.md.
++CVar* CWorldParam::cvar_wolShadowMapSize;
++
+ #define WOL_FARCLIP_FACTOR_MAX 3.0f
+ 
+ static float ClampEnvironmentDetail(float detail) {
+@@ -161,6 +164,46 @@ bool CWorldParam::WolFarClipFactorCallback(CVar* var, const char* oldValue, cons
+     return true;
+ }
+ 
++// Not in the original client. Size in texels of the exterior shadow map textures: 0 keeps the original (1024, or 2048 in
++// the MEDIUM and >= HIGH modes), 1024, 2048 or 4096 forces it. The textures are recreated the same way as when
++// extShadowQuality changes: CShadowCache::Update destroys and creates them on the next frame (see CShadowCache::Init).
++bool CWorldParam::WolShadowMapSizeCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    uint32_t size = 0;
++    bool valid = value && *value;
++
++    for (const char* digit = value; valid && *digit; digit++) {
++        if (*digit < '0' || *digit > '9') {
++            valid = false;
++        } else if (size < 100000) {
++            size = size * 10 + static_cast<uint32_t>(*digit - '0');
++        }
++    }
++
++    if (!valid || (size != 0 && size != 1024 && size != 2048 && size != 4096)) {
++        ConsoleWrite("wolShadowMapSize must be 0 (original), 1024, 2048 or 4096.", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    CShadowCache::s_wolShadowMapSize = size;
++    CShadowCache::NotifyTexturesRecreate();
++
++    // No message while the CVar is first registered (no previous value).
++    if (oldValue && *oldValue) {
++        char buffer[256];
++
++        if (size) {
++            SStrPrintf(buffer, sizeof(buffer), "wolShadowMapSize: %u x %u", size, size);
++        } else {
++            SStrPrintf(buffer, sizeof(buffer), "wolShadowMapSize: original");
++        }
++
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
+ // VERIFY: 54f5415a manual
+ // OFFSET: 0x004023C0
+ bool CWorldParam::TextureFilteringCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
+@@ -675,6 +718,8 @@ void CWorldParam::Initialize() {
+     // Not in the original client. Registered first so that the saved farclip, groundEffectDist and environmentDetail
+     // values above the original limits are accepted when those CVars are registered below.
+     CWorldParam::cvar_wolFarClipFactor = CVar::Register("wolFarclipFactor", "Scales the view distance limits (1.0 original, up to 3.0)", 1, "1.0", CWorldParam::WolFarClipFactorCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Not in the original client: also before extShadowQuality, so the saved shadow map size is in place when the shadow cache starts.
++    CWorldParam::cvar_wolShadowMapSize = CVar::Register("wolShadowMapSize", "Exterior shadow map size (0 original, 1024, 2048 or 4096)", 1, "0", CWorldParam::WolShadowMapSizeCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_farClipOverride = CVar::Register("farClipOverride", "Override old world graphic settings", 1, "0", CWorldParam::FarClipOverrideCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_lod = CVar::Register("lod", "Video option: Toggle Lod", 1, "0", CWorldParam::LodCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_mapShadows = CVar::Register("mapShadows", "Video option: Toggle map shadows", 1, "1", CWorldParam::MapShadowsCallback, CATEGORY_GRAPHICS, false, nullptr, false);

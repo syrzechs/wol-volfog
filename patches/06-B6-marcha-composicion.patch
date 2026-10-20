@@ -1,0 +1,1032 @@
+diff --git a/Engine/Source/VolFog/VolFog.cpp b/Engine/Source/VolFog/VolFog.cpp
+index ffec6b3..65508e2 100644
+--- a/Engine/Source/VolFog/VolFog.cpp
++++ b/Engine/Source/VolFog/VolFog.cpp
+@@ -27,3 +27,36 @@ void VolFog::SetGodRays(float value) {
+ void VolFog::SetLocalLights(bool value) {
+     s_settings.localLights = value;
+ }
++
++// Brief B6: state of the pass for VolFog::Armed(). No dependency on FFX or the shaders: the Gx backends call NoteDeviceRelease.
++namespace {
++    bool s_hardFailure;
++    bool s_lastFrameOk = true;
++    bool s_inLiquid;
++    uint32_t s_deviceEpoch;
++}
++
++bool VolFog::Armed() {
++    return VolFog::s_mode > 0 && VolFog::s_caps.intz && VolFog::s_caps.ps30Slots >= 1024 && VolFog::DepthTexture() != nullptr && !s_hardFailure && s_lastFrameOk && !s_inLiquid && (VolFog::s_debugMode == 0 || VolFog::s_debugMode == 2);
++}
++
++void VolFog::SetFrameResult(bool ok, bool inLiquid) {
++    s_lastFrameOk = ok;
++    s_inLiquid = inLiquid;
++}
++
++void VolFog::SetHardFailure(bool failed) {
++    s_hardFailure = failed;
++}
++
++bool VolFog::HardFailure() {
++    return s_hardFailure;
++}
++
++void VolFog::NoteDeviceRelease() {
++    s_deviceEpoch++;
++}
++
++uint32_t VolFog::DeviceEpoch() {
++    return s_deviceEpoch;
++}
+diff --git a/Engine/Source/VolFog/VolFog.h b/Engine/Source/VolFog/VolFog.h
+index 61db663..82826f3 100644
+--- a/Engine/Source/VolFog/VolFog.h
++++ b/Engine/Source/VolFog/VolFog.h
+@@ -89,9 +89,30 @@ namespace VolFog {
+     void RequestDump();
+     void RunPendingDump();
+ 
++    // Brief B6: the fog is "armed" when the pass is going to draw the fog of the world this frame, so the client's own linear fog has to be
++    // pushed out of range (DayNight::UpdateFog, design 1.3): wolVolFog > 0, the caps allow it (INTZ, at least 1024 pixel shader slots), the
++    // INTZ depth exists, the pass has not failed for good (shaders, targets), the view is not underwater, wolVolFogDebug is not showing
++    // another view, and the last frame that ran drew without error. If a frame fails, Armed() is false from the next frame on and the
++    // client goes back to its linear fog; the world is never left without fog for more than that one frame.
++    bool Armed();
++
++    // Written by VolFog::Render() (VolFogRender.cpp) and read by Armed(). SetFrameResult: the frame drew (or legitimately drew nothing,
++    // e.g. underwater) = true; the camera was in liquid. SetHardFailure: the pass cannot work with this device/shaders; it is cleared when
++    // wolVolFog changes or the device is rebuilt (NoteDeviceRelease, called from ReleaseDepthTexture).
++    void SetFrameResult(bool ok, bool inLiquid);
++    void SetHardFailure(bool failed);
++    bool HardFailure();
++    void NoteDeviceRelease();
++    uint32_t DeviceEpoch();
++
++    // The 32^3 density noise as a 2D atlas texture (32 x 1024, A8R8G8B8, MANAGED), created on first use; nullptr if it could not be made
++    // (the fog then has no density variation). VolFogNoise.cpp.
++    CGxTex* DensityNoiseTex();
++
+     // Draws the fog sub-passes over the world viewport of CGWorldFrame::OnWorldRender, between
+-    // DayNight::RenderGlares and PlayerNameUpdateLate. With wolVolFogDebug 0 it draws nothing. If the shaders are
+-    // not valid it writes one line to the console and does nothing else.
++    // DayNight::RenderGlares and PlayerNameUpdateLate. Brief B6: with wolVolFog > 0 (and the INTZ depth) it ray-marches the fog into a
++    // low-resolution target, copies the scene and composites the fog over the back buffer; wolVolFogDebug 2 shows the march buffer
++    // instead, 1 the depth, 3 the test grid. If the shaders are not valid it writes one line to the console and does nothing else.
+     void Render();
+ }
+ 
+diff --git a/Engine/Source/VolFog/VolFogDepth.cpp b/Engine/Source/VolFog/VolFogDepth.cpp
+index 9b359ba..be87e45 100644
+--- a/Engine/Source/VolFog/VolFogDepth.cpp
++++ b/Engine/Source/VolFog/VolFogDepth.cpp
+@@ -137,6 +137,10 @@ bool VolFog::CreateDepthTexture(IDirect3DDevice9* device) {
+ }
+ 
+ void VolFog::ReleaseDepthTexture(IDirect3DDevice9* device) {
++    // Brief B6: the device is being reset or rebuilt; the pass drops its failure state and re-checks its targets (VolFogRender.cpp). The
++    // targets and the scene copy are Gx textures (render targets), which the device itself releases and recreates on demand.
++    VolFog::NoteDeviceRelease();
++
+     if (device && (s_texture || s_surface)) {
+         // Brief B3b: the INTZ may still be bound as a texture (the pass leaves s0 on it) and is the depth-stencil of the device. The
+         // native D3D9 runtime fails Reset with D3DERR_INVALIDCALL while a D3DPOOL_DEFAULT resource of the application is still alive,
+diff --git a/Engine/Source/VolFog/VolFogNoise.cpp b/Engine/Source/VolFog/VolFogNoise.cpp
+new file mode 100644
+index 0000000..2449d99
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogNoise.cpp
+@@ -0,0 +1,88 @@
++#include <cstdint>
++#include <cstring>
++#include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
++#include "Engine/Source/Gx/CGxTex.h"
++#include "Engine/Source/Gx/CGxTexFlags.h"
++#include "Engine/Source/Gx/Gx.h"
++#include "Engine/Source/VolFog/VolFog.h"
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B6.
++// Licensed under GPL-3.0-only. DensityNoiseValue is derived from CreateDensityNoise in src/noise_volume.cpp of coa-vfog 205ade5 (copyright of
++// the authors of CoAVolFog, jealous-sound and the contributors of the Raz0r1337 fork; see Shaders/VolFog/NOTICE-modificaciones.txt).
++// Modified 2026-10-20 (brief B6): the hash is the same, but the 32x32x32 volume texture of Direct3D 9 is uploaded as a 2D atlas of 32 slices
++// (32 x 1024, A8R8G8B8 grey) through the Gx texture layer, which has no volume textures. Texel (x, y, z) of the volume is texel (x, z * 32 + y)
++// of the atlas; vf_density_variation.hlsli does the matching lookup.
++
++namespace {
++    constexpr uint32_t kNoiseSize = 32;
++    constexpr uint32_t kAtlasHeight = kNoiseSize * kNoiseSize;
++
++    uint32_t s_texels[kNoiseSize * kAtlasHeight]; // A8R8G8B8, one row of 32 texels per atlas row
++    bool s_filled;
++    CGxTex* s_texture;
++    const CGxDevice* s_device;
++    bool s_failed;
++
++    // Same hash as DensityNoiseValue of noise_volume.cpp.
++    uint8_t DensityNoiseValue(uint32_t x, uint32_t y, uint32_t z) {
++        uint32_t value = x + kNoiseSize * (y + kNoiseSize * z);
++        value = ((value ^ (value >> 7)) * 4051u + 12743u) & 0x7FFFu;
++        value ^= value >> 9;
++        value = (value * 109u + 583u) & 0x7FFFu;
++        value ^= value >> 6;
++        value = (value * 29317u + 9419u) & 0x7FFFu;
++        value ^= value >> 7;
++
++        return static_cast<uint8_t>(value >> 7);
++    }
++
++    void FillTexels() {
++        for (uint32_t z = 0; z < kNoiseSize; z++) {
++            for (uint32_t y = 0; y < kNoiseSize; y++) {
++                uint32_t* row = &s_texels[(z * kNoiseSize + y) * kNoiseSize];
++
++                for (uint32_t x = 0; x < kNoiseSize; x++) {
++                    row[x] = 0xFF000000u | (static_cast<uint32_t>(DensityNoiseValue(x, y, z)) * 0x00010101u); // WriteGreyArgb
++                }
++            }
++        }
++
++        s_filled = true;
++    }
++
++    // Supplies the atlas when the device uploads the texture (creation and every device reset); the texture is MANAGED.
++    void NoiseTexFunc(EGxTexCommand command, uint32_t width, uint32_t height, uint32_t face, uint32_t level, void* userArg, uint32_t& texelStrideInBytes, const void*& texels) {
++        if (command == GxTex_Latch) {
++            texelStrideInBytes = kNoiseSize * sizeof(uint32_t);
++            texels = s_texels;
++        }
++    }
++}
++
++CGxTex* VolFog::DensityNoiseTex() {
++    if (s_texture && s_device != g_theGxDevicePtr) {
++        s_texture = nullptr; // the device that owned it is gone
++    }
++
++    if (s_texture || s_failed || !g_theGxDevicePtr) {
++        return s_texture;
++    }
++
++    if (!s_filled) {
++        FillTexels();
++    }
++
++    // Linear filter, wrap in u, clamp in v (v is kept inside its slice by the shader), no mip maps, plain managed texture.
++    CGxTexFlags flags(GxTex_Linear, 1, 0, 0, 0, 0, 1, 0, 0, 0);
++
++    if (!GxTexCreate(kNoiseSize, kAtlasHeight, GxTex_Argb8888, flags, nullptr, NoiseTexFunc, s_texture) || !s_texture) {
++        s_texture = nullptr;
++        s_failed = true;
++
++        return nullptr;
++    }
++
++    s_device = g_theGxDevicePtr;
++
++    return s_texture;
++}
+diff --git a/Engine/Source/VolFog/VolFogRender.cpp b/Engine/Source/VolFog/VolFogRender.cpp
+index ddd161d..fa6b36a 100644
+--- a/Engine/Source/VolFog/VolFogRender.cpp
++++ b/Engine/Source/VolFog/VolFogRender.cpp
+@@ -1,14 +1,26 @@
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
+ #include <cstring>
+ #include "Engine/Source/ConsoleBase/IConsole.h"
+ #include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
++#include "Engine/Source/Gx/CGxTex.h"
++#include "Engine/Source/Gx/CGxTexFlags.h"
+ #include "Engine/Source/Gx/Gx.h"
++#include "Engine/Source/Tempest/C2iVector.h"
+ #include "Engine/Source/Tempest/C44Matrix.h"
+ #include "Engine/Source/Tempest/CRect.h"
+ #include "Engine/Source/VolFog/VolFog.h"
++#include "Engine/Source/VolFog/VolFogInputs.h"
++#include "Engine/Source/VolFog/VolFogModel.h"
+ #include "Engine/Source/VolFog/VolFogPass.h"
+ 
+-// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B2.
+-// Licensed under GPL-3.0-only (see Shaders/VolFog/NOTICE-modificaciones.txt).
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), briefs B2 (debug views) and B6 (march and composite).
++// Licensed under GPL-3.0-only (see Shaders/VolFog/NOTICE-modificaciones.txt). The packing of the constants and the order of the passes follow
++// Renderer::Draw of src/renderer.cpp in coa-vfog 205ade5 (copyright of the authors of CoAVolFog, jealous-sound and the contributors of the
++// Raz0r1337 fork); modified 2026-10-20 (brief B6): rewritten over the Gx layer (FFX plumbing, Gx render targets and texture units instead of
++// raw Direct3D 9 calls), without the temporal filter, the local lights and the light shafts, which come in later briefs.
+ 
+ int32_t VolFog::s_debugMode;
+ 
+@@ -94,69 +106,505 @@ namespace {
+ 
+     DebugPass* s_debugPass;
+     bool s_failureLogged;
+-}
+ 
+-void VolFog::Render() {
+-    // Brief B5: a pending wolVolFogDump runs here, inside the world frame (it only reads and prints).
+-    VolFog::RunPendingDump();
++    void Say(const char* message) {
++        ConsoleWrite(message, DEFAULT_COLOR);
++        CGxDevice::Log("%s", message);
++    }
+ 
+-    int32_t mode = VolFog::s_debugMode;
++    // ---------------------------------------------------------------------------------------------------------------------------------
++    // Brief B6: march and composite.
++    // ---------------------------------------------------------------------------------------------------------------------------------
++
++    constexpr uint32_t kMarchConstants = 100; // c0..c99, the range the fog writes (renderer.cpp: kPixelConstants); saved and restored around the pass
++
++    // Everything the two shaders read from constant registers for one frame (contract of the design, section 3; the layout is the one of
++    // Renderer::Draw in renderer.cpp).
++    struct FogFrame {
++        float common[9][4];         // c0-c8
++        float light[4];             // c9  cLight (the shader declares c9 only; c10 is not read)
++        float march[4];             // c11 cMarch
++        float layers[24][4];        // c12-c35 four FogLayer of six registers
++        float layerNoise[12][4];    // c36-c47 cLayerNoise: no authored noise in the derived mode, uploaded as zeros
++        float localControl[4];      // c53 cLocalLightControl: no lights in B6
++        float variation[4];         // c78 cDensityVariation
++        float composite[3][4];      // c96-c98 cComposite, cGodRayColour, cSun
++    };
+ 
+-    if (mode < 1 || mode > 3) {
+-        return;
++    void NullTexFunc(EGxTexCommand command, uint32_t width, uint32_t height, uint32_t face, uint32_t level, void* userArg, uint32_t& texelStrideInBytes, const void*& texels) {
+     }
+ 
+-    if (mode == 1 && !VolFog::DepthTex()) {
+-        // No readable depth (wolVolFog 0, no INTZ, or the device has not been rebuilt yet): say it once and draw nothing.
+-        if (!VolFog::s_noDepthWarned) {
+-            VolFog::s_noDepthWarned = true;
+-            const char* message = "wolVolFogDebug 1: there is no readable INTZ depth (set wolVolFog 1-3 and run gxRestart; the video card must report INTZ); nothing is drawn.";
+-            ConsoleWrite(message, DEFAULT_COLOR);
+-            CGxDevice::Log("%s", message);
++    // One pass object per shader (WolVolFogMarch / WolVolFogComposite, six permutations each: (quality - 1) * 2 + localLights).
++    class FogPass : public VolFog::Pass {
++        public:
++        explicit FogPass(const char* pixelName) : VolFog::Pass(pixelName, 6, "WolVolFogQuad", GxBlend_Opaque) {}
++
++        void Execute() override {}
++
++        static void UploadShared(const FogFrame& f) {
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, &f.common[0][0], 9);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 9, f.light, 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 11, f.march, 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 12, &f.layers[0][0], 24);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 36, &f.layerNoise[0][0], 12);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 53, f.localControl, 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 78, f.variation, 1);
+         }
+ 
+-        return;
++        static void SetTexture(uint32_t unit, CGxTex* texture) {
++            GxRsSet(static_cast<EGxRenderState>(GxRs_Texture0 + unit), static_cast<void*>(texture));
++        }
++
++        // Ray march into the low-resolution target (sub-pass 1). False if the target could not be created on the device.
++        bool DrawMarch(const FogFrame& f, uint32_t permutation, CGxTex* depth, CGxTex* noise, CGxTex* target) {
++            this->SetPixelPermutation(permutation);
++            this->Begin();
++
++            GxRenderTargetSet(GxBuffers_Color, target, 0);
++
++            if (target->m_needsCreation) {
++                // The device could not make the texture: nothing must be drawn (the colour target would still be the back buffer).
++                GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++                this->End();
++
++                return false;
++            }
++
++            // The target is the low-resolution texture: the whole of it, not the world viewport of the back buffer.
++            GxXformSetViewport(0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f);
++            GxRsSet(GxRs_ColorWrite, 15);
++            GxRsSet(GxRs_ScissorTest, 0);
++
++            FogPass::UploadShared(f);
++            FogPass::SetTexture(0, depth); // sDepth, POINT / CLAMP
++            FogPass::SetTexture(9, noise); // sDensityNoise, LINEAR / WRAP in u
++
++            this->DrawQuad();
++
++            GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++            this->End();
++
++            return true;
++        }
++
++        // Composite over the back buffer, full resolution inside the world viewport (sub-pass 6).
++        void DrawComposite(const FogFrame& f, uint32_t permutation, CGxTex* depth, CGxTex* march, CGxTex* scene) {
++            this->SetPixelPermutation(permutation);
++            this->Begin();
++
++            GxRsSet(GxRs_ColorWrite, 15);
++            GxRsSet(GxRs_ScissorTest, 0);
++
++            FogPass::UploadShared(f);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 96, &f.composite[0][0], 3);
++            FogPass::SetTexture(0, depth);  // sDepth
++            FogPass::SetTexture(1, march);  // sFog: no temporal filter in B6, the march itself
++            FogPass::SetTexture(2, march);  // sGodRays: unused (cComposite.y = 0), bound so that the sampler is never empty
++            FogPass::SetTexture(3, scene);  // sSceneBeforeFog
++            FogPass::SetTexture(4, march);  // sCurrentMarch
++
++            this->DrawQuad();
++            this->End();
++        }
++    };
++
++    struct FogState {
++        const CGxDevice* device;
++        CGxTex* march;
++        uint32_t marchWidth;
++        uint32_t marchHeight;
++        EGxTexFormat marchFormat;
++        CGxTex* scene;
++        uint32_t sceneWidth;
++        uint32_t sceneHeight;
++        uint32_t epoch;
++        int32_t seenMode;
++        uint32_t frame;
++        uint32_t consecutiveFailures;
++        bool shadersMessage;
++        bool hardMessage;
++        bool noDepthDebugWarned;
++        FogPass* marchPass;
++        FogPass* compositePass;
++    };
++
++    FogState s_fog;
++
++    std::chrono::steady_clock::time_point s_clockStart = std::chrono::steady_clock::now();
++
++    CGxTex* CreateTargetTexture(uint32_t width, uint32_t height, EGxTexFormat format, const char* name) {
++        // Exact size (GxTex_NonPow2): the shaders address the targets in texels of 1 / size. Nearest filter, clamp, a render target of the device
++        // (the device releases it on a reset and makes it again when it is next used).
++        CGxTexFlags flags(GxTex_Nearest, 0, 0, 0, 0, 1, 1, 0, 0, 0);
++        CGxTex* texture = nullptr;
++
++        if (!GxTexCreate(GxTex_NonPow2, width, height, 0, format, format, flags, nullptr, NullTexFunc, name, texture)) {
++            return nullptr;
++        }
++
++        return texture;
++    }
++
++    bool EnsureTargets(uint32_t lowWidth, uint32_t lowHeight, uint32_t sceneWidth, uint32_t sceneHeight) {
++        if (s_fog.device != g_theGxDevicePtr) {
++            // The device that owned the textures is gone (gxApi change): they went with it.
++            s_fog.march = nullptr;
++            s_fog.scene = nullptr;
++            s_fog.marchWidth = 0;
++            s_fog.marchHeight = 0;
++            s_fog.sceneWidth = 0;
++            s_fog.sceneHeight = 0;
++            s_fog.device = g_theGxDevicePtr;
++        }
++
++        if (s_fog.marchFormat == GxTex_Unknown) {
++            s_fog.marchFormat = VolFog::s_caps.abgr16f ? GxTex_Abgr16F : GxTex_Argb8888;
++        }
++
++        if (!s_fog.march || s_fog.marchWidth != lowWidth || s_fog.marchHeight != lowHeight) {
++            if (s_fog.march) {
++                GxTexDestroy(s_fog.march);
++            }
++
++            s_fog.march = CreateTargetTexture(lowWidth, lowHeight, s_fog.marchFormat, "VolFog march");
++            s_fog.marchWidth = lowWidth;
++            s_fog.marchHeight = lowHeight;
++
++            char line[160];
++            std::snprintf(line, sizeof(line), "wolVolFog: march target %ux%u %s", lowWidth, lowHeight, s_fog.marchFormat == GxTex_Abgr16F ? "ABGR16F" : "ARGB8");
++            Say(line); // Say takes a const char*: Log("%s", char[]) would pick the va_list overload of CGxDevice::Log
++        }
++
++        if (!s_fog.scene || s_fog.sceneWidth != sceneWidth || s_fog.sceneHeight != sceneHeight) {
++            if (s_fog.scene) {
++                GxTexDestroy(s_fog.scene);
++            }
++
++            s_fog.scene = CreateTargetTexture(sceneWidth, sceneHeight, GxTex_Argb8888, "VolFog scene");
++            s_fog.sceneWidth = sceneWidth;
++            s_fog.sceneHeight = sceneHeight;
++
++            char line[160];
++            std::snprintf(line, sizeof(line), "wolVolFog: scene copy %ux%u ARGB8", sceneWidth, sceneHeight);
++            Say(line);
++        }
++
++        return s_fog.march && s_fog.scene;
++    }
++
++    bool Normalize3(float* v) {
++        float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
++
++        if (!(length > 1e-6f)) {
++            return false;
++        }
++
++        v[0] /= length;
++        v[1] /= length;
++        v[2] /= length;
++
++        return true;
++    }
++
++    // The constants of one frame (Renderer::Draw of renderer.cpp, without the temporal filter, the local lights and the beams).
++    bool PackFrame(const VolFog::FrameInputs& in, const VolFog::FogParams& fog, uint32_t scale, uint32_t lowWidth, uint32_t lowHeight, float debugView, FogFrame& f) {
++        std::memset(&f, 0, sizeof(f));
++
++        const float* proj = in.glProjection;
++
++        // MapWorldDepth: the world is drawn in the viewport depth range 0..0.94 (minZ..maxZ of the frame).
++        const bool usableRange = in.viewport.maxZ - in.viewport.minZ > 0.01f && in.viewport.minZ >= 0.0f && in.viewport.maxZ <= 1.0f;
++        const float worldMinZ = usableRange ? in.viewport.minZ : 0.0f;
++        const float worldExtent = usableRange ? in.viewport.maxZ - in.viewport.minZ : 1.0f;
++        const float worldMaxZ = worldMinZ + worldExtent;
++        const float depthAtInfinity = worldMinZ + worldExtent * (1.0f + proj[10]) * 0.5f;
++        const float depthPerInverseViewZ = worldExtent * proj[14] * 0.5f;
++        const float deepestWorldDepth = worldMaxZ >= 0.9999995f ? 0.9999995f : worldMaxZ + 2.0e-6f;
++
++        // WorldViewFromCameraRelative: the view matrix has the eye at the origin; the translation of the inverse is the camera position.
++        float viewToWorld[16];
++
++        if (!VolFog::Invert4x4(in.cameraRelativeView, viewToWorld)) {
++            return false;
++        }
++
++        viewToWorld[12] = in.camPos[0];
++        viewToWorld[13] = in.camPos[1];
++        viewToWorld[14] = in.camPos[2];
++
++        float depthTexelX = VolFog::DepthWidth() ? 1.0f / static_cast<float>(VolFog::DepthWidth()) : 0.0f;
++        float depthTexelY = VolFog::DepthHeight() ? 1.0f / static_cast<float>(VolFog::DepthHeight()) : 0.0f;
++
++        float c0[4] = { static_cast<float>(in.viewport.x), static_cast<float>(in.viewport.y), static_cast<float>(in.viewport.width), static_cast<float>(in.viewport.height) };
++        float c1[4] = { static_cast<float>(scale), static_cast<float>(s_fog.frame % 1024u), depthTexelX, depthTexelY };
++        float c2[4] = { proj[0], proj[5], proj[8], proj[9] };
++        float c3[4] = { depthAtInfinity, depthPerInverseViewZ, fog.maxDistance, deepestWorldDepth };
++        float c8[4] = { static_cast<float>(lowWidth), static_cast<float>(lowHeight), 1.0f / static_cast<float>(lowWidth), 1.0f / static_cast<float>(lowHeight) };
++        std::memcpy(f.common[0], c0, sizeof(c0));
++        std::memcpy(f.common[1], c1, sizeof(c1));
++        std::memcpy(f.common[2], c2, sizeof(c2));
++        std::memcpy(f.common[3], c3, sizeof(c3));
++        std::memcpy(f.common[4], viewToWorld, sizeof(viewToWorld)); // c4-c7, row major, camera in row 3
++        std::memcpy(f.common[8], c8, sizeof(c8));
++
++        float toLightInView[3];
++        VolFog::TransformDirection(in.toLight, in.cameraRelativeView, toLightInView);
++
++        if (!Normalize3(toLightInView)) {
++            return false;
++        }
++
++        f.light[0] = toLightInView[0];
++        f.light[1] = toLightInView[1];
++        f.light[2] = toLightInView[2];
++        f.light[3] = fog.lightAboveHorizon;
++
++        // cMarch: the step jitter is only for the temporal filter (B7), so 0 = fixed 0.5 in the shader.
++        f.march[0] = 0.0f;
++        f.march[1] = fog.maxDistance;
++        f.march[2] = fog.horizonStart;
++        f.march[3] = fog.farClip;
++
++        static_assert(sizeof(VolFog::FogLayer) * VolFog::kFogLayers == sizeof(f.layers), "four FogLayer of six registers");
++        std::memcpy(f.layers, &fog.layers[0], sizeof(f.layers));
++
++        // cLocalLightControl: no lights uploaded (the LOCAL_LIGHTS=0 permutations ignore it); phase 0.3 as the default of coa-vfog.
++        f.localControl[2] = 0.3f;
++
++        // cDensityVariation: amount 0.15, scale 0.025, wind offset (0.5 yards per second around the 32 / scale period of the noise).
++        const bool hasNoise = VolFog::DensityNoiseTex() != nullptr;
++        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_clockStart).count();
++        const double windPeriod = 32.0 / 0.025;
++        f.variation[0] = hasNoise ? 0.15f : 0.0f;
++        f.variation[1] = 0.025f;
++        f.variation[2] = static_cast<float>(std::fmod(seconds * 0.5, windPeriod));
++
++        // cComposite: exposure 1, no beams, debug view (0 = none, 2 = transmittance), blend 1 = linear light over the scene copy.
++        f.composite[0][0] = 1.0f;
++        f.composite[0][1] = 0.0f;
++        f.composite[0][2] = debugView;
++        f.composite[0][3] = 1.0f;
++        f.composite[1][0] = fog.rayColor[0];
++        f.composite[1][1] = fog.rayColor[1];
++        f.composite[1][2] = fog.rayColor[2];
++        // cSun: no sun marker, no glow compensation (B9 / B10).
++
++        return true;
+     }
+ 
+-    if (!s_debugPass) {
+-        // Created on first use and kept for the whole run; the shaders belong to the device and go with it.
+-        s_debugPass = new DebugPass();
++    enum FogResult { FogOk, FogTransient, FogFailed };
++
++    // FogOk: the frame drew (or legitimately had nothing to draw). FogTransient: nothing could be drawn this frame (no depth yet, no camera): Armed() is
++    // false for it, but it does not count towards giving the pass up. FogFailed: a real failure. `liquid` reports the camera.
++    FogResult RenderFog(bool showMarch, bool& liquid) {
++        liquid = false;
++
++        if (!VolFog::DepthTex()) {
++            // wolVolFog is on but there is no readable depth yet (waiting for gxRestart): the callback of the CVar already said so.
++            return FogTransient;
++        }
++
++        if (VolFog::s_caps.ps30Slots < 1024 || !g_theGxDevicePtr->Caps().m_texTarget[GxTex_NonPow2]) {
++            if (!s_fog.hardMessage) {
++                s_fog.hardMessage = true;
++                Say("wolVolFog: this video card cannot run the fog (it needs a ps_3_0 with at least 1024 instruction slots and non power of two textures); the fog stays off.");
++            }
++
++            VolFog::SetHardFailure(true);
++
++            return FogFailed;
++        }
++
++        if (!s_fog.marchPass) {
++            // Created on first use, kept for the whole run.
++            s_fog.marchPass = new FogPass("WolVolFogMarch");
++            s_fog.compositePass = new FogPass("WolVolFogComposite");
++        }
++
++        const VolFog::SettingValues& settings = VolFog::Settings();
++        const int32_t quality = std::clamp(settings.quality, 1, 3);
++        const uint32_t permutation = static_cast<uint32_t>((quality - 1) * 2); // + 1 with local lights (B8)
++
++        s_fog.marchPass->SetPixelPermutation(permutation);
++        s_fog.compositePass->SetPixelPermutation(permutation);
++
++        if (!s_fog.marchPass->Valid() || !s_fog.compositePass->Valid()) {
++            if (!s_fog.shadersMessage) {
++                s_fog.shadersMessage = true;
++                Say("wolVolFog: the shaders WolVolFogQuad / WolVolFogMarch / WolVolFogComposite are not valid (is Data\\patch-Z.MPQ present, and does the video card support ps_3_0?); the fog stays off.");
++            }
++
++            VolFog::SetHardFailure(true);
++
++            return FogFailed;
++        }
++
++        VolFog::FrameInputs in;
++
++        if (!VolFog::CollectInputs(in)) {
++            return FogTransient;
++        }
++
++        liquid = in.inLiquid;
++
++        VolFog::FogParams fog = VolFog::BuildFogParams(in, VolFog::CurrentTuning());
++
++        if (!fog.active || in.viewport.width < 8 || in.viewport.height < 8) {
++            return FogOk; // underwater: the client keeps its own fog (Armed() is false there); nothing to draw
++        }
++
++        const uint32_t scale = quality == 1 ? 4u : 2u;
++        const uint32_t lowWidth = std::max((in.viewport.width + scale - 1) / scale, 8u);
++        const uint32_t lowHeight = std::max((in.viewport.height + scale - 1) / scale, 8u);
++
++        if (!EnsureTargets(lowWidth, lowHeight, in.viewport.width, in.viewport.height)) {
++            return FogFailed;
++        }
++
++        FogFrame frame;
++
++        if (!PackFrame(in, fog, scale, lowWidth, lowHeight, showMarch ? 2.0f : 0.0f, frame)) {
++            return FogTransient;
++        }
++
++        // The constants the fog overwrites belong to whoever draws next: put them back as they were.
++        float saved[kMarchConstants * 4];
++        std::memcpy(saved, CGxDevice::s_shadowConstants[0].constants, sizeof(saved));
++
++        CGxTex* depth = VolFog::DepthTex();
++        bool drawn = s_fog.marchPass->DrawMarch(frame, permutation, depth, VolFog::DensityNoiseTex(), s_fog.march);
++
++        if (!drawn && s_fog.marchFormat == GxTex_Abgr16F) {
++            // The device would not make a half float target: ARGB8 like coa-vfog does, from the next frame on.
++            Say("wolVolFog: the ABGR16F march target could not be created; falling back to ARGB8.");
++            s_fog.marchFormat = GxTex_Argb8888;
++            GxTexDestroy(s_fog.march);
++            s_fog.march = nullptr;
++            s_fog.marchWidth = 0;
++        }
++
++        if (drawn) {
++            // Sub-pass 3: the scene as it is before the fog, the world viewport of the back buffer into a texture of exactly that size.
++            C2iVector destination = { 0, 0 };
++            C2iVector source = { static_cast<int32_t>(in.viewport.x), static_cast<int32_t>(in.viewport.y) };
++            C2iVector size = { static_cast<int32_t>(in.viewport.width), static_cast<int32_t>(in.viewport.height) };
++            drawn = GxTexCopy(s_fog.scene, destination, source, size, 0, 0) != 0;
++
++            if (drawn) {
++                s_fog.compositePass->DrawComposite(frame, permutation, depth, s_fog.march, s_fog.scene);
++            }
++        }
++
++        g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, saved, kMarchConstants);
++
++        if (drawn) {
++            s_fog.frame++;
++        }
++
++        return drawn ? FogOk : FogFailed;
+     }
+ 
+-    s_debugPass->SetPixelPermutation(static_cast<uint32_t>(mode - 1));
++    // wolVolFogDebug 1 (depth) and 3 (test grid): the debug shader of brief B2.
++    void RenderDebugView(int32_t mode) {
++        if (mode == 1 && !VolFog::DepthTex()) {
++            // No readable depth (wolVolFog 0, no INTZ, or the device has not been rebuilt yet): say it once and draw nothing.
++            if (!VolFog::s_noDepthWarned) {
++                VolFog::s_noDepthWarned = true;
++                Say("wolVolFogDebug 1: there is no readable INTZ depth (set wolVolFog 1-3 and run gxRestart; the video card must report INTZ); nothing is drawn.");
++            }
++
++            return;
++        }
++
++        if (!s_debugPass) {
++            // Created on first use and kept for the whole run; the shaders belong to the device and go with it.
++            s_debugPass = new DebugPass();
++        }
++
++        s_debugPass->SetPixelPermutation(static_cast<uint32_t>(mode - 1));
++
++        if (!s_debugPass->Valid()) {
++            // Failure policy (design 1.3): say it once, draw nothing, touch nothing else.
++            if (!s_failureLogged) {
++                s_failureLogged = true;
++                Say("wolVolFog: the shaders WolVolFogQuad / WolVolFogDebug are not valid (is Data\\patch-Z.MPQ present, and does the video card support ps_3_0?); wolVolFogDebug does nothing.");
++            }
++
++            return;
++        }
++
++        CRect window = { 0.0f, 0.0f, 0.0f, 0.0f };
++        g_theGxDevicePtr->CapsWindowSize(window);
+ 
+-    if (!s_debugPass->Valid()) {
+-        // Failure policy (design 1.3): say it once, draw nothing, touch nothing else.
+-        if (!s_failureLogged) {
+-            s_failureLogged = true;
+-            const char* message = "wolVolFog: the shaders WolVolFogQuad / WolVolFogDebug are not valid (is Data\\patch-Z.MPQ present, and does the video card support ps_3_0?); wolVolFogDebug does nothing.";
+-            ConsoleWrite(message, DEFAULT_COLOR);
+-            CGxDevice::Log("%s", message);
++        float width = window.maxX - window.minX;
++        float height = window.maxY - window.minY;
++
++        if (width <= 0.0f || height <= 0.0f) {
++            return;
+         }
+ 
++        // The world viewport that CGWorldFrame::OnWorldRender left set, in pixels from the top-left corner of the back
++        // buffer (Gx viewport y grows upwards; D3D9 viewport y is (1 - maxY) * height, CGxDeviceD3d::IXformSetViewport).
++        float minX = 0.0f;
++        float maxX = 0.0f;
++        float minY = 0.0f;
++        float maxY = 0.0f;
++        float minZ = 0.0f;
++        float maxZ = 0.0f;
++        GxXformViewport(minX, maxX, minY, maxY, minZ, maxZ);
++
++        s_debugPass->SetViewport(minX * width, (1.0f - maxY) * height, (maxX - minX) * width, (maxY - minY) * height, width, height);
++        s_debugPass->Execute();
++    }
++}
++
++void VolFog::Render() {
++    // Brief B5: a pending wolVolFogDump runs here, inside the world frame (it only reads and prints).
++    VolFog::RunPendingDump();
++
++    // A device rebuild (gxRestart, resize, reset) or a change of wolVolFog gives the pass a clean slate: a failure for good (shaders, caps,
++    // targets) is only for as long as the same device and the same setting.
++    if (s_fog.epoch != VolFog::DeviceEpoch() || s_fog.seenMode != VolFog::s_mode) {
++        s_fog.epoch = VolFog::DeviceEpoch();
++        s_fog.seenMode = VolFog::s_mode;
++        s_fog.consecutiveFailures = 0;
++        s_fog.shadersMessage = false;
++        s_fog.hardMessage = false;
++        VolFog::SetHardFailure(false);
++        VolFog::SetFrameResult(true, false);
++    }
++
++    int32_t debugMode = VolFog::s_debugMode;
++
++    if (debugMode == 1 || debugMode == 3) {
++        RenderDebugView(debugMode);
++
+         return;
+     }
+ 
+-    CRect window = { 0.0f, 0.0f, 0.0f, 0.0f };
+-    g_theGxDevicePtr->CapsWindowSize(window);
++    if (VolFog::s_mode <= 0) {
++        if (debugMode == 2 && !s_fog.noDepthDebugWarned) {
++            s_fog.noDepthDebugWarned = true;
++            Say("wolVolFogDebug 2 shows the march buffer of the volumetric fog: set wolVolFog 1-3 first (and gxRestart).");
++        }
+ 
+-    float width = window.maxX - window.minX;
+-    float height = window.maxY - window.minY;
++        return;
++    }
+ 
+-    if (width <= 0.0f || height <= 0.0f) {
++    if (VolFog::HardFailure()) {
+         return;
+     }
+ 
+-    // The world viewport that CGWorldFrame::OnWorldRender left set, in pixels from the top-left corner of the back
+-    // buffer (Gx viewport y grows upwards; D3D9 viewport y is (1 - maxY) * height, CGxDeviceD3d::IXformSetViewport).
+-    float minX = 0.0f;
+-    float maxX = 0.0f;
+-    float minY = 0.0f;
+-    float maxY = 0.0f;
+-    float minZ = 0.0f;
+-    float maxZ = 0.0f;
+-    GxXformViewport(minX, maxX, minY, maxY, minZ, maxZ);
+-
+-    s_debugPass->SetViewport(minX * width, (1.0f - maxY) * height, (maxX - minX) * width, (maxY - minY) * height, width, height);
+-    s_debugPass->Execute();
++    bool liquid = false;
++    FogResult result = RenderFog(debugMode == 2, liquid);
++
++    if (result == FogOk) {
++        s_fog.consecutiveFailures = 0;
++    } else if (result == FogFailed && !VolFog::HardFailure() && ++s_fog.consecutiveFailures >= 3) {
++        // Three frames in a row failing for real: give up until the setting or the device changes.
++        Say("wolVolFog: the fog pass failed three frames in a row; the client's own fog is back.");
++        VolFog::SetHardFailure(true);
++    }
++
++    VolFog::SetFrameResult(result == FogOk, liquid);
+ }
+diff --git a/Shaders/VolFog/CMakeLists.txt b/Shaders/VolFog/CMakeLists.txt
+index 594042d..5dbc6f8 100644
+--- a/Shaders/VolFog/CMakeLists.txt
++++ b/Shaders/VolFog/CMakeLists.txt
+@@ -99,10 +99,22 @@ function(volfog_shader NAME KIND SOURCE)
+ endfunction ()
+ 
+ # B2: quad vertex shader (vf_fullscreen_vs.hlsl as it is) and the debug pixel shader (wolVolFogDebug 1..3).
+-# The remaining vf_*.hlsl are compiled from brief B6 on (design, section 3).
++# The remaining vf_*.hlsl are compiled from brief B7 on (design, section 3).
+ volfog_shader(WolVolFogQuad vs vf_fullscreen_vs.hlsl)
+ volfog_shader(WolVolFogDebug ps WolVolFogDebug.hlsl PERMUTATIONS "DEBUG_MODE=1" "DEBUG_MODE=2" "DEBUG_MODE=3")
+ 
++# B6: ray march and composite. Six permutations each, index = (quality - 1) * 2 + localLights: STEPS 16 / 24 / 32 (wolVolFog 1 / 2 / 3)
++# times LOCAL_LIGHTS 0 / 1 (the macros of vf_integrate.hlsli). B6 draws only the LOCAL_LIGHTS=0 ones; the others are compiled for B8.
++# SAMPLES_AUTHORED_NOISE keeps its default (0): the authored noise of the Classic layers is not used (design, section 2).
++volfog_shader(WolVolFogMarch ps vf_march.hlsl PERMUTATIONS
++    "STEPS=16,LOCAL_LIGHTS=0" "STEPS=16,LOCAL_LIGHTS=1"
++    "STEPS=24,LOCAL_LIGHTS=0" "STEPS=24,LOCAL_LIGHTS=1"
++    "STEPS=32,LOCAL_LIGHTS=0" "STEPS=32,LOCAL_LIGHTS=1")
++volfog_shader(WolVolFogComposite ps vf_composite.hlsl PERMUTATIONS
++    "STEPS=16,LOCAL_LIGHTS=0" "STEPS=16,LOCAL_LIGHTS=1"
++    "STEPS=24,LOCAL_LIGHTS=0" "STEPS=24,LOCAL_LIGHTS=1"
++    "STEPS=32,LOCAL_LIGHTS=0" "STEPS=32,LOCAL_LIGHTS=1")
++
+ add_custom_command(
+     OUTPUT ${VOLFOG_MPQ}
+     COMMAND "${VOLFOG_PYTHON}" -I ${VOLFOG_MKMPQ} ${VOLFOG_MPQ} ${VOLFOG_STAGE} ${VOLFOG_BLS_FILES}
+diff --git a/Shaders/VolFog/NOTICE-modificaciones.txt b/Shaders/VolFog/NOTICE-modificaciones.txt
+index 2f7c251..c4abdaa 100644
+--- a/Shaders/VolFog/NOTICE-modificaciones.txt
++++ b/Shaders/VolFog/NOTICE-modificaciones.txt
+@@ -45,3 +45,20 @@ Modifications (GPLv3 section 5a), dated
+     liquidTypeId, fullyInterior and glowEffectActive. The values are read from the client by WoW/Source/WorldClient/VolFogWorld.cpp
+     (written for this project; coa-vfog reads the same values from fixed addresses of the 3.3.5 binary).
+   - Engine/Source/VolFog/VolFogDump.cpp, VolFog::Settings(): new, not derived from CoAVolFog code, same licence.
++
++2026-10-20  Brief B6 (World of Legends, native volumetric fog, phase 3: march and composite).
++  - vf_common.hlsli: kSkyMinDepth 0.99903 -> 0.95 (the only change; the client draws the world in the viewport depth range 0..0.94 and the sky
++    in 0.999..1.0 without writing depth, so depth >= 0.95 is always sky). This was one of the two planned changes of B2.
++  - vf_density_variation.hlsli: tex3D -> 2D atlas (the other planned change). The Gx layer has no volume textures, so the 32^3 density noise is a
++    2D atlas of 32 slices of 32x32 texels stacked along v (32 x 1024, A8R8G8B8 grey, LINEAR, WRAP in u); sampler3D sDensityNoise (s9) becomes
++    sampler2D, each tex3Dlod becomes SampleNoiseVolume(): two tex2Dlod of the slices that bracket z plus a lerp. v stays inside its slice, so
++    the y wrap of the volume is a hard step instead of a blend, once every 32 texels. DensityVariation() keeps its signature and its constants.
++  - vf_authored_noise.hlsli: copied byte for byte from 205ade5 (vf_integrate.hlsli includes it). It is compiled with SAMPLES_AUTHORED_NOISE = 0
++    (its default), so none of its code or registers (c36.., s10) reaches the pixel shaders; the authored noise of the Classic layers is not used.
++  - vf_march.hlsl and vf_composite.hlsl are compiled (CMakeLists.txt, six permutations each: STEPS 16 / 24 / 32 x LOCAL_LIGHTS 0 / 1, the macros of
++    vf_integrate.hlsli); the sources are unchanged.
++  - Engine/Source/VolFog/VolFogNoise.cpp: new, DensityNoiseValue derived from CreateDensityNoise of src/noise_volume.cpp (same hash; the volume is
++    uploaded as the atlas above through GxTexCreate).
++  - Engine/Source/VolFog/VolFogRender.cpp: the packing of the constants (c0-c13 common block, layers at c12, c53, c78, c96-c98) and the order of the
++    passes follow Renderer::Draw of src/renderer.cpp, rewritten over Gx (render targets, texture units, shader constants). Left out for now: the
++    temporal filter (B7), the local lights (B8) and the light shafts (B9).
+diff --git a/Shaders/VolFog/vf_authored_noise.hlsli b/Shaders/VolFog/vf_authored_noise.hlsli
+new file mode 100644
+index 0000000..ee980a4
+--- /dev/null
++++ b/Shaders/VolFog/vf_authored_noise.hlsli
+@@ -0,0 +1,84 @@
++#ifndef SAMPLES_AUTHORED_NOISE
++#define SAMPLES_AUTHORED_NOISE 0
++#endif
++
++static const bool kSamplesAuthoredNoise = SAMPLES_AUTHORED_NOISE;
++static const int kNoisyLayers = 3;
++static const int kRegistersPerLayerNoise = 4;
++static const int kOctave0Register = 0;
++static const int kOctave1Register = 1;
++static const int kFadeRegister = 2;
++static const int kOctaveWeightRegister = 3;
++static const float kNoiseCurveContrast = 20;
++static const float kNoiseCurvePivot = 0.5;
++static const float kNoiseCurveShape = (kNoiseCurveContrast - 1) / (2 - kNoiseCurveContrast);
++
++float4 cLayerNoise[kNoisyLayers * kRegistersPerLayerNoise] : register(c36);
++sampler3D sAuthoredNoise : register(s10);
++
++float4 LayerNoiseRegister(int layer, int registerInLayer)
++{
++    return layer == 0 ? cLayerNoise[registerInLayer]
++         : layer == 1 ? cLayerNoise[kRegistersPerLayerNoise + registerInLayer]
++                      : cLayerNoise[2 * kRegistersPerLayerNoise + registerInLayer];
++}
++
++float LayerNoiseAlpha(int layer)
++{
++    return layer < kNoisyLayers ? LayerNoiseRegister(layer, kFadeRegister).a : 0;
++}
++
++float3 LayerNoiseFade(int layer)
++{
++    return LayerNoiseRegister(layer, kFadeRegister).rgb;
++}
++
++bool AnyLayerNoise()
++{
++    return any(float3(cLayerNoise[kFadeRegister].a, cLayerNoise[kRegistersPerLayerNoise + kFadeRegister].a,
++                      cLayerNoise[2 * kRegistersPerLayerNoise + kFadeRegister].a) > 0);
++}
++
++float NoiseOctaveSample(int layer, int octaveRegister, float3 worldPosition)
++{
++    float4 octave = LayerNoiseRegister(layer, octaveRegister);
++    float3 tileCoordinate = frac((worldPosition - octave.xyz) * octave.w);
++    return tex3Dlod(sAuthoredNoise, float4(tileCoordinate, 0)).r;
++}
++
++float LayerNoiseSample(int layer, float3 worldPosition)
++{
++    float2 weights = LayerNoiseRegister(layer, kOctaveWeightRegister).xy;
++    return weights.x * NoiseOctaveSample(layer, kOctave0Register, worldPosition) +
++           weights.y * NoiseOctaveSample(layer, kOctave1Register, worldPosition);
++}
++
++float NoiseCurveBelowPivot(float x)
++{
++    return x * x * (kNoiseCurveShape + 1) / (x + kNoiseCurveShape / 2);
++}
++
++float NoiseDensityCurve(float x)
++{
++    float nearest = min(x, 1 - x);
++    float curve = NoiseCurveBelowPivot(nearest);
++    return x < kNoiseCurvePivot ? curve : 1 - curve;
++}
++
++float LayerNoiseDensity(int layer, float3 worldPosition)
++{
++    return lerp(1, NoiseDensityCurve(saturate(LayerNoiseSample(layer, worldPosition))), LayerNoiseAlpha(layer));
++}
++
++float4 LayerNoiseDensities(float3 worldPosition)
++{
++    float4 densities = 1;
++    [branch] if (!kSamplesAuthoredNoise || !AnyLayerNoise())
++        return densities;
++    [loop] for (int layer = 0; layer < kNoisyLayers; ++layer)
++    {
++        [branch] if (LayerNoiseAlpha(layer) > 0)
++            densities = layer == int4(0, 1, 2, 3) ? LayerNoiseDensity(layer, worldPosition) : densities;
++    }
++    return densities;
++}
+diff --git a/Shaders/VolFog/vf_common.hlsli b/Shaders/VolFog/vf_common.hlsli
+index 7754148..9fa8d82 100644
+--- a/Shaders/VolFog/vf_common.hlsli
++++ b/Shaders/VolFog/vf_common.hlsli
+@@ -5,7 +5,9 @@ float4 cDepthToViewZ : register(c3);
+ row_major float4x4 cViewToWorld : register(c4);
+ float4 cLowResTarget : register(c8);
+ 
+-static const float kSkyMinDepth = 0.99903;
++// Modified for World of Legends (2026-10-20, brief B6): was 0.99903. The client draws the world with the viewport depth range
++// 0..0.94 and the sky in 0.999..1.0 without writing depth, so depth >= 0.95 is always sky (design 1.1).
++static const float kSkyMinDepth = 0.95;
+ 
+ float2 ViewportOrigin()
+ {
+diff --git a/Shaders/VolFog/vf_density_variation.hlsli b/Shaders/VolFog/vf_density_variation.hlsli
+index 623c4de..c925c3b 100644
+--- a/Shaders/VolFog/vf_density_variation.hlsli
++++ b/Shaders/VolFog/vf_density_variation.hlsli
+@@ -1,13 +1,33 @@
+ float4 cDensityVariation : register(c78);
+-sampler3D sDensityNoise : register(s9);
++// Modified for World of Legends (2026-10-20, brief B6): the Gx layer has no volume textures, so the 32^3 noise is a 2D atlas of 32
++// slices (z) of 32x32 texels stacked along v (32 x 1024, LINEAR, WRAP in u). Was: sampler3D sDensityNoise : register(s9).
++sampler2D sDensityNoise : register(s9);
++
++static const float kNoiseSize = 32;
++
++// Same result as tex3Dlod(volume, uv) with WRAP and trilinear filtering on the 32^3 volume: the two slices that bracket z are
++// sampled with the bilinear filter of the atlas and blended. u wraps in hardware; v is kept inside its slice (half a texel of
++// each edge), so a row of one slice never blends with the next slice (the y wrap becomes a hard step, once every 32 texels).
++float SampleNoiseVolume(float3 uv)
++{
++    float3 texel = uv * kNoiseSize - 0.5;
++    float lowerSlice = floor(texel.z);
++    float blend = texel.z - lowerSlice;
++    float2 slices = floor(frac((lowerSlice + float2(0, 1)) / kNoiseSize) * kNoiseSize + 0.5);
++    float inSlice = clamp(frac(uv.y) * kNoiseSize, 0.5, kNoiseSize - 0.5);
++    float2 v = (slices * kNoiseSize + inSlice) / (kNoiseSize * kNoiseSize);
++    float lower = tex2Dlod(sDensityNoise, float4(uv.x, v.x, 0, 0)).r;
++    float upper = tex2Dlod(sDensityNoise, float4(uv.x, v.y, 0, 0)).r;
++    return lerp(lower, upper, blend);
++}
+ 
+ float DensityVariation(float3 worldPosition)
+ {
+     [branch] if (cDensityVariation.x <= 0)
+         return 1;
+     float3 uv = (worldPosition - float3(cDensityVariation.zw, 0)) * (cDensityVariation.y / 32) + 0.5 / 32;
+-    float noise = tex3Dlod(sDensityNoise, float4(uv, 0)).r * (4.0 / 3.0);
++    float noise = SampleNoiseVolume(uv) * (4.0 / 3.0);
+     uv = uv * 2 + float3(36.5, 16.5, 52.5) / 32;
+-    float centered = noise + tex3Dlod(sDensityNoise, float4(uv, 0)).r * (2.0 / 3.0) - 1;
++    float centered = noise + SampleNoiseVolume(uv) * (2.0 / 3.0) - 1;
+     return 1 + saturate(cDensityVariation.x) * centered;
+ }
+diff --git a/WoW/Source/WorldClient/DayNight.cpp b/WoW/Source/WorldClient/DayNight.cpp
+index ad37b84..2523966 100644
+--- a/WoW/Source/WorldClient/DayNight.cpp
++++ b/WoW/Source/WorldClient/DayNight.cpp
+@@ -32,6 +32,7 @@
+ #include "WoW/Source/WorldClient/WorldParam.h"
+ #include "Engine/Source/Gxu/Gxu.h"
+ #include "WoW/Source/Ui/WorldFrame.h"
++#include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
+ 
+ // STATIC: 0x00AF4C20
+ static C2Vector s_starFadeTable[4] = { C2Vector(0.125f, 1.0f), C2Vector(0.1875f, 0.0f), C2Vector(0.9375f, 0.0f), C2Vector(1.0f, 1.0f) };
+@@ -2267,6 +2268,18 @@ void DayNight::UpdateFog() {
+             DayNight::s_lightFlags &= ~1;
+         }
+     }
++
++    // Not in the original client (World of Legends), brief B6 (design 1.3): while the native volumetric fog draws the fog of the world
++    // (wolVolFog > 0 and VolFog::Armed()), the client's own linear fog is pushed out of range, so the world is drawn without it: start at
++    // 4 x the far clip, density 0 (fogMode 1 maps), and the end a bit further so that SetFogParams does not divide by zero (the design
++    // said start == end). m_fogInterior keeps the final values the volumetric model reads; the colour (also the clear colour) is not touched.
++    // Armed() is false underwater, so the client keeps its own fog there, and from the frame after the pass fails.
++    if (liquidStatus == 0 && VolFog::Armed()) {
++        float outOfRange = info.m_farClip * 4.0f;
++        info.m_fog.m_start = outOfRange;
++        info.m_fog.m_end = outOfRange + info.m_farClip;
++        info.m_fog.m_density = 0.0f;
++    }
+ }
+ 
+ // VERIFY: cb3314a8 manual
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index c92cd05..9b2d856 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -775,8 +775,8 @@ bool CWorldParam::WolVolFogCallback(CVar* var, const char* oldValue, const char*
+ }
+ 
+ // Not in the original client. Debug view of the native volumetric fog pass (VolFog::Render, brief B2): 0 draws nothing,
+-// 1 depth in grey (needs the INTZ depth of brief B3), 2 magenta tint over the world view, 3 test grid. The value is
+-// read every frame, so no restart is needed.
++// 1 depth in grey (needs the INTZ depth of brief B3), 2 the march buffer of the fog (brief B6; was a magenta tint in B2), 3 test grid.
++// The value is read every frame, so no restart is needed.
+ bool CWorldParam::WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
+     int32_t mode = -1;
+ 
+@@ -785,7 +785,7 @@ bool CWorldParam::WolVolFogDebugCallback(CVar* var, const char* oldValue, const
+     }
+ 
+     if (mode < 0) {
+-        ConsoleWrite("wolVolFogDebug must be 0 (off), 1 (depth), 2 (tint) or 3 (grid).", DEFAULT_COLOR);
++        ConsoleWrite("wolVolFogDebug must be 0 (off), 1 (depth), 2 (march buffer) or 3 (grid).", DEFAULT_COLOR);
+ 
+         return false;
+     }
+@@ -892,7 +892,7 @@ void CWorldParam::RegisterVolFogCVars() {
+     VolFog::s_messageHook = WolVolFogMessage;
+     CWorldParam::cvar_wolVolFog = CVar::Register("wolVolFog", "Native volumetric fog (0 off, 1 low, 2 medium, 3 high); needs gxRestart to turn on or off", 1, "0", CWorldParam::WolVolFogCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Debug view of the native volumetric fog pass (brief B2).
+-    CWorldParam::cvar_wolVolFogDebug = CVar::Register("wolVolFogDebug", "Volumetric fog debug view (0 off, 1 depth, 2 tint, 3 grid)", 1, "0", CWorldParam::WolVolFogDebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolVolFogDebug = CVar::Register("wolVolFogDebug", "Volumetric fog debug view (0 off, 1 depth, 2 march buffer, 3 grid)", 1, "0", CWorldParam::WolVolFogDebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Brief B4: density, light shafts and scattered point lights; saved, applied at once.
+     CWorldParam::cvar_wolVolFogDensity = CVar::Register("wolVolFogDensity", "Volumetric fog density multiplier (0.0 to 4.0)", 1, "1.0", CWorldParam::WolVolFogDensityCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolVolFogGodRays = CVar::Register("wolVolFogGodRays", "Volumetric fog light shaft strength (0.0 off to 1.0)", 1, "0.0", CWorldParam::WolVolFogGodRaysCallback, CATEGORY_GRAPHICS, false, nullptr, false);

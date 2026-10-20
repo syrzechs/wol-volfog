@@ -1,0 +1,3215 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d0866ac..fc42b44 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -107,6 +107,13 @@ add_subdirectory(WoW/Source/WorldClient)
+ add_subdirectory(WoW/Source/WowServices)
+ add_subdirectory(WoW/Source/WowSvcs)
+ add_subdirectory(WoW/Source)
++# Not in the original client (World of Legends): HLSL shaders of the native volumetric fog (wolVolFog), compiled with fxc
++# (Windows SDK) and packed with Python into bin/Win/Data/patch-Z.MPQ; WowClient depends on the VolFogShaders target.
++# OFF skips the whole chain (no fxc or Python needed); the client then has no volumetric fog shaders and wolVolFogDebug does nothing.
++option(WOWDECOMP_VOLFOG "Compile the volumetric fog shaders (fxc) into patch-Z.MPQ" ON)
++if (WOWDECOMP_VOLFOG)
++    add_subdirectory(Shaders/VolFog)
++endif ()
+ if (WIN32)
+     add_subdirectory(Tools/WowClient)
+ endif ()
+diff --git a/Engine/Source/VolFog/VolFog.h b/Engine/Source/VolFog/VolFog.h
+index 534ee29..609269f 100644
+--- a/Engine/Source/VolFog/VolFog.h
++++ b/Engine/Source/VolFog/VolFog.h
+@@ -17,6 +17,15 @@ namespace VolFog {
+     };
+ 
+     extern Caps s_caps;
++
++    // Brief B2: wolVolFogDebug (0 = off, 1 depth in grey, 2 magenta tint, 3 test grid), set by the CVar in
++    // WorldParam_CVar.cpp. B3 and later add the real wolVolFog CVar next to it.
++    extern int32_t s_debugMode;
++
++    // Draws the fog sub-passes over the world viewport of CGWorldFrame::OnWorldRender, between
++    // DayNight::RenderGlares and PlayerNameUpdateLate. With wolVolFogDebug 0 it draws nothing. If the shaders are
++    // not valid it writes one line to the console and does nothing else.
++    void Render();
+ }
+ 
+ #endif
+diff --git a/Engine/Source/VolFog/VolFogPass.cpp b/Engine/Source/VolFog/VolFogPass.cpp
+new file mode 100644
+index 0000000..363ed18
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogPass.cpp
+@@ -0,0 +1,114 @@
++#include "Engine/Source/VolFog/VolFogPass.h"
++#include <cstring>
++#include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
++#include "Engine/Source/Gx/CGxDevice/CGxShader.h"
++#include "Engine/Source/Gx/Gx.h"
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B2.
++// Licensed under GPL-3.0-only (see Shaders/VolFog/NOTICE-modificaciones.txt).
++
++VolFog::Pass::Pass(const char* pixelName, uint32_t pixelPermutations, const char* vertexName, EGxBlend blend) : FFX::Pass(nullptr, 0, nullptr, blend, false) {
++    this->m_vertexShader = nullptr;
++    memset(this->m_pixelShaders, 0, sizeof(this->m_pixelShaders));
++    this->m_pixelCount = 0;
++    this->m_pixelIndex = 0;
++    memset(this->m_viewportPx, 0, sizeof(this->m_viewportPx));
++    memset(this->m_targetPx, 0, sizeof(this->m_targetPx));
++    memset(this->m_savedViewport, 0, sizeof(this->m_savedViewport));
++
++    if (pixelPermutations < 1) {
++        pixelPermutations = 1;
++    } else if (pixelPermutations > kMaxPermutations) {
++        pixelPermutations = kMaxPermutations;
++    }
++
++    this->m_pixelCount = pixelPermutations;
++
++    // Same loading as PassBox4: shaders are looked up by name in the MPQ and cached by the device. A missing or invalid
++    // .bls leaves the shader without code and Valid() reports it.
++    g_theGxDevicePtr->ShaderCreate(&this->m_vertexShader, GxSh_Vertex, "Shaders\\Vertex", vertexName, 1);
++    g_theGxDevicePtr->ShaderCreate(this->m_pixelShaders, GxSh_Pixel, "Shaders\\Pixel", pixelName, pixelPermutations);
++}
++
++VolFog::Pass::~Pass() {
++    if (this->m_vertexShader) {
++        g_theGxDevicePtr->ShaderDestroy(this->m_vertexShader);
++    }
++
++    for (uint32_t i = 0; i < this->m_pixelCount; i++) {
++        if (this->m_pixelShaders[i]) {
++            g_theGxDevicePtr->ShaderDestroy(this->m_pixelShaders[i]);
++        }
++    }
++}
++
++bool VolFog::Pass::Valid() {
++    CGxShader* vertex = this->m_vertexShader;
++    CGxShader* pixel = this->m_pixelIndex < this->m_pixelCount ? this->m_pixelShaders[this->m_pixelIndex] : nullptr;
++
++    return vertex && pixel && vertex->Valid() && pixel->Valid();
++}
++
++void VolFog::Pass::SetPixelPermutation(uint32_t index) {
++    this->m_pixelIndex = index;
++}
++
++void VolFog::Pass::SetViewport(float x, float y, float width, float height, float targetWidth, float targetHeight) {
++    this->m_viewportPx[0] = x;
++    this->m_viewportPx[1] = y;
++    this->m_viewportPx[2] = width;
++    this->m_viewportPx[3] = height;
++    this->m_targetPx[0] = targetWidth;
++    this->m_targetPx[1] = targetHeight;
++}
++
++void VolFog::Pass::Begin() {
++    g_theGxDevicePtr->RsPush();
++    GxRsSet(GxRs_Culling, 0);
++    GxRsSet(GxRs_Lighting, 0);
++    GxRsSet(GxRs_DepthTest, 0);
++    GxRsSet(GxRs_DepthWrite, 0);
++    GxRsSet(GxRs_Fog, 0);
++    GxRsSet(GxRs_BlendingMode, static_cast<int32_t>(this->m_blend));
++
++    // The caller (CGWorldFrame::OnWorldRender) leaves the world viewport set: keep its x / y and open the depth range,
++    // the world uses 0..0.94 and the quad has z = 0.
++    float* saved = this->m_savedViewport;
++    GxXformViewport(saved[0], saved[1], saved[2], saved[3], saved[4], saved[5]);
++    GxXformSetViewport(saved[0], saved[1], saved[2], saved[3], 0.0f, 1.0f);
++}
++
++void VolFog::Pass::DrawQuad() {
++    // Clip space quad in the vertex order of FFX::SetupGeo_Quad (bottom-left, top-left, top-right, bottom-right) so
++    // that FFX::s_quadIndices draws it as a strip. The colour (shade 1.0 = white) and the texcoords travel in the
++    // buffer for the pixel shaders that want them; the vertex shader of the pass only reads the position.
++    static const C3Vector s_positions[4] = {
++        C3Vector(-1.0f, -1.0f, 0.0f),
++        C3Vector(-1.0f, 1.0f, 0.0f),
++        C3Vector(1.0f, 1.0f, 0.0f),
++        C3Vector(1.0f, -1.0f, 0.0f)
++    };
++    static const C2Vector s_texCoords[4] = {
++        C2Vector(0.0f, 1.0f),
++        C2Vector(0.0f, 0.0f),
++        C2Vector(1.0f, 0.0f),
++        C2Vector(1.0f, 1.0f)
++    };
++    static const float s_shade[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
++
++    FFX::SetupVB_PCT(4, s_positions, s_texCoords, s_shade);
++    g_theGxDevicePtr->PrimVertexMask(0x51); // position, colour 0, texcoord 0
++    FFX::SetupIB();
++
++    g_theGxDevicePtr->RsSet(GxRs_VertexShader, this->m_vertexShader);
++    g_theGxDevicePtr->RsSet(GxRs_PixelShader, this->m_pixelShaders[this->m_pixelIndex]);
++
++    g_theGxDevicePtr->Draw(&FFX::s_quadBatch, 1);
++}
++
++void VolFog::Pass::End() {
++    g_theGxDevicePtr->RsPop();
++
++    const float* saved = this->m_savedViewport;
++    GxXformSetViewport(saved[0], saved[1], saved[2], saved[3], saved[4], saved[5]);
++}
+diff --git a/Engine/Source/VolFog/VolFogPass.h b/Engine/Source/VolFog/VolFogPass.h
+new file mode 100644
+index 0000000..21bc322
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogPass.h
+@@ -0,0 +1,53 @@
++#ifndef ENGINE_SOURCE_VOLFOG_VOLFOGPASS_H
++#define ENGINE_SOURCE_VOLFOG_VOLFOGPASS_H
++
++#include <cstddef>
++#include <cstdint>
++#include "Engine/Source/FFX/FFX.h"
++
++class CGxShader;
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B2.
++// Licensed under GPL-3.0-only (the module combines the FFX::Pass plumbing of the client with the shader contract of
++// coa-vfog 205ade5; see Shaders/VolFog/NOTICE-modificaciones.txt).
++
++namespace VolFog {
++    // Base of every sub-pass of the fog (design 1.1): an FFX::Pass that owns a vs_3_0 / ps_3_0 pair loaded by name from
++    // Data\patch-Z.MPQ (Shaders\Vertex\vs_3_0\<vs>.bls, Shaders\Pixel\ps_3_0\<ps>.bls) and draws one full-screen quad
++    // over the world viewport with the FFX quad index buffer. The vertex shader is vf_fullscreen_vs.hlsl, which returns
++    // its position untouched, so the quad is built in clip space (-1..1) instead of the pixel space of FFX::SetupGeo_Quad.
++    class Pass : public FFX::Pass {
++        public:
++        static const uint32_t kMaxPermutations = 6;
++
++        ~Pass() override;
++        bool Valid() override;
++
++        // Permutation of the pixel shader used by the next Execute().
++        void SetPixelPermutation(uint32_t index);
++        // World viewport in pixels (origin at the top-left of the back buffer) and back buffer size, for the constants.
++        void SetViewport(float x, float y, float width, float height, float targetWidth, float targetHeight);
++
++        protected:
++        Pass(const char* pixelName, uint32_t pixelPermutations, const char* vertexName, EGxBlend blend);
++
++        // SetupGx equivalent: RsPush, culling / lighting / depth / fog off, blend of the pass, viewport of the world with
++        // the full 0..1 depth range. End() undoes it (RsPop and the viewport as Begin() found it).
++        void Begin();
++        // Binds the shaders of the pass, builds the quad (FFX::SetupVB_PCT + FFX::SetupIB) and draws it.
++        void DrawQuad();
++        void End();
++
++        CGxShader* m_vertexShader;
++        CGxShader* m_pixelShaders[kMaxPermutations];
++        uint32_t m_pixelCount;
++        uint32_t m_pixelIndex;
++        float m_viewportPx[4];
++        float m_targetPx[2];
++
++        private:
++        float m_savedViewport[6];
++    };
++}
++
++#endif
+diff --git a/Engine/Source/VolFog/VolFogRender.cpp b/Engine/Source/VolFog/VolFogRender.cpp
+new file mode 100644
+index 0000000..ee3537b
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogRender.cpp
+@@ -0,0 +1,99 @@
++#include <cstring>
++#include "Engine/Source/ConsoleBase/IConsole.h"
++#include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
++#include "Engine/Source/Gx/Gx.h"
++#include "Engine/Source/Tempest/CRect.h"
++#include "Engine/Source/VolFog/VolFog.h"
++#include "Engine/Source/VolFog/VolFogPass.h"
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B2.
++// Licensed under GPL-3.0-only (see Shaders/VolFog/NOTICE-modificaciones.txt).
++
++int32_t VolFog::s_debugMode;
++
++namespace {
++    // wolVolFogDebug 1..3 (permutation = mode - 1 of WolVolFogDebug.bls): 1 depth in grey (needs the INTZ depth of B3),
++    // 2 magenta tint over the world view, 3 test grid. The registers follow the contract of the design (section 3).
++    class DebugPass : public VolFog::Pass {
++        public:
++        DebugPass() : VolFog::Pass("WolVolFogDebug", 3, "WolVolFogQuad", GxBlend_Alpha) {}
++
++        void Execute() override {
++            // The pixel constants c0..c3 belong to whoever draws next: put them back as they were.
++            float saved[16];
++            memcpy(saved, CGxDevice::s_shadowConstants[0].constants, sizeof(saved));
++
++            float c0[4] = { this->m_viewportPx[0], this->m_viewportPx[1], this->m_viewportPx[2], this->m_viewportPx[3] };
++            float c1[4] = { 1.0f, 0.0f, 1.0f / this->m_targetPx[0], 1.0f / this->m_targetPx[1] };
++            // Depth to view z: filled in by the brief that reads the depth (B3); max distance and deepest world depth as in the design.
++            float c3[4] = { 0.0f, 0.0f, 5000.0f, 0.94f };
++
++            this->Begin();
++
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, c0, 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 1, c1, 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 3, c3, 1);
++            GxRsSet(GxRs_Texture0, 0); // sDepth: the INTZ depth texture is bound here from B3 on
++
++            this->DrawQuad();
++            this->End();
++
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, &saved[0], 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 1, &saved[4], 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 3, &saved[12], 1);
++        }
++    };
++
++    DebugPass* s_debugPass;
++    bool s_failureLogged;
++}
++
++void VolFog::Render() {
++    int32_t mode = VolFog::s_debugMode;
++
++    if (mode < 1 || mode > 3) {
++        return;
++    }
++
++    if (!s_debugPass) {
++        // Created on first use and kept for the whole run; the shaders belong to the device and go with it.
++        s_debugPass = new DebugPass();
++    }
++
++    s_debugPass->SetPixelPermutation(static_cast<uint32_t>(mode - 1));
++
++    if (!s_debugPass->Valid()) {
++        // Failure policy (design 1.3): say it once, draw nothing, touch nothing else.
++        if (!s_failureLogged) {
++            s_failureLogged = true;
++            const char* message = "wolVolFog: the shaders WolVolFogQuad / WolVolFogDebug are not valid (is Data\\patch-Z.MPQ present, and does the video card support ps_3_0?); wolVolFogDebug does nothing.";
++            ConsoleWrite(message, DEFAULT_COLOR);
++            CGxDevice::Log("%s", message);
++        }
++
++        return;
++    }
++
++    CRect window = { 0.0f, 0.0f, 0.0f, 0.0f };
++    g_theGxDevicePtr->CapsWindowSize(window);
++
++    float width = window.maxX - window.minX;
++    float height = window.maxY - window.minY;
++
++    if (width <= 0.0f || height <= 0.0f) {
++        return;
++    }
++
++    // The world viewport that CGWorldFrame::OnWorldRender left set, in pixels from the top-left corner of the back
++    // buffer (Gx viewport y grows upwards; D3D9 viewport y is (1 - maxY) * height, CGxDeviceD3d::IXformSetViewport).
++    float minX = 0.0f;
++    float maxX = 0.0f;
++    float minY = 0.0f;
++    float maxY = 0.0f;
++    float minZ = 0.0f;
++    float maxZ = 0.0f;
++    GxXformViewport(minX, maxX, minY, maxY, minZ, maxZ);
++
++    s_debugPass->SetViewport(minX * width, (1.0f - maxY) * height, (maxX - minX) * width, (maxY - minY) * height, width, height);
++    s_debugPass->Execute();
++}
+diff --git a/Shaders/VolFog/CMakeLists.txt b/Shaders/VolFog/CMakeLists.txt
+new file mode 100644
+index 0000000..594042d
+--- /dev/null
++++ b/Shaders/VolFog/CMakeLists.txt
+@@ -0,0 +1,113 @@
++# Not in the original client (World of Legends): HLSL shaders of the native volumetric fog (wolVolFog), brief B2.
++# Chain (design 2026-10-19-fase3-niebla-volumetrica-design.md, section 3): fxc -> Tools/VolFog/mkbls.py (GXSH .bls) ->
++# Tools/VolFog/mkmpq.py -> bin/Win/Data/patch-Z.MPQ. Only the target VolFogShaders is defined here; WowClient depends on it.
++
++set(VOLFOG_OUT ${CMAKE_BINARY_DIR}/volfog)
++set(VOLFOG_STAGE ${VOLFOG_OUT}/stage)
++set(VOLFOG_MPQ ${CMAKE_SOURCE_DIR}/bin/Win/Data/patch-Z.MPQ)
++
++# fxc.exe: newest Windows SDK that has it (override with -DVOLFOG_FXC=<path>).
++set(VOLFOG_FXC "" CACHE FILEPATH "HLSL compiler (fxc.exe) used for the volumetric fog shaders")
++if (NOT VOLFOG_FXC OR NOT EXISTS "${VOLFOG_FXC}")
++    file(GLOB VOLFOG_FXC_CANDIDATES "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.*/x64/fxc.exe"
++                                    "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64/fxc.exe")
++    list(REMOVE_DUPLICATES VOLFOG_FXC_CANDIDATES)
++    list(SORT VOLFOG_FXC_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
++    if (VOLFOG_FXC_CANDIDATES)
++        list(GET VOLFOG_FXC_CANDIDATES 0 VOLFOG_FXC_FOUND)
++        set(VOLFOG_FXC "${VOLFOG_FXC_FOUND}" CACHE FILEPATH "HLSL compiler (fxc.exe) used for the volumetric fog shaders" FORCE)
++    endif ()
++endif ()
++if (NOT VOLFOG_FXC OR NOT EXISTS "${VOLFOG_FXC}")
++    message(FATAL_ERROR
++        "WOWDECOMP_VOLFOG: fxc.exe not found. Install the Windows 10/11 SDK (it provides "
++        "'C:/Program Files (x86)/Windows Kits/10/bin/<version>/x64/fxc.exe'), pass -DVOLFOG_FXC=<path to fxc.exe>, "
++        "or configure with -DWOWDECOMP_VOLFOG=OFF to skip the volumetric fog shaders.")
++endif ()
++
++# Python 3 (standard library only) runs mkbls.py and mkmpq.py (override with -DVOLFOG_PYTHON=<python.exe>).
++set(VOLFOG_PYTHON "" CACHE FILEPATH "Python 3 interpreter used by Tools/VolFog")
++if (NOT VOLFOG_PYTHON OR NOT EXISTS "${VOLFOG_PYTHON}")
++    find_package(Python3 COMPONENTS Interpreter QUIET)
++    if (Python3_Interpreter_FOUND)
++        set(VOLFOG_PYTHON "${Python3_EXECUTABLE}" CACHE FILEPATH "Python 3 interpreter used by Tools/VolFog" FORCE)
++    endif ()
++endif ()
++if (NOT VOLFOG_PYTHON OR NOT EXISTS "${VOLFOG_PYTHON}")
++    message(FATAL_ERROR
++        "WOWDECOMP_VOLFOG: Python 3 not found (needed by Tools/VolFog/mkbls.py and mkmpq.py). Install it, pass "
++        "-DVOLFOG_PYTHON=<path to python.exe>, or configure with -DWOWDECOMP_VOLFOG=OFF.")
++endif ()
++
++file(GLOB VOLFOG_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.hlsli")
++set(VOLFOG_MKBLS ${CMAKE_SOURCE_DIR}/Tools/VolFog/mkbls.py)
++set(VOLFOG_MKMPQ ${CMAKE_SOURCE_DIR}/Tools/VolFog/mkmpq.py)
++set(VOLFOG_BLS_FILES "")
++
++# volfog_shader(<Name> <ps|vs> <source.hlsl> [PERMUTATIONS <defs> ...])
++# One fxc run per permutation: each <defs> is a comma separated list of preprocessor definitions (e.g.
++# "STEPS=16,LOCAL_LIGHTS=0"); without PERMUTATIONS there is one permutation with no definitions. The .bls holds the
++# permutations in the order given and is staged as Shaders/Pixel/ps_3_0/<Name>.bls or Shaders/Vertex/vs_3_0/<Name>.bls.
++function(volfog_shader NAME KIND SOURCE)
++    cmake_parse_arguments(ARG "" "" "PERMUTATIONS" ${ARGN})
++    if (KIND STREQUAL "ps")
++        set(PROFILE ps_3_0)
++        set(BLS_DIR Shaders/Pixel/ps_3_0)
++    elseif (KIND STREQUAL "vs")
++        set(PROFILE vs_3_0)
++        set(BLS_DIR Shaders/Vertex/vs_3_0)
++    else ()
++        message(FATAL_ERROR "volfog_shader(${NAME}): kind must be ps or vs")
++    endif ()
++    if (NOT ARG_PERMUTATIONS)
++        set(ARG_PERMUTATIONS "-")
++    endif ()
++    list(LENGTH ARG_PERMUTATIONS PERM_COUNT)
++
++    set(PSOS "")
++    set(INDEX 0)
++    foreach (PERM IN LISTS ARG_PERMUTATIONS)
++        set(DEFINE_ARGS "")
++        if (NOT PERM STREQUAL "-")
++            string(REPLACE "," ";" DEFINES "${PERM}")
++            foreach (DEFINE IN LISTS DEFINES)
++                list(APPEND DEFINE_ARGS /D ${DEFINE})
++            endforeach ()
++        endif ()
++        set(PSO ${VOLFOG_OUT}/${NAME}_${INDEX}.pso)
++        set(ASM ${VOLFOG_OUT}/${NAME}_${INDEX}.asm)
++        add_custom_command(
++            OUTPUT ${PSO} ${ASM}
++            COMMAND ${CMAKE_COMMAND} -E make_directory ${VOLFOG_OUT}
++            COMMAND "${VOLFOG_FXC}" /nologo /O3 /T ${PROFILE} /E main ${DEFINE_ARGS} /Fo ${PSO} /Fc ${ASM} ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE}
++            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE} ${VOLFOG_HEADERS}
++            COMMENT "fxc ${PROFILE} ${NAME} [${INDEX}] ${PERM}"
++            VERBATIM)
++        list(APPEND PSOS ${PSO})
++        math(EXPR INDEX "${INDEX} + 1")
++    endforeach ()
++
++    set(BLS ${VOLFOG_STAGE}/${BLS_DIR}/${NAME}.bls)
++    add_custom_command(
++        OUTPUT ${BLS}
++        COMMAND ${CMAKE_COMMAND} -E make_directory ${VOLFOG_STAGE}/${BLS_DIR}
++        COMMAND "${VOLFOG_PYTHON}" -I ${VOLFOG_MKBLS} ${BLS} ${PSOS}
++        DEPENDS ${PSOS} ${VOLFOG_MKBLS}
++        COMMENT "mkbls ${NAME}.bls (${PERM_COUNT} permutation(s))"
++        VERBATIM)
++    set(VOLFOG_BLS_FILES ${VOLFOG_BLS_FILES} ${BLS} PARENT_SCOPE)
++endfunction ()
++
++# B2: quad vertex shader (vf_fullscreen_vs.hlsl as it is) and the debug pixel shader (wolVolFogDebug 1..3).
++# The remaining vf_*.hlsl are compiled from brief B6 on (design, section 3).
++volfog_shader(WolVolFogQuad vs vf_fullscreen_vs.hlsl)
++volfog_shader(WolVolFogDebug ps WolVolFogDebug.hlsl PERMUTATIONS "DEBUG_MODE=1" "DEBUG_MODE=2" "DEBUG_MODE=3")
++
++add_custom_command(
++    OUTPUT ${VOLFOG_MPQ}
++    COMMAND "${VOLFOG_PYTHON}" -I ${VOLFOG_MKMPQ} ${VOLFOG_MPQ} ${VOLFOG_STAGE} ${VOLFOG_BLS_FILES}
++    DEPENDS ${VOLFOG_BLS_FILES} ${VOLFOG_MKMPQ}
++    COMMENT "mkmpq patch-Z.MPQ"
++    VERBATIM)
++
++add_custom_target(VolFogShaders ALL DEPENDS ${VOLFOG_MPQ})
+diff --git a/Shaders/VolFog/LICENSE b/Shaders/VolFog/LICENSE
+new file mode 100644
+index 0000000..f288702
+--- /dev/null
++++ b/Shaders/VolFog/LICENSE
+@@ -0,0 +1,674 @@
++                    GNU GENERAL PUBLIC LICENSE
++                       Version 3, 29 June 2007
++
++ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
++ Everyone is permitted to copy and distribute verbatim copies
++ of this license document, but changing it is not allowed.
++
++                            Preamble
++
++  The GNU General Public License is a free, copyleft license for
++software and other kinds of works.
++
++  The licenses for most software and other practical works are designed
++to take away your freedom to share and change the works.  By contrast,
++the GNU General Public License is intended to guarantee your freedom to
++share and change all versions of a program--to make sure it remains free
++software for all its users.  We, the Free Software Foundation, use the
++GNU General Public License for most of our software; it applies also to
++any other work released this way by its authors.  You can apply it to
++your programs, too.
++
++  When we speak of free software, we are referring to freedom, not
++price.  Our General Public Licenses are designed to make sure that you
++have the freedom to distribute copies of free software (and charge for
++them if you wish), that you receive source code or can get it if you
++want it, that you can change the software or use pieces of it in new
++free programs, and that you know you can do these things.
++
++  To protect your rights, we need to prevent others from denying you
++these rights or asking you to surrender the rights.  Therefore, you have
++certain responsibilities if you distribute copies of the software, or if
++you modify it: responsibilities to respect the freedom of others.
++
++  For example, if you distribute copies of such a program, whether
++gratis or for a fee, you must pass on to the recipients the same
++freedoms that you received.  You must make sure that they, too, receive
++or can get the source code.  And you must show them these terms so they
++know their rights.
++
++  Developers that use the GNU GPL protect your rights with two steps:
++(1) assert copyright on the software, and (2) offer you this License
++giving you legal permission to copy, distribute and/or modify it.
++
++  For the developers' and authors' protection, the GPL clearly explains
++that there is no warranty for this free software.  For both users' and
++authors' sake, the GPL requires that modified versions be marked as
++changed, so that their problems will not be attributed erroneously to
++authors of previous versions.
++
++  Some devices are designed to deny users access to install or run
++modified versions of the software inside them, although the manufacturer
++can do so.  This is fundamentally incompatible with the aim of
++protecting users' freedom to change the software.  The systematic
++pattern of such abuse occurs in the area of products for individuals to
++use, which is precisely where it is most unacceptable.  Therefore, we
++have designed this version of the GPL to prohibit the practice for those
++products.  If such problems arise substantially in other domains, we
++stand ready to extend this provision to those domains in future versions
++of the GPL, as needed to protect the freedom of users.
++
++  Finally, every program is threatened constantly by software patents.
++States should not allow patents to restrict development and use of
++software on general-purpose computers, but in those that do, we wish to
++avoid the special danger that patents applied to a free program could
++make it effectively proprietary.  To prevent this, the GPL assures that
++patents cannot be used to render the program non-free.
++
++  The precise terms and conditions for copying, distribution and
++modification follow.
++
++                       TERMS AND CONDITIONS
++
++  0. Definitions.
++
++  "This License" refers to version 3 of the GNU General Public License.
++
++  "Copyright" also means copyright-like laws that apply to other kinds of
++works, such as semiconductor masks.
++
++  "The Program" refers to any copyrightable work licensed under this
++License.  Each licensee is addressed as "you".  "Licensees" and
++"recipients" may be individuals or organizations.
++
++  To "modify" a work means to copy from or adapt all or part of the work
++in a fashion requiring copyright permission, other than the making of an
++exact copy.  The resulting work is called a "modified version" of the
++earlier work or a work "based on" the earlier work.
++
++  A "covered work" means either the unmodified Program or a work based
++on the Program.
++
++  To "propagate" a work means to do anything with it that, without
++permission, would make you directly or secondarily liable for
++infringement under applicable copyright law, except executing it on a
++computer or modifying a private copy.  Propagation includes copying,
++distribution (with or without modification), making available to the
++public, and in some countries other activities as well.
++
++  To "convey" a work means any kind of propagation that enables other
++parties to make or receive copies.  Mere interaction with a user through
++a computer network, with no transfer of a copy, is not conveying.
++
++  An interactive user interface displays "Appropriate Legal Notices"
++to the extent that it includes a convenient and prominently visible
++feature that (1) displays an appropriate copyright notice, and (2)
++tells the user that there is no warranty for the work (except to the
++extent that warranties are provided), that licensees may convey the
++work under this License, and how to view a copy of this License.  If
++the interface presents a list of user commands or options, such as a
++menu, a prominent item in the list meets this criterion.
++
++  1. Source Code.
++
++  The "source code" for a work means the preferred form of the work
++for making modifications to it.  "Object code" means any non-source
++form of a work.
++
++  A "Standard Interface" means an interface that either is an official
++standard defined by a recognized standards body, or, in the case of
++interfaces specified for a particular programming language, one that
++is widely used among developers working in that language.
++
++  The "System Libraries" of an executable work include anything, other
++than the work as a whole, that (a) is included in the normal form of
++packaging a Major Component, but which is not part of that Major
++Component, and (b) serves only to enable use of the work with that
++Major Component, or to implement a Standard Interface for which an
++implementation is available to the public in source code form.  A
++"Major Component", in this context, means a major essential component
++(kernel, window system, and so on) of the specific operating system
++(if any) on which the executable work runs, or a compiler used to
++produce the work, or an object code interpreter used to run it.
++
++  The "Corresponding Source" for a work in object code form means all
++the source code needed to generate, install, and (for an executable
++work) run the object code and to modify the work, including scripts to
++control those activities.  However, it does not include the work's
++System Libraries, or general-purpose tools or generally available free
++programs which are used unmodified in performing those activities but
++which are not part of the work.  For example, Corresponding Source
++includes interface definition files associated with source files for
++the work, and the source code for shared libraries and dynamically
++linked subprograms that the work is specifically designed to require,
++such as by intimate data communication or control flow between those
++subprograms and other parts of the work.
++
++  The Corresponding Source need not include anything that users
++can regenerate automatically from other parts of the Corresponding
++Source.
++
++  The Corresponding Source for a work in source code form is that
++same work.
++
++  2. Basic Permissions.
++
++  All rights granted under this License are granted for the term of
++copyright on the Program, and are irrevocable provided the stated
++conditions are met.  This License explicitly affirms your unlimited
++permission to run the unmodified Program.  The output from running a
++covered work is covered by this License only if the output, given its
++content, constitutes a covered work.  This License acknowledges your
++rights of fair use or other equivalent, as provided by copyright law.
++
++  You may make, run and propagate covered works that you do not
++convey, without conditions so long as your license otherwise remains
++in force.  You may convey covered works to others for the sole purpose
++of having them make modifications exclusively for you, or provide you
++with facilities for running those works, provided that you comply with
++the terms of this License in conveying all material for which you do
++not control copyright.  Those thus making or running the covered works
++for you must do so exclusively on your behalf, under your direction
++and control, on terms that prohibit them from making any copies of
++your copyrighted material outside their relationship with you.
++
++  Conveying under any other circumstances is permitted solely under
++the conditions stated below.  Sublicensing is not allowed; section 10
++makes it unnecessary.
++
++  3. Protecting Users' Legal Rights From Anti-Circumvention Law.
++
++  No covered work shall be deemed part of an effective technological
++measure under any applicable law fulfilling obligations under article
++11 of the WIPO copyright treaty adopted on 20 December 1996, or
++similar laws prohibiting or restricting circumvention of such
++measures.
++
++  When you convey a covered work, you waive any legal power to forbid
++circumvention of technological measures to the extent such circumvention
++is effected by exercising rights under this License with respect to
++the covered work, and you disclaim any intention to limit operation or
++modification of the work as a means of enforcing, against the work's
++users, your or third parties' legal rights to forbid circumvention of
++technological measures.
++
++  4. Conveying Verbatim Copies.
++
++  You may convey verbatim copies of the Program's source code as you
++receive it, in any medium, provided that you conspicuously and
++appropriately publish on each copy an appropriate copyright notice;
++keep intact all notices stating that this License and any
++non-permissive terms added in accord with section 7 apply to the code;
++keep intact all notices of the absence of any warranty; and give all
++recipients a copy of this License along with the Program.
++
++  You may charge any price or no price for each copy that you convey,
++and you may offer support or warranty protection for a fee.
++
++  5. Conveying Modified Source Versions.
++
++  You may convey a work based on the Program, or the modifications to
++produce it from the Program, in the form of source code under the
++terms of section 4, provided that you also meet all of these conditions:
++
++    a) The work must carry prominent notices stating that you modified
++    it, and giving a relevant date.
++
++    b) The work must carry prominent notices stating that it is
++    released under this License and any conditions added under section
++    7.  This requirement modifies the requirement in section 4 to
++    "keep intact all notices".
++
++    c) You must license the entire work, as a whole, under this
++    License to anyone who comes into possession of a copy.  This
++    License will therefore apply, along with any applicable section 7
++    additional terms, to the whole of the work, and all its parts,
++    regardless of how they are packaged.  This License gives no
++    permission to license the work in any other way, but it does not
++    invalidate such permission if you have separately received it.
++
++    d) If the work has interactive user interfaces, each must display
++    Appropriate Legal Notices; however, if the Program has interactive
++    interfaces that do not display Appropriate Legal Notices, your
++    work need not make them do so.
++
++  A compilation of a covered work with other separate and independent
++works, which are not by their nature extensions of the covered work,
++and which are not combined with it such as to form a larger program,
++in or on a volume of a storage or distribution medium, is called an
++"aggregate" if the compilation and its resulting copyright are not
++used to limit the access or legal rights of the compilation's users
++beyond what the individual works permit.  Inclusion of a covered work
++in an aggregate does not cause this License to apply to the other
++parts of the aggregate.
++
++  6. Conveying Non-Source Forms.
++
++  You may convey a covered work in object code form under the terms
++of sections 4 and 5, provided that you also convey the
++machine-readable Corresponding Source under the terms of this License,
++in one of these ways:
++
++    a) Convey the object code in, or embodied in, a physical product
++    (including a physical distribution medium), accompanied by the
++    Corresponding Source fixed on a durable physical medium
++    customarily used for software interchange.
++
++    b) Convey the object code in, or embodied in, a physical product
++    (including a physical distribution medium), accompanied by a
++    written offer, valid for at least three years and valid for as
++    long as you offer spare parts or customer support for that product
++    model, to give anyone who possesses the object code either (1) a
++    copy of the Corresponding Source for all the software in the
++    product that is covered by this License, on a durable physical
++    medium customarily used for software interchange, for a price no
++    more than your reasonable cost of physically performing this
++    conveying of source, or (2) access to copy the
++    Corresponding Source from a network server at no charge.
++
++    c) Convey individual copies of the object code with a copy of the
++    written offer to provide the Corresponding Source.  This
++    alternative is allowed only occasionally and noncommercially, and
++    only if you received the object code with such an offer, in accord
++    with subsection 6b.
++
++    d) Convey the object code by offering access from a designated
++    place (gratis or for a charge), and offer equivalent access to the
++    Corresponding Source in the same way through the same place at no
++    further charge.  You need not require recipients to copy the
++    Corresponding Source along with the object code.  If the place to
++    copy the object code is a network server, the Corresponding Source
++    may be on a different server (operated by you or a third party)
++    that supports equivalent copying facilities, provided you maintain
++    clear directions next to the object code saying where to find the
++    Corresponding Source.  Regardless of what server hosts the
++    Corresponding Source, you remain obligated to ensure that it is
++    available for as long as needed to satisfy these requirements.
++
++    e) Convey the object code using peer-to-peer transmission, provided
++    you inform other peers where the object code and Corresponding
++    Source of the work are being offered to the general public at no
++    charge under subsection 6d.
++
++  A separable portion of the object code, whose source code is excluded
++from the Corresponding Source as a System Library, need not be
++included in conveying the object code work.
++
++  A "User Product" is either (1) a "consumer product", which means any
++tangible personal property which is normally used for personal, family,
++or household purposes, or (2) anything designed or sold for incorporation
++into a dwelling.  In determining whether a product is a consumer product,
++doubtful cases shall be resolved in favor of coverage.  For a particular
++product received by a particular user, "normally used" refers to a
++typical or common use of that class of product, regardless of the status
++of the particular user or of the way in which the particular user
++actually uses, or expects or is expected to use, the product.  A product
++is a consumer product regardless of whether the product has substantial
++commercial, industrial or non-consumer uses, unless such uses represent
++the only significant mode of use of the product.
++
++  "Installation Information" for a User Product means any methods,
++procedures, authorization keys, or other information required to install
++and execute modified versions of a covered work in that User Product from
++a modified version of its Corresponding Source.  The information must
++suffice to ensure that the continued functioning of the modified object
++code is in no case prevented or interfered with solely because
++modification has been made.
++
++  If you convey an object code work under this section in, or with, or
++specifically for use in, a User Product, and the conveying occurs as
++part of a transaction in which the right of possession and use of the
++User Product is transferred to the recipient in perpetuity or for a
++fixed term (regardless of how the transaction is characterized), the
++Corresponding Source conveyed under this section must be accompanied
++by the Installation Information.  But this requirement does not apply
++if neither you nor any third party retains the ability to install
++modified object code on the User Product (for example, the work has
++been installed in ROM).
++
++  The requirement to provide Installation Information does not include a
++requirement to continue to provide support service, warranty, or updates
++for a work that has been modified or installed by the recipient, or for
++the User Product in which it has been modified or installed.  Access to a
++network may be denied when the modification itself materially and
++adversely affects the operation of the network or violates the rules and
++protocols for communication across the network.
++
++  Corresponding Source conveyed, and Installation Information provided,
++in accord with this section must be in a format that is publicly
++documented (and with an implementation available to the public in
++source code form), and must require no special password or key for
++unpacking, reading or copying.
++
++  7. Additional Terms.
++
++  "Additional permissions" are terms that supplement the terms of this
++License by making exceptions from one or more of its conditions.
++Additional permissions that are applicable to the entire Program shall
++be treated as though they were included in this License, to the extent
++that they are valid under applicable law.  If additional permissions
++apply only to part of the Program, that part may be used separately
++under those permissions, but the entire Program remains governed by
++this License without regard to the additional permissions.
++
++  When you convey a copy of a covered work, you may at your option
++remove any additional permissions from that copy, or from any part of
++it.  (Additional permissions may be written to require their own
++removal in certain cases when you modify the work.)  You may place
++additional permissions on material, added by you to a covered work,
++for which you have or can give appropriate copyright permission.
++
++  Notwithstanding any other provision of this License, for material you
++add to a covered work, you may (if authorized by the copyright holders of
++that material) supplement the terms of this License with terms:
++
++    a) Disclaiming warranty or limiting liability differently from the
++    terms of sections 15 and 16 of this License; or
++
++    b) Requiring preservation of specified reasonable legal notices or
++    author attributions in that material or in the Appropriate Legal
++    Notices displayed by works containing it; or
++
++    c) Prohibiting misrepresentation of the origin of that material, or
++    requiring that modified versions of such material be marked in
++    reasonable ways as different from the original version; or
++
++    d) Limiting the use for publicity purposes of names of licensors or
++    authors of the material; or
++
++    e) Declining to grant rights under trademark law for use of some
++    trade names, trademarks, or service marks; or
++
++    f) Requiring indemnification of licensors and authors of that
++    material by anyone who conveys the material (or modified versions of
++    it) with contractual assumptions of liability to the recipient, for
++    any liability that these contractual assumptions directly impose on
++    those licensors and authors.
++
++  All other non-permissive additional terms are considered "further
++restrictions" within the meaning of section 10.  If the Program as you
++received it, or any part of it, contains a notice stating that it is
++governed by this License along with a term that is a further
++restriction, you may remove that term.  If a license document contains
++a further restriction but permits relicensing or conveying under this
++License, you may add to a covered work material governed by the terms
++of that license document, provided that the further restriction does
++not survive such relicensing or conveying.
++
++  If you add terms to a covered work in accord with this section, you
++must place, in the relevant source files, a statement of the
++additional terms that apply to those files, or a notice indicating
++where to find the applicable terms.
++
++  Additional terms, permissive or non-permissive, may be stated in the
++form of a separately written license, or stated as exceptions;
++the above requirements apply either way.
++
++  8. Termination.
++
++  You may not propagate or modify a covered work except as expressly
++provided under this License.  Any attempt otherwise to propagate or
++modify it is void, and will automatically terminate your rights under
++this License (including any patent licenses granted under the third
++paragraph of section 11).
++
++  However, if you cease all violation of this License, then your
++license from a particular copyright holder is reinstated (a)
++provisionally, unless and until the copyright holder explicitly and
++finally terminates your license, and (b) permanently, if the copyright
++holder fails to notify you of the violation by some reasonable means
++prior to 60 days after the cessation.
++
++  Moreover, your license from a particular copyright holder is
++reinstated permanently if the copyright holder notifies you of the
++violation by some reasonable means, this is the first time you have
++received notice of violation of this License (for any work) from that
++copyright holder, and you cure the violation prior to 30 days after
++your receipt of the notice.
++
++  Termination of your rights under this section does not terminate the
++licenses of parties who have received copies or rights from you under
++this License.  If your rights have been terminated and not permanently
++reinstated, you do not qualify to receive new licenses for the same
++material under section 10.
++
++  9. Acceptance Not Required for Having Copies.
++
++  You are not required to accept this License in order to receive or
++run a copy of the Program.  Ancillary propagation of a covered work
++occurring solely as a consequence of using peer-to-peer transmission
++to receive a copy likewise does not require acceptance.  However,
++nothing other than this License grants you permission to propagate or
++modify any covered work.  These actions infringe copyright if you do
++not accept this License.  Therefore, by modifying or propagating a
++covered work, you indicate your acceptance of this License to do so.
++
++  10. Automatic Licensing of Downstream Recipients.
++
++  Each time you convey a covered work, the recipient automatically
++receives a license from the original licensors, to run, modify and
++propagate that work, subject to this License.  You are not responsible
++for enforcing compliance by third parties with this License.
++
++  An "entity transaction" is a transaction transferring control of an
++organization, or substantially all assets of one, or subdividing an
++organization, or merging organizations.  If propagation of a covered
++work results from an entity transaction, each party to that
++transaction who receives a copy of the work also receives whatever
++licenses to the work the party's predecessor in interest had or could
++give under the previous paragraph, plus a right to possession of the
++Corresponding Source of the work from the predecessor in interest, if
++the predecessor has it or can get it with reasonable efforts.
++
++  You may not impose any further restrictions on the exercise of the
++rights granted or affirmed under this License.  For example, you may
++not impose a license fee, royalty, or other charge for exercise of
++rights granted under this License, and you may not initiate litigation
++(including a cross-claim or counterclaim in a lawsuit) alleging that
++any patent claim is infringed by making, using, selling, offering for
++sale, or importing the Program or any portion of it.
++
++  11. Patents.
++
++  A "contributor" is a copyright holder who authorizes use under this
++License of the Program or a work on which the Program is based.  The
++work thus licensed is called the contributor's "contributor version".
++
++  A contributor's "essential patent claims" are all patent claims
++owned or controlled by the contributor, whether already acquired or
++hereafter acquired, that would be infringed by some manner, permitted
++by this License, of making, using, or selling its contributor version,
++but do not include claims that would be infringed only as a
++consequence of further modification of the contributor version.  For
++purposes of this definition, "control" includes the right to grant
++patent sublicenses in a manner consistent with the requirements of
++this License.
++
++  Each contributor grants you a non-exclusive, worldwide, royalty-free
++patent license under the contributor's essential patent claims, to
++make, use, sell, offer for sale, import and otherwise run, modify and
++propagate the contents of its contributor version.
++
++  In the following three paragraphs, a "patent license" is any express
++agreement or commitment, however denominated, not to enforce a patent
++(such as an express permission to practice a patent or covenant not to
++sue for patent infringement).  To "grant" such a patent license to a
++party means to make such an agreement or commitment not to enforce a
++patent against the party.
++
++  If you convey a covered work, knowingly relying on a patent license,
++and the Corresponding Source of the work is not available for anyone
++to copy, free of charge and under the terms of this License, through a
++publicly available network server or other readily accessible means,
++then you must either (1) cause the Corresponding Source to be so
++available, or (2) arrange to deprive yourself of the benefit of the
++patent license for this particular work, or (3) arrange, in a manner
++consistent with the requirements of this License, to extend the patent
++license to downstream recipients.  "Knowingly relying" means you have
++actual knowledge that, but for the patent license, your conveying the
++covered work in a country, or your recipient's use of the covered work
++in a country, would infringe one or more identifiable patents in that
++country that you have reason to believe are valid.
++
++  If, pursuant to or in connection with a single transaction or
++arrangement, you convey, or propagate by procuring conveyance of, a
++covered work, and grant a patent license to some of the parties
++receiving the covered work authorizing them to use, propagate, modify
++or convey a specific copy of the covered work, then the patent license
++you grant is automatically extended to all recipients of the covered
++work and works based on it.
++
++  A patent license is "discriminatory" if it does not include within
++the scope of its coverage, prohibits the exercise of, or is
++conditioned on the non-exercise of one or more of the rights that are
++specifically granted under this License.  You may not convey a covered
++work if you are a party to an arrangement with a third party that is
++in the business of distributing software, under which you make payment
++to the third party based on the extent of your activity of conveying
++the work, and under which the third party grants, to any of the
++parties who would receive the covered work from you, a discriminatory
++patent license (a) in connection with copies of the covered work
++conveyed by you (or copies made from those copies), or (b) primarily
++for and in connection with specific products or compilations that
++contain the covered work, unless you entered into that arrangement,
++or that patent license was granted, prior to 28 March 2007.
++
++  Nothing in this License shall be construed as excluding or limiting
++any implied license or other defenses to infringement that may
++otherwise be available to you under applicable patent law.
++
++  12. No Surrender of Others' Freedom.
++
++  If conditions are imposed on you (whether by court order, agreement or
++otherwise) that contradict the conditions of this License, they do not
++excuse you from the conditions of this License.  If you cannot convey a
++covered work so as to satisfy simultaneously your obligations under this
++License and any other pertinent obligations, then as a consequence you may
++not convey it at all.  For example, if you agree to terms that obligate you
++to collect a royalty for further conveying from those to whom you convey
++the Program, the only way you could satisfy both those terms and this
++License would be to refrain entirely from conveying the Program.
++
++  13. Use with the GNU Affero General Public License.
++
++  Notwithstanding any other provision of this License, you have
++permission to link or combine any covered work with a work licensed
++under version 3 of the GNU Affero General Public License into a single
++combined work, and to convey the resulting work.  The terms of this
++License will continue to apply to the part which is the covered work,
++but the special requirements of the GNU Affero General Public License,
++section 13, concerning interaction through a network will apply to the
++combination as such.
++
++  14. Revised Versions of this License.
++
++  The Free Software Foundation may publish revised and/or new versions of
++the GNU General Public License from time to time.  Such new versions will
++be similar in spirit to the present version, but may differ in detail to
++address new problems or concerns.
++
++  Each version is given a distinguishing version number.  If the
++Program specifies that a certain numbered version of the GNU General
++Public License "or any later version" applies to it, you have the
++option of following the terms and conditions either of that numbered
++version or of any later version published by the Free Software
++Foundation.  If the Program does not specify a version number of the
++GNU General Public License, you may choose any version ever published
++by the Free Software Foundation.
++
++  If the Program specifies that a proxy can decide which future
++versions of the GNU General Public License can be used, that proxy's
++public statement of acceptance of a version permanently authorizes you
++to choose that version for the Program.
++
++  Later license versions may give you additional or different
++permissions.  However, no additional obligations are imposed on any
++author or copyright holder as a result of your choosing to follow a
++later version.
++
++  15. Disclaimer of Warranty.
++
++  THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
++APPLICABLE LAW.  EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT
++HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS" WITHOUT WARRANTY
++OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,
++THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++PURPOSE.  THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM
++IS WITH YOU.  SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF
++ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
++
++  16. Limitation of Liability.
++
++  IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
++WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS
++THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY
++GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
++USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF
++DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD
++PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS),
++EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
++SUCH DAMAGES.
++
++  17. Interpretation of Sections 15 and 16.
++
++  If the disclaimer of warranty and limitation of liability provided
++above cannot be given local legal effect according to their terms,
++reviewing courts shall apply local law that most closely approximates
++an absolute waiver of all civil liability in connection with the
++Program, unless a warranty or assumption of liability accompanies a
++copy of the Program in return for a fee.
++
++                     END OF TERMS AND CONDITIONS
++
++            How to Apply These Terms to Your New Programs
++
++  If you develop a new program, and you want it to be of the greatest
++possible use to the public, the best way to achieve this is to make it
++free software which everyone can redistribute and change under these terms.
++
++  To do so, attach the following notices to the program.  It is safest
++to attach them to the start of each source file to most effectively
++state the exclusion of warranty; and each file should have at least
++the "copyright" line and a pointer to where the full notice is found.
++
++    <one line to give the program's name and a brief idea of what it does.>
++    Copyright (C) <year>  <name of author>
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++Also add information on how to contact you by electronic and paper mail.
++
++  If the program does terminal interaction, make it output a short
++notice like this when it starts in an interactive mode:
++
++    <program>  Copyright (C) <year>  <name of author>
++    This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.
++    This is free software, and you are welcome to redistribute it
++    under certain conditions; type `show c' for details.
++
++The hypothetical commands `show w' and `show c' should show the appropriate
++parts of the General Public License.  Of course, your program's commands
++might be different; for a GUI interface, you would use an "about box".
++
++  You should also get your employer (if you work as a programmer) or school,
++if any, to sign a "copyright disclaimer" for the program, if necessary.
++For more information on this, and how to apply and follow the GNU GPL, see
++<https://www.gnu.org/licenses/>.
++
++  The GNU General Public License does not permit incorporating your program
++into proprietary programs.  If your program is a subroutine library, you
++may consider it more useful to permit linking proprietary applications with
++the library.  If this is what you want to do, use the GNU Lesser General
++Public License instead of this License.  But first, please read
++<https://www.gnu.org/licenses/why-not-lgpl.html>.
+diff --git a/Shaders/VolFog/NOTICE-modificaciones.txt b/Shaders/VolFog/NOTICE-modificaciones.txt
+new file mode 100644
+index 0000000..4cfe1b1
+--- /dev/null
++++ b/Shaders/VolFog/NOTICE-modificaciones.txt
+@@ -0,0 +1,33 @@
++Shaders/VolFog: notice of origin and modifications
++===================================================
++
++Origin
++------
++The vf_*.hlsl / vf_*.hlsli files in this directory are copies of the shaders of CoAVolFog (coa-vfog):
++
++  fork   https://github.com/Raz0r1337/coa-vfog   (branch st0ny-main; based on https://github.com/jealous-sound/coa-vfog)
++  commit 205ade5abe54524ccd2f449fb628903bc0b66be0  (2026-10-19 13:38 UTC)
++  copy   ThirdParty/coa-vfog-205ade5/ (shaders/, src/, LICENSE, README.md; frozen, nothing in it is built or executed)
++
++Copyright belongs to the authors of CoAVolFog (jealous-sound and the contributors of the Raz0r1337 fork). CoAVolFog is
++licensed under the GNU General Public License version 3 only (GPL-3.0-only); the text is in the LICENSE file next to this
++notice. Its README adds a permission under GPLv3 section 7: CoAVolFog, including modified versions, may be linked or
++combined with the World of Warcraft client and the combination distributed without the client source code; GPLv3 keeps
++applying to CoAVolFog. Everything in this directory, and the code under Engine/Source/VolFog and Tools/VolFog derived from
++it, is distributed under the same terms.
++
++Modifications (GPLv3 section 5a), dated
++----------------------------------------
++2026-10-19  Brief B2 (World of Legends, native volumetric fog, phase 3).
++  - vf_common.hlsli, vf_integrate.hlsli, vf_local_lights.hlsli, vf_composite.hlsli, vf_sample_split.hlsli,
++    vf_march.hlsl, vf_temporal.hlsl, vf_history_depth.hlsl, vf_composite.hlsl, vf_silhouette_mask.hlsl,
++    vf_ray_mask.hlsl, vf_ray_blur.hlsl, vf_ray_composite.hlsl, vf_density_variation.hlsli:
++    copied byte for byte, unchanged. They are not compiled yet (briefs B6 and later). Planned changes, not applied
++    here: kSkyMinDepth 0.99903 -> 0.95 in vf_common.hlsli and tex3D -> 2D atlas in vf_density_variation.hlsli.
++  - vf_fullscreen_vs.hlsl: copied byte for byte and compiled as it is (vs_3_0, WolVolFogQuad.bls). It returns its POSITION
++    input untouched, so the adaptation to the client is on the CPU side: VolFog::Render draws the FFX quad
++    (FFX::SetupVB_PCT, vertex format position + colour + texcoord) with its positions already in clip space (-1..1).
++    The colour and texcoord attributes are present in the vertex buffer and ignored by the shader.
++  - WolVolFogDebug.hlsl: new file written for this project (not derived from CoAVolFog code), same licence.
++  - Build: the shaders are compiled with fxc (Windows SDK) from CMake, packed in the GXSH ".bls" container by
++    Tools/VolFog/mkbls.py and stored in bin/Win/Data/patch-Z.MPQ by Tools/VolFog/mkmpq.py.
+diff --git a/Shaders/VolFog/WolVolFogDebug.hlsl b/Shaders/VolFog/WolVolFogDebug.hlsl
+new file mode 100644
+index 0000000..d3e1225
+--- /dev/null
++++ b/Shaders/VolFog/WolVolFogDebug.hlsl
+@@ -0,0 +1,42 @@
++// Not in the original client (World of Legends): debug pixel shader of the native volumetric fog (wolVolFogDebug),
++// brief B2. Written for this project, GPL-3.0-only like the rest of Shaders/VolFog (see LICENSE and
++// NOTICE-modificaciones.txt). The register contract is the one of vf_common.hlsli (coa-vfog 205ade5).
++// Compiled by fxc as ps_3_0, one permutation per mode: /D DEBUG_MODE=1|2|3 (WolVolFogDebug.bls permutation = mode - 1).
++//   1: depth buffer linearised in grey, sky white (reads sDepth; stays black until the INTZ depth of brief B3)
++//   2: semi-transparent magenta tint over the whole world view
++//   3: test grid every 64 px (green) with a red border on the world viewport
++#ifndef DEBUG_MODE
++#error DEBUG_MODE must be 1, 2 or 3
++#endif
++
++float4 cWorldViewportPx : register(c0); // xy origin, zw size of the world viewport, in pixels
++float4 cPixelGrid : register(c1);       // zw = size of one texel of the depth texture
++float4 cDepthToViewZ : register(c3);    // x depth at infinite z, y depth per 1/z, z max distance, w deepest world depth
++sampler2D sDepth : register(s0);
++
++static const float kSkyMinDepth = 0.95;
++
++float4 main(float2 pixel : VPOS) : COLOR0
++{
++#if DEBUG_MODE == 1
++    float depth = tex2Dlod(sDepth, float4((pixel + 0.5) * cPixelGrid.zw, 0, 0)).r;
++    if (depth >= kSkyMinDepth)
++    {
++        return float4(1, 1, 1, 1);
++    }
++    float dist = min(cDepthToViewZ.y / max(depth - cDepthToViewZ.x, 1e-6), cDepthToViewZ.z);
++    float grey = sqrt(saturate(dist / cDepthToViewZ.z));
++    return float4(grey, grey, grey, 1);
++#elif DEBUG_MODE == 2
++    return float4(1, 0, 1, 0.35);
++#elif DEBUG_MODE == 3
++    float2 local = pixel - cWorldViewportPx.xy;
++    float2 cell = fmod(local, 64.0);
++    float grid = (cell.x < 1.0 || cell.y < 1.0) ? 1.0 : 0.0;
++    float border = (any(local < 2.0) || any(local > cWorldViewportPx.zw - 3.0)) ? 1.0 : 0.0;
++    float3 colour = lerp(float3(0, 1, 0), float3(1, 0, 0), border);
++    return float4(colour, saturate(grid + border) * 0.85);
++#else
++#error DEBUG_MODE must be 1, 2 or 3
++#endif
++}
+diff --git a/Shaders/VolFog/vf_common.hlsli b/Shaders/VolFog/vf_common.hlsli
+new file mode 100644
+index 0000000..7754148
+--- /dev/null
++++ b/Shaders/VolFog/vf_common.hlsli
+@@ -0,0 +1,154 @@
++float4 cWorldViewportPx : register(c0);
++float4 cPixelGrid : register(c1);
++float4 cViewToNdc : register(c2);
++float4 cDepthToViewZ : register(c3);
++row_major float4x4 cViewToWorld : register(c4);
++float4 cLowResTarget : register(c8);
++
++static const float kSkyMinDepth = 0.99903;
++
++float2 ViewportOrigin()
++{
++    return cWorldViewportPx.xy;
++}
++
++float2 ViewportSize()
++{
++    return cWorldViewportPx.zw;
++}
++
++float2 ViewportLastPixelCentre()
++{
++    return ViewportOrigin() + ViewportSize() - 0.5;
++}
++
++bool OutsideViewport(float2 pixel)
++{
++    return any(pixel < ViewportOrigin()) || any(pixel > ViewportOrigin() + ViewportSize());
++}
++
++float FullPixelsPerLowResTexel()
++{
++    return cPixelGrid.x;
++}
++
++float FrameIndex()
++{
++    return cPixelGrid.y;
++}
++
++float2 DepthTexelSize()
++{
++    return cPixelGrid.zw;
++}
++
++float2 ViewToNdcScale()
++{
++    return cViewToNdc.xy;
++}
++
++float2 ViewToNdcOffset()
++{
++    return cViewToNdc.zw;
++}
++
++float DepthAtInfiniteViewZ()
++{
++    return cDepthToViewZ.x;
++}
++
++float DepthPerInverseViewZ()
++{
++    return cDepthToViewZ.y;
++}
++
++float MaxFogDistance()
++{
++    return cDepthToViewZ.z;
++}
++
++float DeepestWorldDepth()
++{
++    return cDepthToViewZ.w;
++}
++
++float3 CameraPositionWorld()
++{
++    return cViewToWorld[3].xyz;
++}
++
++float3 ViewToWorldDirection(float3 viewDirection)
++{
++    return mul(viewDirection, (float3x3)cViewToWorld);
++}
++
++float2 LowResSize()
++{
++    return cLowResTarget.xy;
++}
++
++float2 LowResTexelSize()
++{
++    return cLowResTarget.zw;
++}
++
++float SampleDepth(sampler2D depthSampler, float2 pixel)
++{
++    return tex2Dlod(depthSampler, float4(pixel * DepthTexelSize(), 0, 0)).r;
++}
++
++bool BeyondFarClip(float depth)
++{
++    return depth > DeepestWorldDepth();
++}
++
++bool IsSky(float depth)
++{
++    return depth >= max(DeepestWorldDepth(), kSkyMinDepth);
++}
++
++float LinearDepth(float depth)
++{
++    return BeyondFarClip(depth) ? MaxFogDistance()
++                                : min(DepthPerInverseViewZ() / (depth - DepthAtInfiniteViewZ()), MaxFogDistance());
++}
++
++float2 LowResTexelToFullPixel(float2 lowResTexel)
++{
++    float2 pixel = ViewportOrigin() + lowResTexel * FullPixelsPerLowResTexel() +
++                   floor(FullPixelsPerLowResTexel() * 0.5) + 0.5;
++    return min(pixel, ViewportLastPixelCentre());
++}
++
++float2 FullPixelToLowResTexel(float2 pixel)
++{
++    return (pixel - ViewportOrigin() - floor(FullPixelsPerLowResTexel() * 0.5) - 0.5) / FullPixelsPerLowResTexel();
++}
++
++float2 LowResTexelToUv(float2 lowResTexel)
++{
++    return (lowResTexel + 0.5) * LowResTexelSize();
++}
++
++float2 PixelToNdc(float2 pixel)
++{
++    return float2((pixel.x - ViewportOrigin().x) / ViewportSize().x * 2 - 1,
++                  1 - (pixel.y - ViewportOrigin().y) / ViewportSize().y * 2);
++}
++
++float2 NdcToPixel(float2 ndc)
++{
++    return ViewportOrigin() + float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * ViewportSize();
++}
++
++float3 ViewRayAtUnitDepth(float2 pixel)
++{
++    float2 ndc = PixelToNdc(pixel);
++    return float3((ndc.x - ViewToNdcOffset().x) / ViewToNdcScale().x,
++                  (ndc.y - ViewToNdcOffset().y) / ViewToNdcScale().y, 1);
++}
++
++float InterleavedGradientNoise(float2 pixel)
++{
++    return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
++}
+diff --git a/Shaders/VolFog/vf_composite.hlsl b/Shaders/VolFog/vf_composite.hlsl
+new file mode 100644
+index 0000000..66b1b1a
+--- /dev/null
++++ b/Shaders/VolFog/vf_composite.hlsl
+@@ -0,0 +1,7 @@
++#include "vf_composite.hlsli"
++
++float4 main(float2 pixelIndex : VPOS) : COLOR0
++{
++    float2 pixel = pixelIndex + 0.5;
++    return CompositeAtDepth(pixel, SampleDepth(sDepth, pixel));
++}
+diff --git a/Shaders/VolFog/vf_composite.hlsli b/Shaders/VolFog/vf_composite.hlsli
+new file mode 100644
+index 0000000..c40390a
+--- /dev/null
++++ b/Shaders/VolFog/vf_composite.hlsli
+@@ -0,0 +1,349 @@
++#include "vf_integrate.hlsli"
++
++float4 cComposite : register(c96);
++float4 cGodRayColour : register(c97);
++float4 cSun : register(c98);
++
++sampler2D sFog : register(s1);
++sampler2D sGodRays : register(s2);
++sampler2D sSceneBeforeFog : register(s3);
++sampler2D sCurrentMarch : register(s4);
++
++static const float kHighlightKnee = 0.8;
++static const float kSunMarkerRadius = 6;
++static const float4 kSunMarkerColour = float4(1, 0, 0, 1);
++static const float kDebugRadiance = 1;
++static const float kDebugTransmittance = 2;
++static const float kDebugLinearDepth = 3;
++static const float kSameSurfaceAbsoluteDepth = 0.5;
++static const float kSameSurfaceRelativeDepth = 0.02;
++static const float kTapPlaneRelativeDepth = 0.005;
++static const float kWholeBilinearWeight = 0.999;
++static const float kMaxDisplayedMarchCurvature = 2.0 / 255;
++
++float Exposure()
++{
++    return cComposite.x;
++}
++
++float GodRayStrength()
++{
++    return cComposite.y;
++}
++
++float DebugView()
++{
++    return cComposite.z;
++}
++
++bool DebugViewEnabled()
++{
++    return DebugView() > 0.5;
++}
++
++bool DebugViewAtMost(float view)
++{
++    return DebugView() < view + 0.5;
++}
++
++float BlendMode()
++{
++    return cComposite.w;
++}
++
++bool BlendsInLinearLight()
++{
++    return BlendMode() > 0.5 && BlendMode() < 2.5;
++}
++
++bool BlendsOverSceneCopy()
++{
++    return (BlendMode() > 0.5 && BlendMode() < 1.5) || BlendMode() > 2.5;
++}
++
++float2 SunPixel()
++{
++    return cSun.xy;
++}
++
++bool SunMarkerEnabled()
++{
++    return cSun.z > 0;
++}
++
++float ClientGlowToCompensate()
++{
++    return cSun.w;
++}
++
++float3 GammaToLinear(float3 colour)
++{
++    return pow(colour, 2.2);
++}
++
++float3 LinearToGamma(float3 colour)
++{
++    return pow(colour, 1 / 2.2);
++}
++
++float3 RollOffHighlights(float3 colour, float3 knee)
++{
++    float3 span = max(1 - knee, 1e-4);
++    return colour <= knee ? colour : knee + span * (1 - exp(-(colour - knee) / span));
++}
++
++float3 BeforeClientGlow(float3 onScreen, float glow)
++{
++    return 2 * onScreen / (1 + sqrt(1 + 4 * glow * onScreen));
++}
++
++bool SameDepthClass(float depth, float tapDepth)
++{
++    return IsSky(depth) == IsSky(tapDepth) && BeyondFarClip(depth) == BeyondFarClip(tapDepth);
++}
++
++struct BilinearTaps
++{
++    float2 baseTexel;
++    float2 fraction;
++    float4 currentMarch;
++    float depth;
++    float sameClassWeight;
++    float farthestViewZ;
++};
++
++BilinearTaps GatherBilinearTaps(float2 pixel, float depth, float viewZ)
++{
++    float2 lowResCoord = FullPixelToLowResTexel(pixel);
++    BilinearTaps taps;
++    taps.baseTexel = floor(lowResCoord);
++    taps.fraction = lowResCoord - taps.baseTexel;
++    taps.currentMarch = 0;
++    taps.depth = 0;
++    taps.sameClassWeight = 0;
++    taps.farthestViewZ = viewZ;
++    [loop] for (int j = 0; j < 4; j++)
++    {
++        float2 tapOffset = float2(frac(j * 0.5) * 2, floor(j * 0.5));
++        float2 tapTexel = clamp(taps.baseTexel + tapOffset, 0, LowResSize() - 1);
++        float tapDepth = SampleDepth(sDepth, LowResTexelToFullPixel(tapTexel));
++        float2 bilinearWeight = lerp(1 - taps.fraction, taps.fraction, tapOffset);
++        float weight = bilinearWeight.x * bilinearWeight.y;
++        taps.currentMarch += tex2Dlod(sCurrentMarch, float4(LowResTexelToUv(tapTexel), 0, 0)) * weight;
++        taps.depth += tapDepth * weight;
++        taps.sameClassWeight += SameDepthClass(depth, tapDepth) ? weight : 0;
++        taps.farthestViewZ = max(taps.farthestViewZ, weight > 0 ? LinearDepth(tapDepth) : viewZ);
++    }
++    return taps;
++}
++
++bool PixelOnTapPlane(BilinearTaps taps, float viewZ)
++{
++    return taps.sameClassWeight > kWholeBilinearWeight && taps.farthestViewZ < HorizonBlendStart() &&
++           abs(LinearDepth(taps.depth) - viewZ) <= viewZ * kTapPlaneRelativeDepth;
++}
++
++bool RayMeetsLocalLight(float2 pixel, float viewZ)
++{
++    float3 viewRay = ViewRayAtUnitDepth(pixel);
++    float distancePerViewZ = length(viewRay);
++    float3 viewDirection = viewRay / distancePerViewZ;
++    float rayLength = viewZ * distancePerViewZ;
++    bool meets = false;
++    [loop] for (int index = 0; index < LocalLightCount(); ++index)
++    {
++        float2 chord = LoadLocalLight(index, viewDirection).chord;
++        meets = meets || (chord.y > 0 && chord.x < rayLength);
++    }
++    return meets;
++}
++
++float4 DisplayedCurrentMarch(float2 lowResTexel)
++{
++    float2 uv = LowResTexelToUv(clamp(lowResTexel, 0, LowResSize() - 1));
++    float4 fog = tex2Dlod(sCurrentMarch, float4(uv, 0, 0));
++    fog.rgb *= Exposure();
++    fog.rgb = BlendsInLinearLight() ? sqrt(max(fog.rgb, 0)) : fog.rgb;
++    return fog;
++}
++
++float4 DisplayedMarchCurvature(float2 firstTexel, float2 axis)
++{
++    float4 before = DisplayedCurrentMarch(firstTexel - axis);
++    float4 first = DisplayedCurrentMarch(firstTexel);
++    float4 second = DisplayedCurrentMarch(firstTexel + axis);
++    float4 after = DisplayedCurrentMarch(firstTexel + 2 * axis);
++    return max(abs(before - 2 * first + second), abs(first - 2 * second + after));
++}
++
++bool MarchLinearBetweenTaps(BilinearTaps taps)
++{
++    float4 curvature = 0;
++    [loop] for (int k = 0; k < 4; k++)
++    {
++        float2 axis = k < 2 ? float2(0, 1) : float2(1, 0);
++        float2 across = 1 - axis;
++        bool secondLine = k == 1 || k == 3;
++        bool interpolated = dot(taps.fraction, axis) > 0 && (!secondLine || dot(taps.fraction, across) > 0);
++        float2 firstTexel = taps.baseTexel + (secondLine ? across : float2(0, 0));
++        [branch] if (interpolated)
++            curvature = max(curvature, DisplayedMarchCurvature(firstTexel, axis));
++    }
++    return max(max(curvature.r, curvature.g), max(curvature.b, curvature.a)) <= kMaxDisplayedMarchCurvature;
++}
++
++bool TapsReproduceMarch(BilinearTaps taps, float viewZ)
++{
++    [branch] if (!PixelOnTapPlane(taps, viewZ))
++        return false;
++    return MarchLinearBetweenTaps(taps);
++}
++
++bool FullResolutionMarchTakesNoiseAtItsMean()
++{
++    return kMarchesLocalLights && !kSamplesAuthoredNoise && AnyLayerNoise();
++}
++
++bool LightOnRayNeedsFullResolution(float2 pixel, float viewZ)
++{
++    [branch] if (!kMarchesLocalLights || FullResolutionMarchTakesNoiseAtItsMean())
++        return false;
++    return RayMeetsLocalLight(pixel, viewZ);
++}
++
++float4 FilteredFogBetweenTaps(BilinearTaps taps)
++{
++    float4 fog = 0;
++    [loop] for (int j = 0; j < 4; j++)
++    {
++        float2 tapOffset = float2(frac(j * 0.5) * 2, floor(j * 0.5));
++        float2 tapTexel = clamp(taps.baseTexel + tapOffset, 0, LowResSize() - 1);
++        float2 bilinearWeight = lerp(1 - taps.fraction, taps.fraction, tapOffset);
++        fog += tex2Dlod(sFog, float4(LowResTexelToUv(tapTexel), 0, 0)) * bilinearWeight.x * bilinearWeight.y;
++    }
++    return fog;
++}
++
++float4 FogWithoutMatchingTap(float2 pixel, float depth, float viewZ)
++{
++    [branch] if (!LightOnRayNeedsFullResolution(pixel, viewZ))
++    {
++        BilinearTaps taps = GatherBilinearTaps(pixel, depth, viewZ);
++        [branch] if (FullResolutionMarchTakesNoiseAtItsMean())
++        {
++            [branch] if (PixelOnTapPlane(taps, viewZ))
++                return FilteredFogBetweenTaps(taps);
++        }
++        else
++        {
++            [branch] if (TapsReproduceMarch(taps, viewZ))
++                return taps.currentMarch;
++        }
++    }
++    return IntegrateFogAtDepth(pixel, depth, 0.5);
++}
++
++float4 DepthAwareUpsample(float2 pixel, float depth, float viewZ)
++{
++    float2 lowResCoord = FullPixelToLowResTexel(pixel);
++    float2 baseTexel = floor(lowResCoord);
++    float2 bilinearFraction = lowResCoord - baseTexel;
++
++    float4 weightedFog = 0;
++    float weightSum = 0;
++    [loop] for (int j = 0; j < 4; j++)
++    {
++        float2 tapOffset = float2(frac(j * 0.5) * 2, floor(j * 0.5));
++        float2 tapTexel = clamp(baseTexel + tapOffset, 0, LowResSize() - 1);
++        float tapDepth = SampleDepth(sDepth, LowResTexelToFullPixel(tapTexel));
++        float tapViewZ = LinearDepth(tapDepth);
++        float2 bilinearWeight = lerp(1 - bilinearFraction, bilinearFraction, tapOffset);
++        bool sameClass = SameDepthClass(depth, tapDepth);
++        bool sameDepth = abs(tapViewZ - viewZ) <= max(kSameSurfaceAbsoluteDepth, viewZ * kSameSurfaceRelativeDepth);
++        float relativeDepthDifference = abs(tapViewZ - viewZ) / max(viewZ, 1e-3);
++        float weight = sameClass && sameDepth ?
++            bilinearWeight.x * bilinearWeight.y / (1e-3 + relativeDepthDifference) : 0;
++        weightedFog += tex2Dlod(sFog, float4(LowResTexelToUv(tapTexel), 0, 0)) * weight;
++        weightSum += weight;
++    }
++    [branch] if (weightSum > 1e-6)
++        return weightedFog / weightSum;
++    return FogWithoutMatchingTap(pixel, depth, viewZ);
++}
++
++float3 DisplaySpaceGodRays(float2 viewportUv)
++{
++    float3 godRays = 0;
++    [branch] if (GodRayStrength() > 0)
++        godRays = tex2Dlod(sGodRays, float4(viewportUv, 0, 0)).rgb * cGodRayColour.rgb * GodRayStrength();
++    return godRays;
++}
++
++float3 BlendGodRays(float3 colour, float3 godRays)
++{
++    [branch] if (GodRayStrength() > 0)
++    {
++        float glow = ClientGlowToCompensate();
++        float3 displayed = colour * (1 + glow * colour);
++        displayed += max(1 - displayed, 0) * (1 - exp(-max(godRays, 0)));
++        colour = BeforeClientGlow(displayed, glow);
++    }
++    return colour;
++}
++
++float3 FogSceneColour(float3 scene, float4 fog)
++{
++    [branch] if (!BlendsInLinearLight())
++    {
++        float3 fogColour = RollOffHighlights(fog.rgb / max(fog.a, 1e-4), kHighlightKnee);
++        float3 colour = scene * (1 - fog.a) + fogColour * fog.a;
++        return colour;
++    }
++    scene = GammaToLinear(scene);
++    float3 colour = LinearToGamma(RollOffHighlights(scene * (1 - fog.a) + fog.rgb, max(kHighlightKnee, scene)));
++    [branch] if (ClientGlowToCompensate() > 0)
++        colour = lerp(colour, BeforeClientGlow(colour, ClientGlowToCompensate()), fog.a);
++    return colour;
++}
++
++float4 BlendOverSceneCopy(float2 viewportUv, float4 fog, float3 godRays)
++{
++    float3 scene = tex2Dlod(sSceneBeforeFog, float4(viewportUv, 0, 0)).rgb;
++    return float4(BlendGodRays(FogSceneColour(scene, fog), godRays), 1);
++}
++
++float4 PremultipliedForFixedFunctionBlend(float4 fog, float3 godRays, bool linearLight)
++{
++    float opacity = max(fog.a, 1e-4);
++    float3 unpremultiplied = RollOffHighlights(fog.rgb / opacity, kHighlightKnee);
++    if (linearLight)
++        unpremultiplied = LinearToGamma(unpremultiplied);
++    return float4(unpremultiplied * fog.a + godRays, fog.a);
++}
++
++float4 CompositeAtDepth(float2 pixel, float depth)
++{
++    float viewZ = LinearDepth(depth);
++    float4 fog = DepthAwareUpsample(pixel, depth, viewZ);
++    fog.rgb *= Exposure();
++
++    float2 viewportUv = (pixel - ViewportOrigin()) / ViewportSize();
++    float3 godRays = DisplaySpaceGodRays(viewportUv);
++    const bool linearLight = BlendsInLinearLight();
++
++    [branch] if (DebugViewEnabled())
++    {
++        if (DebugViewAtMost(kDebugRadiance))
++            return float4((linearLight ? LinearToGamma(saturate(fog.rgb)) : fog.rgb) + godRays, 1);
++        if (DebugViewAtMost(kDebugTransmittance))
++            return float4(1 - fog.aaa, 1);
++        if (DebugViewAtMost(kDebugLinearDepth))
++            return float4(saturate(viewZ / MaxFogDistance()).xxx, 1);
++    }
++    [branch] if (SunMarkerEnabled() && distance(pixel, SunPixel()) < kSunMarkerRadius)
++        return kSunMarkerColour;
++
++    [branch] if (BlendsOverSceneCopy())
++        return BlendOverSceneCopy(viewportUv, fog, godRays);
++    return PremultipliedForFixedFunctionBlend(fog, godRays, linearLight);
++}
+diff --git a/Shaders/VolFog/vf_density_variation.hlsli b/Shaders/VolFog/vf_density_variation.hlsli
+new file mode 100644
+index 0000000..623c4de
+--- /dev/null
++++ b/Shaders/VolFog/vf_density_variation.hlsli
+@@ -0,0 +1,13 @@
++float4 cDensityVariation : register(c78);
++sampler3D sDensityNoise : register(s9);
++
++float DensityVariation(float3 worldPosition)
++{
++    [branch] if (cDensityVariation.x <= 0)
++        return 1;
++    float3 uv = (worldPosition - float3(cDensityVariation.zw, 0)) * (cDensityVariation.y / 32) + 0.5 / 32;
++    float noise = tex3Dlod(sDensityNoise, float4(uv, 0)).r * (4.0 / 3.0);
++    uv = uv * 2 + float3(36.5, 16.5, 52.5) / 32;
++    float centered = noise + tex3Dlod(sDensityNoise, float4(uv, 0)).r * (2.0 / 3.0) - 1;
++    return 1 + saturate(cDensityVariation.x) * centered;
++}
+diff --git a/Shaders/VolFog/vf_fullscreen_vs.hlsl b/Shaders/VolFog/vf_fullscreen_vs.hlsl
+new file mode 100644
+index 0000000..0448257
+--- /dev/null
++++ b/Shaders/VolFog/vf_fullscreen_vs.hlsl
+@@ -0,0 +1,4 @@
++float4 main(float4 pos : POSITION) : POSITION
++{
++    return pos;
++}
+diff --git a/Shaders/VolFog/vf_history_depth.hlsl b/Shaders/VolFog/vf_history_depth.hlsl
+new file mode 100644
+index 0000000..46d9a94
+--- /dev/null
++++ b/Shaders/VolFog/vf_history_depth.hlsl
+@@ -0,0 +1,13 @@
++#include "vf_common.hlsli"
++
++sampler2D sDepth : register(s0);
++
++float4 main(float2 lowResTexel : VPOS) : COLOR0
++{
++    float depth = SampleDepth(sDepth, LowResTexelToFullPixel(lowResTexel));
++    float packed = floor(saturate(LinearDepth(depth) / MaxFogDistance()) * 65535 + 0.5);
++    float highByte = floor(packed / 256);
++    float lowByte = packed - highByte * 256;
++    float depthClass = IsSky(depth) ? 1 : (BeyondFarClip(depth) ? 0.5 : 0);
++    return float4(highByte / 255, lowByte / 255, depthClass, 1);
++}
+diff --git a/Shaders/VolFog/vf_integrate.hlsli b/Shaders/VolFog/vf_integrate.hlsli
+new file mode 100644
+index 0000000..0f1f3b0
+--- /dev/null
++++ b/Shaders/VolFog/vf_integrate.hlsli
+@@ -0,0 +1,330 @@
++#include "vf_common.hlsli"
++#include "vf_density_variation.hlsli"
++#include "vf_authored_noise.hlsli"
++
++#ifndef STEPS
++#define STEPS 24
++#endif
++
++#ifndef LOCAL_LIGHTS
++#define LOCAL_LIGHTS 1
++#endif
++
++static const int kFogLayers = 4;
++static const int kRegistersPerLayer = 6;
++static const float kGoldenRatioFraction = 0.618034;
++static const bool kMarchesLocalLights = LOCAL_LIGHTS;
++static const bool kUnrollsLayers = !kMarchesLocalLights;
++
++float4 cLight : register(c9);
++float4 cMarch : register(c11);
++float4 cLayers[kFogLayers * kRegistersPerLayer] : register(c12);
++
++sampler2D sDepth : register(s0);
++
++struct FogLayer
++{
++    float start;
++    float density;
++    float g;
++    float isotropic;
++    float3 emissive;
++    float strength;
++    float3 diffuse;
++    float exponent;
++    float upperHeight;
++    float upperFalloff;
++    float lowerHeight;
++    float lowerFalloff;
++    float3 shadowEmissive;
++    float shadowDensity;
++    float shadowed;
++    float skyFalloff;
++    float limit;
++    float densityVariation;
++};
++
++FogLayer LoadConstantFogLayer(int index)
++{
++    int first = index * kRegistersPerLayer;
++    FogLayer layer;
++    layer.start = cLayers[first].x;
++    layer.density = cLayers[first].y;
++    layer.g = cLayers[first].z;
++    layer.isotropic = cLayers[first].w;
++    layer.emissive = cLayers[first + 1].rgb;
++    layer.strength = cLayers[first + 1].w;
++    layer.diffuse = cLayers[first + 2].rgb;
++    layer.exponent = cLayers[first + 2].w;
++    layer.upperHeight = cLayers[first + 3].x;
++    layer.upperFalloff = cLayers[first + 3].y;
++    layer.lowerHeight = cLayers[first + 3].z;
++    layer.lowerFalloff = cLayers[first + 3].w;
++    layer.shadowEmissive = cLayers[first + 4].rgb;
++    layer.shadowDensity = cLayers[first + 4].w;
++    layer.shadowed = cLayers[first + 5].x;
++    layer.skyFalloff = cLayers[first + 5].y;
++    layer.limit = cLayers[first + 5].z;
++    layer.densityVariation = cLayers[first + 5].w;
++    return layer;
++}
++
++FogLayer LoadFogLayer(int index)
++{
++    [branch] if (index == 0)
++        return LoadConstantFogLayer(0);
++    [branch] if (index == 1)
++        return LoadConstantFogLayer(1);
++    [branch] if (index == 2)
++        return LoadConstantFogLayer(2);
++    return LoadConstantFogLayer(3);
++}
++
++float3 DirectionToLightView()
++{
++    return cLight.xyz;
++}
++
++float LightAboveHorizon()
++{
++    return cLight.w;
++}
++
++bool JitterEnabled()
++{
++    return cMarch.x > 0;
++}
++
++float DistanceCurveRange()
++{
++    return cMarch.y;
++}
++
++float HorizonBlendStart()
++{
++    return cMarch.z;
++}
++
++float FarClip()
++{
++    return cMarch.w;
++}
++
++float PhaseHG(float g, float cosAngle)
++{
++    float r = (1 - g) / sqrt(max(1 + g * g - 2 * g * cosAngle, 1e-6));
++    return r * r * r;
++}
++
++float DistanceCurve(FogLayer layer, float sampleDistance)
++{
++    return 1 + layer.strength * pow(saturate(max(sampleDistance - layer.start, 0) / DistanceCurveRange()) + 1e-6,
++                                    layer.exponent);
++}
++
++float HeightProfile(FogLayer layer, float height)
++{
++    return saturate(exp((layer.upperHeight - height) * layer.upperFalloff)) *
++           saturate(exp((height - layer.lowerHeight) * layer.lowerFalloff));
++}
++
++float HorizonShadow(FogLayer layer)
++{
++    return layer.shadowed * (1 - LightAboveHorizon());
++}
++
++float ShadowDensityScale(FogLayer layer)
++{
++    return lerp(1, layer.shadowDensity, HorizonShadow(layer));
++}
++
++float SkyDensityScale(FogLayer layer, float skyMask, float upward)
++{
++    return skyMask > 0 ? exp(-upward * layer.skyFalloff) : 1;
++}
++
++float LayerPhase(FogLayer layer, float cosAngle)
++{
++    return lerp(PhaseHG(layer.g, cosAngle), 1, layer.isotropic);
++}
++
++struct MarchRay
++{
++    float3 viewDirection;
++    float3 directionWorld;
++    float cameraHeight;
++    float heightPerYard;
++};
++
++float DensityVariationAlongRay(MarchRay ray, float distanceAlongRay)
++{
++    return DensityVariation(CameraPositionWorld() + ray.directionWorld * distanceAlongRay);
++}
++
++float WeightedVariation(float variation, float weight)
++{
++    return kSamplesAuthoredNoise ? lerp(1, variation, weight) : variation;
++}
++
++float DensityProfile(FogLayer layer, MarchRay ray, float distanceAlongRay, float variation)
++{
++    float density = DistanceCurve(layer, distanceAlongRay) *
++                    HeightProfile(layer, ray.cameraHeight + ray.heightPerYard * distanceAlongRay);
++    return layer.densityVariation > 0 ? density * WeightedVariation(variation, layer.densityVariation) : density;
++}
++
++#include "vf_local_lights.hlsli"
++
++struct StepVariation
++{
++    float distance;
++    float variation;
++};
++
++StepVariation StepVariationAt(MarchRay ray, float stepStart, float stepEnd, float jitter)
++{
++    StepVariation step;
++    step.distance = stepStart + (stepEnd - stepStart) * jitter;
++    step.variation = DensityVariationAlongRay(ray, step.distance);
++    return step;
++}
++
++float LayerVariation(StepVariation step, MarchRay ray, float sampleDistance)
++{
++    [branch] if (kUnrollsLayers && sampleDistance == step.distance)
++        return step.variation;
++    return DensityVariationAlongRay(ray, sampleDistance);
++}
++
++void AccumulateLayer(FogLayer layer, int layerIndex, float noiseDensity, float cosToLight, float skyDensityScale,
++                     float stepStart, float stepEnd, float jitter, MarchRay ray, StepVariation stepVariation,
++                     inout float3 radiance, inout float opticalDepth)
++{
++    float layerStart = max(stepStart, layer.start);
++    float layerLength = max(min(stepEnd, layer.limit) - layerStart, 0);
++    [branch] if (layerLength <= 0 || layer.density <= 0)
++        return;
++    float shadow = HorizonShadow(layer);
++    float shadowDensityScale = ShadowDensityScale(layer);
++    float sampleDistance = layerStart + layerLength * jitter;
++    float sampleHeight = ray.cameraHeight + ray.heightPerYard * sampleDistance;
++    float distanceCurve = DistanceCurve(layer, sampleDistance);
++    float heightProfile = HeightProfile(layer, sampleHeight);
++    float variation = 1;
++    [branch] if (layer.densityVariation > 0 && cDensityVariation.x > 0)
++        variation = WeightedVariation(LayerVariation(stepVariation, ray, sampleDistance), layer.densityVariation);
++    float directLight = 1 - shadow;
++    float layerOpticalDepth = layer.density * skyDensityScale * layerLength * distanceCurve * heightProfile *
++                              shadowDensityScale * variation * noiseDensity;
++    float3 emissive = lerp(layer.emissive, layer.shadowEmissive, shadow);
++    [flatten] if (kSamplesAuthoredNoise && layerIndex < kNoisyLayers)
++        emissive = lerp(emissive, LayerNoiseFade(layerIndex), 1 - noiseDensity);
++    float phase = LayerPhase(layer, cosToLight);
++    radiance += (layer.diffuse * (directLight * phase) + emissive) * layerOpticalDepth;
++    opticalDepth += layerOpticalDepth;
++}
++
++float3 StepSamplePosition(MarchRay ray, float stepStart, float stepEnd, float jitter)
++{
++    return CameraPositionWorld() + ray.directionWorld * (stepStart + (stepEnd - stepStart) * jitter);
++}
++
++void AccumulateLayers(float4 noiseDensities, float cosToLight, float skyMask, float upward, float stepStart,
++                      float stepEnd, float jitter, MarchRay ray, inout float3 radiance, inout float opticalDepth)
++{
++    StepVariation stepVariation = StepVariationAt(ray, stepStart, stepEnd, jitter);
++    [branch] if (kUnrollsLayers)
++    {
++        [unroll] for (int j = 0; j < kFogLayers; j++)
++        {
++            FogLayer layer = LoadConstantFogLayer(j);
++            AccumulateLayer(layer, j, noiseDensities[j], cosToLight, SkyDensityScale(layer, skyMask, upward),
++                            stepStart, stepEnd, jitter, ray, stepVariation, radiance, opticalDepth);
++        }
++    }
++    else
++    {
++        [loop] for (int j = 0; j < kFogLayers; j++)
++        {
++            FogLayer layer = LoadFogLayer(j);
++            float noiseDensity = kSamplesAuthoredNoise ? dot(noiseDensities, j == int4(0, 1, 2, 3) ? 1 : 0) : 1;
++            AccumulateLayer(layer, j, noiseDensity, cosToLight, SkyDensityScale(layer, skyMask, upward), stepStart,
++                            stepEnd, jitter, ray, stepVariation, radiance, opticalDepth);
++        }
++    }
++}
++
++float LayerMarchEnd(FogLayer layer)
++{
++    return layer.density > 0 ? layer.limit : 0;
++}
++
++float LayersMarchEnd()
++{
++    return max(max(LayerMarchEnd(LoadConstantFogLayer(0)), LayerMarchEnd(LoadConstantFogLayer(1))),
++               max(LayerMarchEnd(LoadConstantFogLayer(2)), LayerMarchEnd(LoadConstantFogLayer(3))));
++}
++
++float StepJitter(float2 lowResTexel)
++{
++    return JitterEnabled() ? frac(InterleavedGradientNoise(lowResTexel) + FrameIndex() * kGoldenRatioFraction) : 0.5;
++}
++
++float4 IntegrateFogAtDepth(float2 pixel, float depth, float jitter)
++{
++    float3 viewRay = ViewRayAtUnitDepth(pixel);
++    float distancePerViewZ = length(viewRay);
++    float3 viewDirection = viewRay / distancePerViewZ;
++    float skyMask = IsSky(depth) ? 1 : 0;
++    float viewZ = LinearDepth(depth);
++    float horizonBlend = max(BeyondFarClip(depth) ? 1 : 0, smoothstep(HorizonBlendStart(), FarClip(), viewZ));
++    viewZ = lerp(viewZ, MaxFogDistance(), horizonBlend);
++    float marchLength = min(viewZ * distancePerViewZ, MaxFogDistance());
++
++    float3 cameraWorld = CameraPositionWorld();
++    float3 directionWorld = ViewToWorldDirection(viewDirection);
++    float cosToLight = dot(DirectionToLightView(), viewDirection);
++    float upward = max(directionWorld.z, 0);
++    float riseLevelledAtHorizon = lerp(directionWorld.z, upward, horizonBlend);
++    MarchRay ray = {viewDirection, directionWorld, cameraWorld.z, riseLevelledAtHorizon};
++    ChordCoverage lightCoverage = {0, false, 0, LocalLightCount()};
++    float4 lightDensityScales = LayerLightDensityScales(skyMask, upward);
++
++    float layersEnd = LayersMarchEnd();
++    float3 inScatteredRadiance = 0;
++    float transmittance = 1;
++    const float stepFraction = 1.0 / STEPS;
++    [loop] for (int s = 0; s < STEPS; s++)
++    {
++        float startFraction = s * stepFraction;
++        float endFraction = startFraction + stepFraction;
++        float stepStart = marchLength * startFraction * startFraction;
++        [branch] if (kUnrollsLayers && stepStart >= layersEnd)
++            break;
++        float stepEnd = marchLength * endFraction * endFraction;
++        float3 stepRadiance = 0;
++        float stepOpticalDepth = 0;
++        float4 noiseDensities = LayerNoiseDensities(StepSamplePosition(ray, stepStart, stepEnd, jitter));
++        AccumulateLayers(noiseDensities, cosToLight, skyMask, upward, stepStart, stepEnd, jitter, ray, stepRadiance,
++                         stepOpticalDepth);
++        [branch] if (kMarchesLocalLights && lightCoverage.nextEndpoint <= stepStart)
++            lightCoverage = ChordCoverageFrom(lightCoverage, viewDirection, stepStart, marchLength);
++        [branch] if (kMarchesLocalLights && StepMeetsLocalLights(lightCoverage, stepEnd))
++            stepRadiance += LocalLightScattering(lightCoverage, lightDensityScales, ray, stepStart, stepEnd,
++                                                 noiseDensities);
++        [branch] if (stepOpticalDepth > 0)
++        {
++            float stepOpacity = stepOpticalDepth < 1e-3
++                ? stepOpticalDepth * (1 - 0.5 * stepOpticalDepth + stepOpticalDepth * stepOpticalDepth / 6)
++                : 1 - exp(-stepOpticalDepth);
++            inScatteredRadiance += transmittance * stepRadiance * (stepOpacity / stepOpticalDepth);
++            transmittance *= 1 - stepOpacity;
++        }
++    }
++    return float4(clamp(inScatteredRadiance, 0, 65504), 1 - transmittance);
++}
++
++float4 IntegrateFogAtPixel(float2 pixel, float jitter)
++{
++    return IntegrateFogAtDepth(pixel, SampleDepth(sDepth, pixel), jitter);
++}
+diff --git a/Shaders/VolFog/vf_local_lights.hlsli b/Shaders/VolFog/vf_local_lights.hlsli
+new file mode 100644
+index 0000000..f914d57
+--- /dev/null
++++ b/Shaders/VolFog/vf_local_lights.hlsli
+@@ -0,0 +1,300 @@
++float4 cLocalLightControl : register(c53);
++sampler2D sLocalLights : register(s8);
++
++static const float kFirstQuadratureFraction = 0.2113248654;
++static const float kQuadratureFractionSpacing = 0.5773502692;
++static const float kBeyondEveryLight = 1e30;
++
++struct ChordCoverage
++{
++    float nextEndpoint;
++    bool covered;
++    float firstLight;
++    float lightEnd;
++};
++
++struct LocalLight
++{
++    float3 position;
++    float radius;
++    float projected;
++    float2 chord;
++};
++
++float LocalLightCount()
++{
++    return cLocalLightControl.x;
++}
++
++float LocalLightReachLimit()
++{
++    return cLocalLightControl.y;
++}
++
++float LocalLightPhaseG()
++{
++    return cLocalLightControl.z;
++}
++
++float4 LocalLightParameter(int index)
++{
++    float texel = (index + 0.5) / 32.0;
++    return tex2Dlod(sLocalLights, float4(texel, texel, texel, -texel));
++}
++
++float3 LocalLightColour(int light)
++{
++    return LocalLightParameter(light * 3 + 1).rgb;
++}
++
++float3 LocalLightAttenuation(int light)
++{
++    return LocalLightParameter(light * 3 + 2).xyz;
++}
++
++LocalLight LoadLocalLight(int index, float3 viewDirection)
++{
++    float4 positionRadius = LocalLightParameter(index * 3);
++    LocalLight light;
++    light.position = positionRadius.xyz;
++    light.radius = positionRadius.w;
++    light.projected = dot(light.position, viewDirection);
++    float perpendicularSquared = max(dot(light.position, light.position) - light.projected * light.projected, 0);
++    float discriminant = light.radius * light.radius - perpendicularSquared;
++    float halfChord = sqrt(max(discriminant, 0));
++    light.chord = discriminant > 0 ? float2(light.projected - halfChord, light.projected + halfChord)
++                                   : float2(kBeyondEveryLight, -kBeyondEveryLight);
++    return light;
++}
++
++float QuadratureFraction(int sample)
++{
++    return kFirstQuadratureFraction + sample * kQuadratureFractionSpacing;
++}
++
++ChordCoverage ChordCoverageFrom(ChordCoverage previous, float3 viewDirection, float distanceAlongRay,
++                                float marchLength)
++{
++    ChordCoverage coverage;
++    coverage.nextEndpoint = kBeyondEveryLight;
++    coverage.covered = false;
++    coverage.firstLight = previous.lightEnd;
++    coverage.lightEnd = previous.firstLight;
++    [loop] for (int index = previous.firstLight; index < previous.lightEnd; ++index)
++    {
++        float2 chord = LoadLocalLight(index, viewDirection).chord;
++        float endpoint = chord.x > distanceAlongRay ? chord.x : chord.y;
++        coverage.nextEndpoint = endpoint > distanceAlongRay ? min(coverage.nextEndpoint, endpoint)
++                                                            : coverage.nextEndpoint;
++        coverage.covered = coverage.covered || (chord.x <= distanceAlongRay && chord.y > distanceAlongRay);
++        [flatten] if (chord.y > distanceAlongRay && chord.x < marchLength)
++        {
++            coverage.firstLight = min(coverage.firstLight, index);
++            coverage.lightEnd = index + 1;
++        }
++    }
++    return coverage;
++}
++
++bool StepMeetsLocalLights(ChordCoverage coverage, float stepEnd)
++{
++    return coverage.covered || coverage.nextEndpoint < stepEnd;
++}
++
++float LayerLightDensityScale(FogLayer layer, float skyMask, float upward)
++{
++    return layer.density * SkyDensityScale(layer, skyMask, upward) * ShadowDensityScale(layer);
++}
++
++float4 LayerLightDensityScales(float skyMask, float upward)
++{
++    return float4(LayerLightDensityScale(LoadConstantFogLayer(0), skyMask, upward),
++                  LayerLightDensityScale(LoadConstantFogLayer(1), skyMask, upward),
++                  LayerLightDensityScale(LoadConstantFogLayer(2), skyMask, upward),
++                  LayerLightDensityScale(LoadConstantFogLayer(3), skyMask, upward));
++}
++
++bool LayerLitInStep(FogLayer layer, float stepStart, float stepEnd)
++{
++    float layerStart = max(stepStart, layer.start);
++    return min(stepEnd, layer.limit) - layerStart > 0 && layer.density > 0 &&
++           (LocalLightReachLimit() <= 0 || layerStart < LocalLightReachLimit());
++}
++
++bool4 LayersLitInStep(float stepStart, float stepEnd)
++{
++    return bool4(LayerLitInStep(LoadConstantFogLayer(0), stepStart, stepEnd),
++                 LayerLitInStep(LoadConstantFogLayer(1), stepStart, stepEnd),
++                 LayerLitInStep(LoadConstantFogLayer(2), stepStart, stepEnd),
++                 LayerLitInStep(LoadConstantFogLayer(3), stepStart, stepEnd));
++}
++
++bool LayerCoversInterval(FogLayer layer, float2 interval)
++{
++    return layer.start <= interval.x && layer.limit >= interval.y;
++}
++
++bool4 LayersCoverInterval(float2 interval)
++{
++    return bool4(LayerCoversInterval(LoadConstantFogLayer(0), interval),
++                 LayerCoversInterval(LoadConstantFogLayer(1), interval),
++                 LayerCoversInterval(LoadConstantFogLayer(2), interval),
++                 LayerCoversInterval(LoadConstantFogLayer(3), interval));
++}
++
++float LayerStart(int layer)
++{
++    return layer == 0 ? LoadConstantFogLayer(0).start
++         : layer == 1 ? LoadConstantFogLayer(1).start
++         : layer == 2 ? LoadConstantFogLayer(2).start : LoadConstantFogLayer(3).start;
++}
++
++float LayerLimit(int layer)
++{
++    return layer == 0 ? LoadConstantFogLayer(0).limit
++         : layer == 1 ? LoadConstantFogLayer(1).limit
++         : layer == 2 ? LoadConstantFogLayer(2).limit : LoadConstantFogLayer(3).limit;
++}
++
++float4 LayerSelector(int layer)
++{
++    return layer == int4(0, 1, 2, 3) ? 1 : 0;
++}
++
++float2 LayerIntervalWithin(float2 interval, int layer)
++{
++    return float2(max(interval.x, LayerStart(layer)), min(interval.y, LayerLimit(layer)));
++}
++
++float4 DensityProfiles(MarchRay ray, float distanceAlongRay)
++{
++    float variation = DensityVariationAlongRay(ray, distanceAlongRay);
++    return float4(DensityProfile(LoadConstantFogLayer(0), ray, distanceAlongRay, variation),
++                  DensityProfile(LoadConstantFogLayer(1), ray, distanceAlongRay, variation),
++                  DensityProfile(LoadConstantFogLayer(2), ray, distanceAlongRay, variation),
++                  DensityProfile(LoadConstantFogLayer(3), ray, distanceAlongRay, variation));
++}
++
++float SampleDensity(MarchRay ray, float distanceAlongRay, float4 layerMask, float4 densityScales)
++{
++    return dot(DensityProfiles(ray, distanceAlongRay) * layerMask, densityScales);
++}
++
++float LightSampleScattering(LocalLight light, float3 attenuation, float3 viewDirection, float distanceAlongRay,
++                            float density)
++{
++    float3 toLight = light.position - viewDirection * distanceAlongRay;
++    float distanceSquared = dot(toLight, toLight);
++    float inverseDistance = rsqrt(max(distanceSquared, 1e-6));
++    float lightDistance = max(distanceSquared, 1e-6) * inverseDistance;
++    float falloff = rcp(max(attenuation.x + attenuation.y * lightDistance + attenuation.z * distanceSquared, 1));
++    float boundaryFade = saturate((light.radius - lightDistance) * 4 / max(light.radius, 1e-3));
++    float cosAngle = (light.projected - distanceAlongRay) * inverseDistance;
++    return falloff * boundaryFade * PhaseHG(LocalLightPhaseG(), cosAngle) * density;
++}
++
++float IntervalScattering(LocalLight light, float3 attenuation, float2 interval, float4 layerMask,
++                         float4 densityScales, MarchRay ray)
++{
++    float quadrature = 0;
++    [loop] for (int sample = 0; sample < 2; ++sample)
++    {
++        float distanceAlongRay = lerp(interval.x, interval.y, QuadratureFraction(sample));
++        quadrature += LightSampleScattering(light, attenuation, ray.viewDirection, distanceAlongRay,
++                                            SampleDensity(ray, distanceAlongRay, layerMask, densityScales));
++    }
++    return 0.5 * quadrature * (interval.y - interval.x);
++}
++
++float2 PieceInterval(int piece, float2 interval)
++{
++    return piece == 0 ? interval : LayerIntervalWithin(interval, piece - 1);
++}
++
++float4 PieceLayers(int piece, float2 interval, float2 pieceInterval, float4 litLayers)
++{
++    return piece == 0 ? (LayersCoverInterval(interval) ? litLayers : 0)
++                      : (any(pieceInterval != interval) ? litLayers * LayerSelector(piece - 1) : 0);
++}
++
++float LightOwnIntervalsScattering(LocalLight light, float3 attenuation, float2 interval, bool wholeStep,
++                                  bool layerBoundaryInStep, float4 litLayers, float4 densityScales, MarchRay ray)
++{
++    float scattering = 0;
++    int lastPiece = layerBoundaryInStep ? kFogLayers : 0;
++    [loop] for (int piece = wholeStep ? 1 : 0; piece <= lastPiece; ++piece)
++    {
++        float2 pieceInterval = PieceInterval(piece, interval);
++        float4 pieceLayers = PieceLayers(piece, interval, pieceInterval, litLayers);
++        [branch] if (pieceInterval.y > pieceInterval.x && any(pieceLayers != 0))
++            scattering += IntervalScattering(light, attenuation, pieceInterval, pieceLayers, densityScales, ray);
++    }
++    return scattering;
++}
++
++bool ChordCoversStep(float2 chord, float2 step)
++{
++    return chord.x <= step.x && chord.y >= step.y;
++}
++
++float3 WholeStepLightScattering(ChordCoverage coverage, float4 stepLayers, float4 densityScales, MarchRay ray,
++                                float2 step)
++{
++    float first = lerp(step.x, step.y, QuadratureFraction(0));
++    float second = lerp(step.x, step.y, QuadratureFraction(1));
++    float atFirst = 0;
++    float atSecond = 0;
++    [loop] for (int sample = 0; sample < 2; ++sample)
++    {
++        float density = SampleDensity(ray, sample == 0 ? first : second, stepLayers, densityScales);
++        [flatten] if (sample == 0)
++            atFirst = density;
++        else
++            atSecond = density;
++    }
++    float3 scattering = 0;
++    [loop] for (int index = coverage.firstLight; index < coverage.lightEnd; ++index)
++    {
++        LocalLight light = LoadLocalLight(index, ray.viewDirection);
++        [branch] if (ChordCoversStep(light.chord, step))
++        {
++            float3 attenuation = LocalLightAttenuation(index);
++            scattering += LocalLightColour(index) *
++                          (LightSampleScattering(light, attenuation, ray.viewDirection, first, atFirst) +
++                           LightSampleScattering(light, attenuation, ray.viewDirection, second, atSecond));
++        }
++    }
++    return 0.5 * (step.y - step.x) * scattering;
++}
++
++float3 LocalLightScattering(ChordCoverage coverage, float4 densityScales, MarchRay ray, float stepStart,
++                            float stepEnd, float4 layerNoiseDensities)
++{
++    float2 step = float2(stepStart, stepEnd);
++    float4 litLayers = LayersLitInStep(stepStart, stepEnd) ? layerNoiseDensities : 0;
++    bool4 layersCoverStep = LayersCoverInterval(step);
++    bool layerBoundaryInStep = any(layersCoverStep ? 0 : litLayers);
++    bool lightCoversStep = coverage.covered;
++    float3 scattering = 0;
++    [branch] if (coverage.nextEndpoint < stepEnd || layerBoundaryInStep)
++    {
++        lightCoversStep = false;
++        [loop] for (int index = coverage.firstLight; index < coverage.lightEnd; ++index)
++        {
++            LocalLight light = LoadLocalLight(index, ray.viewDirection);
++            float2 interval = float2(max(stepStart, light.chord.x), min(stepEnd, light.chord.y));
++            bool wholeStep = ChordCoversStep(light.chord, step);
++            lightCoversStep = lightCoversStep || wholeStep;
++            float amount = 0;
++            [branch] if (interval.y > interval.x && (!wholeStep || layerBoundaryInStep))
++                amount = LightOwnIntervalsScattering(light, LocalLightAttenuation(index), interval, wholeStep,
++                                                     layerBoundaryInStep, litLayers, densityScales, ray);
++            [branch] if (amount != 0)
++                scattering += LocalLightColour(index) * amount;
++        }
++    }
++    float4 stepLayers = layersCoverStep ? litLayers : 0;
++    [branch] if (lightCoversStep && any(stepLayers != 0))
++        scattering += WholeStepLightScattering(coverage, stepLayers, densityScales, ray, step);
++    return scattering;
++}
+diff --git a/Shaders/VolFog/vf_march.hlsl b/Shaders/VolFog/vf_march.hlsl
+new file mode 100644
+index 0000000..a0745b4
+--- /dev/null
++++ b/Shaders/VolFog/vf_march.hlsl
+@@ -0,0 +1,6 @@
++#include "vf_integrate.hlsli"
++
++float4 main(float2 lowResTexel : VPOS) : COLOR0
++{
++    return IntegrateFogAtPixel(LowResTexelToFullPixel(lowResTexel), StepJitter(lowResTexel));
++}
+diff --git a/Shaders/VolFog/vf_ray_blur.hlsl b/Shaders/VolFog/vf_ray_blur.hlsl
+new file mode 100644
+index 0000000..b99695f
+--- /dev/null
++++ b/Shaders/VolFog/vf_ray_blur.hlsl
+@@ -0,0 +1,41 @@
++float4 cRadialBlur : register(c9);
++float4 cRayTarget : register(c10);
++
++sampler2D sSource : register(s0);
++
++static const int kTaps = 8;
++static const float kDecayPerTap = 0.9;
++
++float2 SunUv()
++{
++    return cRadialBlur.xy;
++}
++
++float StepFractionTowardSun()
++{
++    return cRadialBlur.z;
++}
++
++float TapWeightNormalisation()
++{
++    return cRadialBlur.w;
++}
++
++float2 TargetTexelSize()
++{
++    return cRayTarget.zw;
++}
++
++float4 main(float2 texel : VPOS) : COLOR0
++{
++    float2 uv = (texel + 0.5) * TargetTexelSize();
++    float2 tapStep = (SunUv() - uv) * StepFractionTowardSun();
++    float3 sum = 0;
++    float tapWeight = 1;
++    [unroll] for (int k = 0; k < kTaps; k++)
++    {
++        sum += tex2Dlod(sSource, float4(uv + tapStep * k, 0, 0)).rgb * tapWeight;
++        tapWeight *= kDecayPerTap;
++    }
++    return float4(sum * TapWeightNormalisation(), 1);
++}
+diff --git a/Shaders/VolFog/vf_ray_composite.hlsl b/Shaders/VolFog/vf_ray_composite.hlsl
+new file mode 100644
+index 0000000..bab6d72
+--- /dev/null
++++ b/Shaders/VolFog/vf_ray_composite.hlsl
+@@ -0,0 +1,8 @@
++#include "vf_composite.hlsli"
++
++float4 main(float2 pixelIndex : VPOS) : COLOR0
++{
++    float2 viewportUv = (pixelIndex + 0.5 - ViewportOrigin()) / ViewportSize();
++    float3 scene = tex2Dlod(sSceneBeforeFog, float4(viewportUv, 0, 0)).rgb;
++    return float4(BlendGodRays(scene, DisplaySpaceGodRays(viewportUv)), 1);
++}
+diff --git a/Shaders/VolFog/vf_ray_mask.hlsl b/Shaders/VolFog/vf_ray_mask.hlsl
+new file mode 100644
+index 0000000..a851ecf
+--- /dev/null
++++ b/Shaders/VolFog/vf_ray_mask.hlsl
+@@ -0,0 +1,43 @@
++#include "vf_common.hlsli"
++
++float4 cRayMask : register(c9);
++float4 cRaySource : register(c10);
++
++sampler2D sDepth : register(s0);
++sampler2D sDownsampledScene : register(s1);
++
++static const float3 kLumaWeights = float3(0.299, 0.587, 0.114);
++static const float kThresholdRampSlope = 4;
++
++float3 DirectionToSunView()
++{
++    return cRayMask.xyz;
++}
++
++float AngularFalloffExponent()
++{
++    return cRayMask.w;
++}
++
++float LuminanceThreshold()
++{
++    return cRaySource.y;
++}
++
++float2 RayTexelSize()
++{
++    return cRaySource.zw;
++}
++
++float4 main(float2 rayTexel : VPOS) : COLOR0
++{
++    float2 fullPixelsPerRayTexel = ViewportSize() * RayTexelSize();
++    float2 pixel = min(ViewportOrigin() + (rayTexel + 0.5) * fullPixelsPerRayTexel, ViewportLastPixelCentre());
++    float skyMask = IsSky(SampleDepth(sDepth, pixel)) ? 1 : 0;
++    float3 viewDirection = normalize(ViewRayAtUnitDepth(pixel));
++    float sunFalloff = pow(saturate(dot(viewDirection, DirectionToSunView())), AngularFalloffExponent());
++    float3 scene = tex2Dlod(sDownsampledScene, float4((rayTexel + 0.5) * RayTexelSize(), 0, 0)).rgb;
++    float luminance = dot(scene, kLumaWeights);
++    float brightSky = skyMask * sunFalloff * saturate((luminance - LuminanceThreshold()) * kThresholdRampSlope);
++    return float4(scene * brightSky, 1);
++}
+diff --git a/Shaders/VolFog/vf_sample_split.hlsli b/Shaders/VolFog/vf_sample_split.hlsli
+new file mode 100644
+index 0000000..5451bef
+--- /dev/null
++++ b/Shaders/VolFog/vf_sample_split.hlsli
+@@ -0,0 +1,55 @@
++#include "vf_composite.hlsli"
++
++static const float kPlanarCurvatureShare = 0.25;
++
++struct DepthNeighbourhood
++{
++    float own;
++    float nearest;
++    float farthest;
++    float curvature;
++};
++
++float DepthAround(float2 pixel, float2 offset)
++{
++    return SampleDepth(sDepth, clamp(pixel + offset, ViewportOrigin() + 0.5, ViewportLastPixelCentre()));
++}
++
++float SecondDifference(float before, float own, float after)
++{
++    return abs(before + after - 2 * own);
++}
++
++DepthNeighbourhood NeighbourhoodOf(float2 pixel)
++{
++    float depth[3][3];
++    [unroll] for (int y = 0; y < 3; y++)
++        [unroll] for (int x = 0; x < 3; x++)
++            depth[y][x] = DepthAround(pixel, float2(x - 1, y - 1));
++    DepthNeighbourhood n;
++    n.own = depth[1][1];
++    n.nearest = min(min(min(depth[0][0], depth[0][1]), min(depth[0][2], depth[1][0])),
++                    min(min(depth[1][1], depth[1][2]), min(min(depth[2][0], depth[2][1]), depth[2][2])));
++    n.farthest = max(max(max(depth[0][0], depth[0][1]), max(depth[0][2], depth[1][0])),
++                     max(max(depth[1][1], depth[1][2]), max(max(depth[2][0], depth[2][1]), depth[2][2])));
++    n.curvature = max(max(SecondDifference(depth[1][0], n.own, depth[1][2]),
++                          SecondDifference(depth[0][1], n.own, depth[2][1])),
++                      max(SecondDifference(depth[0][0], n.own, depth[2][2]),
++                          SecondDifference(depth[0][2], n.own, depth[2][0])));
++    return n;
++}
++
++bool SilhouetteWithin(DepthNeighbourhood n)
++{
++    float nearestViewZ = LinearDepth(n.nearest);
++    float farthestViewZ = LinearDepth(n.farthest);
++    bool separated = farthestViewZ - nearestViewZ > max(kSameSurfaceAbsoluteDepth,
++                                                        nearestViewZ * kSameSurfaceRelativeDepth);
++    bool planar = n.curvature <= kPlanarCurvatureShare * (n.farthest - n.nearest);
++    return !SameDepthClass(n.nearest, n.farthest) || (separated && !planar);
++}
++
++float SplitDepth(DepthNeighbourhood n)
++{
++    return 0.5 * (n.nearest + n.farthest);
++}
+diff --git a/Shaders/VolFog/vf_silhouette_mask.hlsl b/Shaders/VolFog/vf_silhouette_mask.hlsl
+new file mode 100644
+index 0000000..c8f9a3a
+--- /dev/null
++++ b/Shaders/VolFog/vf_silhouette_mask.hlsl
+@@ -0,0 +1,17 @@
++#include "vf_sample_split.hlsli"
++
++struct SilhouetteSplit
++{
++    float4 colour : COLOR0;
++    float depth : DEPTH;
++};
++
++SilhouetteSplit main(float2 pixelIndex : VPOS)
++{
++    DepthNeighbourhood n = NeighbourhoodOf(pixelIndex + 0.5);
++    clip(SilhouetteWithin(n) ? 1 : -1);
++    SilhouetteSplit output;
++    output.colour = 0;
++    output.depth = SplitDepth(n);
++    return output;
++}
+diff --git a/Shaders/VolFog/vf_temporal.hlsl b/Shaders/VolFog/vf_temporal.hlsl
+new file mode 100644
+index 0000000..153db27
+--- /dev/null
++++ b/Shaders/VolFog/vf_temporal.hlsl
+@@ -0,0 +1,158 @@
++#include "vf_common.hlsli"
++
++row_major float4x4 cViewToPreviousClip : register(c9);
++float4 cTemporal : register(c13);
++
++sampler2D sCurrent : register(s0);
++sampler2D sHistory : register(s1);
++sampler2D sDepth : register(s2);
++sampler2D sHistoryDepth : register(s3);
++
++static const float kHistoryRelativeDepthTolerance = 0.02;
++static const float kHistoryAbsoluteDepthTolerance = 0.5;
++
++float HistoryWeight()
++{
++    return cTemporal.x;
++}
++
++bool HistoryInvalid()
++{
++    return cTemporal.y <= 0;
++}
++
++float LightingHistoryWeight(float3 current, float3 history)
++{
++    float weight = HistoryWeight();
++    [branch] if (cTemporal.z > 0)
++    {
++        float3 difference = abs(current - history);
++        float peakDifference = max(difference.r, max(difference.g, difference.b));
++        float3 peak = max(current, history);
++        float brightness = max(0.05, max(peak.r, max(peak.g, peak.b)));
++        weight *= 1 - smoothstep(0.20, 0.40, peakDifference / brightness);
++    }
++    return weight;
++}
++
++void CurrentNeighbourhoodRange(float2 uv, float4 centre, out float4 lowest, out float4 highest)
++{
++    lowest = centre;
++    highest = centre;
++    static const float2 kNeighbourOffsets[8] = {
++        float2(-1, -1), float2(0, -1), float2(1, -1), float2(-1, 0),
++        float2(1, 0), float2(-1, 1), float2(0, 1), float2(1, 1)
++    };
++    [unroll] for (int k = 0; k < 8; k++)
++    {
++        float4 neighbour = tex2Dlod(sCurrent, float4(uv + kNeighbourOffsets[k] * LowResTexelSize(), 0, 0));
++        lowest = min(lowest, neighbour);
++        highest = max(highest, neighbour);
++    }
++}
++
++bool MatchesSurface(float expectedDepth, float depthClass, float tapViewZ, float tapDepthClass)
++{
++    float tolerance = max(kHistoryAbsoluteDepthTolerance, expectedDepth * kHistoryRelativeDepthTolerance);
++    return abs(tapDepthClass - depthClass) < 0.25 && (depthClass > 0 || abs(tapViewZ - expectedDepth) <= tolerance);
++}
++
++float DepthClass(float depth)
++{
++    return IsSky(depth) ? 1 : (BeyondFarClip(depth) ? 0.5 : 0);
++}
++
++struct History
++{
++    float4 value;
++    bool found;
++};
++
++History NoHistory()
++{
++    History none;
++    none.value = 0;
++    none.found = false;
++    return none;
++}
++
++History ValidatedHistory(float2 uv, float expectedDepth, float depthClass)
++{
++    float2 texel = uv * LowResSize() - 0.5;
++    float2 baseTexel = floor(texel);
++    float2 fraction = texel - baseTexel;
++    static const float2 kOffsets[4] = {float2(0, 0), float2(1, 0), float2(0, 1), float2(1, 1)};
++    float4 history = 0;
++    float weightSum = 0;
++    [unroll] for (int i = 0; i < 4; ++i)
++    {
++        float2 tap = baseTexel + kOffsets[i];
++        float2 tapUv = LowResTexelToUv(clamp(tap, 0, LowResSize() - 1));
++        float3 previousDepth = tex2Dlod(sHistoryDepth, float4(tapUv, 0, 0)).rgb;
++        float previousViewZ = dot(previousDepth.rg, float2(65280, 255)) * (MaxFogDistance() / 65535);
++        float valid = MatchesSurface(expectedDepth, depthClass, previousViewZ, previousDepth.b) ? 1 : 0;
++        float2 bilinear = lerp(1 - fraction, fraction, kOffsets[i]);
++        float weight = bilinear.x * bilinear.y * valid;
++        history += tex2Dlod(sHistory, float4(tapUv, 0, 0)) * weight;
++        weightSum += weight;
++    }
++    History validated;
++    validated.found = weightSum > 1e-5;
++    validated.value = history / max(weightSum, 1e-5);
++    return validated;
++}
++
++History ReprojectedHistory(float2 pixel, float depth, float viewZ, float depthClass)
++{
++    [branch] if (HistoryInvalid())
++        return NoHistory();
++    float4 previousClip = mul(float4(ViewRayAtUnitDepth(pixel) * viewZ, IsSky(depth) ? 0 : 1),
++                              cViewToPreviousClip);
++    [branch] if (previousClip.w <= 1e-3)
++        return NoHistory();
++    float2 previousPixel = NdcToPixel(previousClip.xy / previousClip.w);
++    float2 previousUv = LowResTexelToUv(FullPixelToLowResTexel(previousPixel));
++    [branch] if (any(previousUv < 0) || any(previousUv > 1))
++        return NoHistory();
++    return ValidatedHistory(previousUv, previousClip.w, depthClass);
++}
++
++bool InsideLowResTarget(float2 lowResTexel)
++{
++    return all(lowResTexel >= 0) && all(lowResTexel < LowResSize());
++}
++
++float4 SameSurfaceCurrentAverage(float2 lowResTexel, float viewZ, float depthClass)
++{
++    float4 sum = 0;
++    float weightSum = 0;
++    [loop] for (int k = 0; k < 9; ++k)
++    {
++        float2 tap = lowResTexel + float2(k % 3, k / 3) - 1;
++        float tapDepth = SampleDepth(sDepth, LowResTexelToFullPixel(tap));
++        float weight = InsideLowResTarget(tap) &&
++                       MatchesSurface(viewZ, depthClass, LinearDepth(tapDepth), DepthClass(tapDepth)) ? 1 : 0;
++        sum += tex2Dlod(sCurrent, float4(LowResTexelToUv(tap), 0, 0)) * weight;
++        weightSum += weight;
++    }
++    return sum / max(weightSum, 1);
++}
++
++float4 main(float2 lowResTexel : VPOS) : COLOR0
++{
++    float2 uv = LowResTexelToUv(lowResTexel);
++    float2 pixel = LowResTexelToFullPixel(lowResTexel);
++    float depth = SampleDepth(sDepth, pixel);
++    float viewZ = LinearDepth(depth);
++    float depthClass = DepthClass(depth);
++    History reprojected = ReprojectedHistory(pixel, depth, viewZ, depthClass);
++    [branch] if (!reprojected.found)
++        return SameSurfaceCurrentAverage(lowResTexel, viewZ, depthClass);
++
++    float4 current = tex2Dlod(sCurrent, float4(uv, 0, 0));
++    float4 lowest;
++    float4 highest;
++    CurrentNeighbourhoodRange(uv, current, lowest, highest);
++    float4 history = clamp(reprojected.value, lowest, highest);
++    return lerp(current, history, LightingHistoryWeight(current.rgb, history.rgb));
++}
+diff --git a/Tools/VolFog/mkbls.py b/Tools/VolFog/mkbls.py
+new file mode 100644
+index 0000000..02ac2bb
+--- /dev/null
++++ b/Tools/VolFog/mkbls.py
+@@ -0,0 +1,165 @@
++"""Packs compiled D3D9 shader bytecode (fxc /Fo output) into the GXSH ".bls" container of the WoW 3.3.5a client.
++
++Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B2. GPL-3.0-only (same licence
++as Shaders/VolFog); standard library only.
++
++usage: python -I mkbls.py <out.bls> <permutation0.pso> [<permutation1.pso> ...]
++       python -I mkbls.py --check <file.bls> [<file.bls> ...]
++
++Container (little-endian, CGxDevice::IShaderLoad + CGxShader::Load of the client):
++    u32 magic 'GXSH' (on disk 48 53 58 47)   u32 version 0x00010003   u32 N (number of permutations)
++    N entries: u32 unk_003C, u32 unk_0040, u16 unk_0044, u16 unk_0046, u32 codeSize, bytecode, padding to 4 bytes.
++
++The unk fields are read and kept by the client but nothing in it consumes them; the original files do not leave them at 0
++(checked against Terrain1, Combiners_Opaque, FFXBox4, FFXGlow, TerrainSM and the vs_3_0 Terrain, Diffuse_T1, ShadowMap
++of patch.MPQ / patch-2.MPQ), so they are reproduced from the bytecode:
++    unk_003C  bit mask of the inputs the shader declares (vertex shader: vertex attributes; pixel shader: interpolants)
++    unk_0040  bit mask of the outputs (vertex shader: interpolants written; pixel shader: 0x200 = colour 0)
++    unk_0044  pixel shader: bit mask of the samplers used (bit n = sN); vertex shader: 0
++    unk_0046  always 0
++    bit of a usage: position 0, blend weight 1, blend indices 2, normal 3, fog 7, colour n 9 + n, texcoord n 11 + n.
++"""
++import os
++import struct
++import sys
++
++MAGIC = 0x47585348      # 'GXSH'
++VERSION = 0x00010003
++
++D3DDECLUSAGE = {0: 'position', 1: 'blendweight', 2: 'blendindices', 3: 'normal', 4: 'psize', 5: 'texcoord',
++                6: 'tangent', 7: 'binormal', 8: 'tessfactor', 9: 'positiont', 10: 'color', 11: 'fog',
++                12: 'depth', 13: 'sample'}
++FIXED_BITS = {'position': 0, 'blendweight': 1, 'blendindices': 2, 'normal': 3, 'fog': 7}
++COLOR_BASE = 9
++TEXCOORD_BASE = 11
++
++REG_INPUT, REG_TEXTURE, REG_OUTPUT, REG_SAMPLER = 1, 3, 6, 10
++OP_DCL, OP_COMMENT, OP_END = 31, 0xFFFE, 0xFFFF
++
++
++def usage_bit(usage, index, where):
++    name = D3DDECLUSAGE.get(usage, 'usage %d' % usage)
++    if name in FIXED_BITS and index == 0:
++        return FIXED_BITS[name]
++    if name == 'color' and index < 2:
++        return COLOR_BASE + index
++    if name == 'texcoord' and index < 8:
++        return TEXCOORD_BASE + index
++    raise SystemExit('mkbls: %s %s%d has no known unk bit (not seen in the original .bls files); extend usage_bit()'
++                     % (where, name, index))
++
++
++def derive_unk(code):
++    """Returns (unk_003C, unk_0040, unk_0044, unk_0046, is_pixel) from D3D9 shader bytecode."""
++    if len(code) < 8 or len(code) % 4:
++        raise SystemExit('mkbls: bytecode size %d is not a multiple of 4 (is this an fxc /Fo output?)' % len(code))
++    tokens = struct.unpack('<%dI' % (len(code) // 4), code)
++    kind = tokens[0] >> 16
++    if kind not in (0xFFFF, 0xFFFE):
++        raise SystemExit('mkbls: bytecode does not start with a D3D9 version token (0x%08x)' % tokens[0])
++    is_pixel = kind == 0xFFFF
++    major = (tokens[0] >> 8) & 0xFF
++    inputs = outputs = samplers = 0
++    pos = 1
++    ended = False
++    while pos < len(tokens):
++        token = tokens[pos]
++        op = token & 0xFFFF
++        if op == OP_END:
++            ended = True
++            break
++        if op == OP_COMMENT:
++            pos += 1 + ((token >> 16) & 0x7FFF)
++            continue
++        length = (token >> 24) & 0xF
++        if op == OP_DCL:
++            decl, dest = tokens[pos + 1], tokens[pos + 2]
++            reg_type = ((dest >> 28) & 7) | ((dest >> 8) & 0x18)
++            reg_num = dest & 0x7FF
++            usage, index = decl & 0x1F, (decl >> 16) & 0xF
++            if reg_type == REG_SAMPLER:
++                samplers |= 1 << reg_num
++            elif reg_type == REG_INPUT:
++                if is_pixel and major < 3:
++                    inputs |= 1 << (COLOR_BASE + reg_num)       # ps_2_x: v# are the colour registers
++                else:
++                    inputs |= 1 << usage_bit(usage, index, 'input')
++            elif reg_type == REG_TEXTURE and is_pixel:
++                inputs |= 1 << (TEXCOORD_BASE + reg_num)        # ps_2_x: t# are the texcoord registers
++            elif reg_type == REG_OUTPUT and not is_pixel:
++                outputs |= 1 << usage_bit(usage, index, 'output')
++        pos += 1 + length
++    if not ended:
++        raise SystemExit('mkbls: bytecode has no end token')
++    if is_pixel:
++        outputs = 1 << COLOR_BASE   # colour 0; every original pixel shader writes exactly this
++    else:
++        samplers = 0
++    return inputs, outputs, samplers, 0, is_pixel
++
++
++def build(out_path, pso_paths):
++    entries = []
++    for path in pso_paths:
++        with open(path, 'rb') as f:
++            code = f.read()
++        in_mask, out_mask, sampler_mask, unk46, is_pixel = derive_unk(code)
++        entries.append(struct.pack('<IIHHI', in_mask, out_mask, sampler_mask, unk46, len(code)) + code
++                       + b'\0' * (-len(code) % 4))
++    data = struct.pack('<III', MAGIC, VERSION, len(entries)) + b''.join(entries)
++    with open(out_path, 'wb') as f:
++        f.write(data)
++    print('mkbls: %s: %d permutation(s), %d bytes' % (out_path, len(entries), len(data)))
++
++
++def check(path):
++    """Opens a .bls with the same steps as CGxDevice::IShaderLoad and compares the unk fields with the bytecode."""
++    with open(path, 'rb') as f:
++        data = f.read()
++    path = os.path.basename(path)
++    if len(data) < 12:
++        print('%s: %d bytes, not a GXSH file (the client treats it as a missing shader)' % (path, len(data)))
++        return False
++    ok = True
++    magic, version, count = struct.unpack_from('<III', data, 0)
++    if magic != MAGIC or version != VERSION:
++        print('%s: BAD header magic=%08x version=%08x' % (path, magic, version))
++        return False
++    pos = 12
++    mismatches = 0
++    for i in range(count):
++        if pos + 16 > len(data):
++            print('%s: entry %d truncated' % (path, i))
++            return False
++        u3c, u40, u44, u46, size = struct.unpack_from('<IIHHI', data, pos)
++        pos += 16
++        code = data[pos:pos + size]
++        if len(code) != size:
++            print('%s: entry %d bytecode truncated' % (path, i))
++            return False
++        pos += (size + 3) & ~3
++        try:
++            d3c, d40, d44, d46, _ = derive_unk(code)
++        except SystemExit as exc:
++            print('%s: entry %d: %s' % (path, i, exc))
++            ok = False
++            continue
++        if (u3c, u40, u44, u46) != (d3c, d40, d44, d46):
++            mismatches += 1
++            print('%s: entry %d unk stored %05x/%05x/%04x/%04x derived %05x/%05x/%04x/%04x'
++                  % (path, i, u3c, u40, u44, u46, d3c, d40, d44, d46))
++    if pos != len(data):
++        print('%s: %d unread bytes after %d entries' % (path, len(data) - pos, count))
++        ok = False
++    print('%s: GXSH v%08x, %d permutation(s), %d bytes, unk fields %s' % (
++        path, version, count, len(data), 'all match the bytecode' if not mismatches else '%d MISMATCH' % mismatches))
++    return ok and not mismatches
++
++
++if __name__ == '__main__':
++    if len(sys.argv) >= 3 and sys.argv[1] == '--check':
++        results = [check(p) for p in sys.argv[2:]]
++        sys.exit(0 if all(results) else 1)
++    if len(sys.argv) < 3:
++        sys.exit(__doc__)
++    build(sys.argv[1], sys.argv[2:])
+diff --git a/Tools/VolFog/mkmpq.py b/Tools/VolFog/mkmpq.py
+new file mode 100644
+index 0000000..486d83f
+--- /dev/null
++++ b/Tools/VolFog/mkmpq.py
+@@ -0,0 +1,118 @@
++"""Minimal MPQ (format v1) writer for small interface patches of the WoW 3.3.5a client.
++
++usage: python -I mkmpq.py <output.MPQ> <root_dir> <file inside root> [<file> ...]
++
++Each file is stored under its path relative to <root_dir> (with backslashes, e.g. Interface\\GlueXML\\AccountLogin.lua),
++zlib-compressed in 4096-byte sectors with a sector offset table, locale neutral, not encrypted. A (listfile) is added.
++Hash and block tables are encrypted as the format requires. No external dependencies.
++"""
++import os
++import struct
++import sys
++import zlib
++
++MPQ_FILE_COMPRESS = 0x00000200
++MPQ_FILE_EXISTS = 0x80000000
++SECTOR_SHIFT = 3  # 512 << 3 = 4096
++
++
++def _crypt_table():
++    table = [0] * 0x500
++    seed = 0x00100001
++    for index1 in range(0x100):
++        index2 = index1
++        for _ in range(5):
++            seed = (seed * 125 + 3) % 0x2AAAAB
++            temp1 = (seed & 0xFFFF) << 0x10
++            seed = (seed * 125 + 3) % 0x2AAAAB
++            temp2 = seed & 0xFFFF
++            table[index2] = temp1 | temp2
++            index2 += 0x100
++    return table
++
++
++CRYPT = _crypt_table()
++
++
++def hash_string(name, hash_type):
++    seed1, seed2 = 0x7FED7FED, 0xEEEEEEEE
++    for ch in name.replace('/', '\\').upper().encode('ascii'):
++        value = CRYPT[(hash_type << 8) + ch]
++        seed1 = (value ^ (seed1 + seed2)) & 0xFFFFFFFF
++        seed2 = (ch + seed1 + seed2 + (seed2 << 5) + 3) & 0xFFFFFFFF
++    return seed1
++
++
++def encrypt(data, key):
++    assert len(data) % 4 == 0
++    seed1, seed2 = key, 0xEEEEEEEE
++    out = []
++    for (value,) in struct.iter_unpack('<I', data):
++        seed2 = (seed2 + CRYPT[0x400 + (seed1 & 0xFF)]) & 0xFFFFFFFF
++        out.append((value ^ (seed1 + seed2)) & 0xFFFFFFFF)
++        seed1 = (((~seed1 << 0x15) + 0x11111111) | (seed1 >> 0x0B)) & 0xFFFFFFFF
++        seed2 = (value + seed2 + (seed2 << 5) + 3) & 0xFFFFFFFF
++    return struct.pack('<%dI' % len(out), *out)
++
++
++def pack_file(data):
++    sector_size = 512 << SECTOR_SHIFT
++    sectors = [data[i:i + sector_size] for i in range(0, len(data), sector_size)] or [b'']
++    blobs = []
++    for sector in sectors:
++        packed = b'\x02' + zlib.compress(sector, 9)  # 0x02 = zlib
++        blobs.append(packed if len(packed) < len(sector) else sector)
++    offsets = [(len(sectors) + 1) * 4]
++    for blob in blobs:
++        offsets.append(offsets[-1] + len(blob))
++    return struct.pack('<%dI' % len(offsets), *offsets) + b''.join(blobs)
++
++
++def build(output, root, files):
++    entries = []
++    for path in files:
++        rel = os.path.relpath(path, root).replace('/', '\\')
++        with open(path, 'rb') as f:
++            entries.append((rel, f.read()))
++    listfile = ''.join(name + '\r\n' for name, _ in entries).encode('ascii')
++    entries.append(('(listfile)', listfile))
++
++    hash_size = 16
++    while hash_size < len(entries) * 2:
++        hash_size *= 2
++
++    body = bytearray()
++    blocks = []
++    header_size = 32
++    for name, data in entries:
++        packed = pack_file(data)
++        blocks.append((header_size + len(body), len(packed), len(data), MPQ_FILE_EXISTS | MPQ_FILE_COMPRESS))
++        body += packed
++
++    hash_table = [(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFF, 0xFFFF, 0xFFFFFFFF)] * hash_size
++    for block_index, (name, _) in enumerate(entries):
++        index = hash_string(name, 0) & (hash_size - 1)
++        while hash_table[index][4] != 0xFFFFFFFF:
++            index = (index + 1) & (hash_size - 1)
++        hash_table[index] = (hash_string(name, 1), hash_string(name, 2), 0, 0, block_index)
++
++    hash_raw = b''.join(struct.pack('<IIHHI', *e) for e in hash_table)
++    block_raw = b''.join(struct.pack('<IIII', *b) for b in blocks)
++    hash_offset = header_size + len(body)
++    block_offset = hash_offset + len(hash_raw)
++    archive_size = block_offset + len(block_raw)
++
++    header = struct.pack('<4sIIHHIIII', b'MPQ\x1a', header_size, archive_size, 0, SECTOR_SHIFT,
++                         hash_offset, block_offset, hash_size, len(blocks))
++    with open(output, 'wb') as f:
++        f.write(header)
++        f.write(body)
++        f.write(encrypt(hash_raw, hash_string('(hash table)', 3)))
++        f.write(encrypt(block_raw, hash_string('(block table)', 3)))
++    for name, data in entries:
++        print('  %-45s %6d bytes' % (name, len(data)))
++    print('wrote %s (%d bytes)' % (output, archive_size))
++
++
++if __name__ == '__main__':
++    build(sys.argv[1], sys.argv[2], sys.argv[3:])
+diff --git a/Tools/WowClient/CMakeLists.txt b/Tools/WowClient/CMakeLists.txt
+index 343d8e3..db32a71 100644
+--- a/Tools/WowClient/CMakeLists.txt
++++ b/Tools/WowClient/CMakeLists.txt
+@@ -21,6 +21,11 @@ endif ()
+ 
+ add_executable(WowClient WIN32 ${CLIENT_SOURCES} ${CLIENT_PLATFORM_SOURCES} ${CLIENT_TOOL_SOURCES})
+ 
++# Not in the original client (World of Legends): patch-Z.MPQ with the volumetric fog shaders is built before the client.
++if (TARGET VolFogShaders)
++    add_dependencies(WowClient VolFogShaders)
++endif ()
++
+ set_target_properties(WowClient PROPERTIES
+     OUTPUT_NAME ${WOWCLIENT_OUTPUT_NAME}
+     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin/Win
+diff --git a/WoW/Source/Ui/WorldFrame.cpp b/WoW/Source/Ui/WorldFrame.cpp
+index 5de1dc0..53efbb7 100644
+--- a/WoW/Source/Ui/WorldFrame.cpp
++++ b/WoW/Source/Ui/WorldFrame.cpp
+@@ -10,6 +10,7 @@
+ #include "Engine/Source/Event/Event.h"
+ #include "Engine/Source/FFX/EffectGlow.h"
+ #include "Engine/Source/FFX/FFX.h"
++#include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
+ #include "Engine/Source/Frame/CRenderBatch.h"
+ #include "Engine/Source/Frame/CSimpleTop.h"
+ #include "Engine/Source/FrameScript/FrameScript.h"
+@@ -1779,6 +1780,8 @@ void CGWorldFrame::OnWorldRender() {
+     GxuSortDrawList(GxuCat_1, GxuSort_B2F, *World::GetCamPos());
+     GxuFlushDrawList(GxuCat_1, *World::GetCamPos());
+     DayNight::RenderGlares();
++    // Not in the original client (World of Legends): native volumetric fog, drawn before the 3D names so that the text stays sharp.
++    VolFog::Render();
+     PlayerNameUpdateLate();
+ 
+     if (CWorld::enables & 0x20000000) {
+diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
+index 7d4c04f..89b4a4f 100644
+--- a/WoW/Source/WorldClient/WorldParam.h
++++ b/WoW/Source/WorldClient/WorldParam.h
+@@ -42,6 +42,8 @@ class CWorldParam {
+     static CVar* cvar_wolFarClipFactor;
+     // Not in the original client (World of Legends): see patches-cliente/sombras-4096/README-sombras.md.
+     static CVar* cvar_wolShadowMapSize;
++    // Not in the original client (World of Legends): native volumetric fog, see patches-cliente/niebla-volumetrica/README-niebla.md.
++    static CVar* cvar_wolVolFogDebug;
+ 
+     static bool BaseMipCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool BspCacheCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+@@ -80,6 +82,7 @@ class CWorldParam {
+     // Not in the original client.
+     static bool WolFarClipFactorCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolShadowMapSizeCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool TextureFilteringCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WaterLodCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WorldPoolUsageCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index aa8686c..b054433 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -6,6 +6,7 @@
+ #include "Engine/Source/Services/Texture.h"
+ #include "Engine/Source/ShaderEffect/ShaderEffect.h"
+ #include "Engine/Source/ShaderEffect/ShadowCache.h"
++#include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
+ #include "WoW/Common/AaBsp.h"
+ #include "WoW/Source/UIUtil/PortraitButton.h"
+ #include "WoW/Source/WorldClient/Map.h"
+@@ -115,6 +116,9 @@ CVar* CWorldParam::cvar_wolFarClipFactor;
+ // Not in the original client (World of Legends): wolShadowMapSize, see patches-cliente/sombras-4096/README-sombras.md.
+ CVar* CWorldParam::cvar_wolShadowMapSize;
+ 
++// Not in the original client (World of Legends): wolVolFogDebug, see patches-cliente/niebla-volumetrica/README-niebla.md.
++CVar* CWorldParam::cvar_wolVolFogDebug;
++
+ #define WOL_FARCLIP_FACTOR_MAX 3.0f
+ 
+ static float ClampEnvironmentDetail(float detail) {
+@@ -712,6 +716,34 @@ bool CWorldParam::GxTextureCacheSizeCallback(CVar* var, const char* oldValue, co
+     return true;
+ }
+ 
++// Not in the original client. Debug view of the native volumetric fog pass (VolFog::Render, brief B2): 0 draws nothing,
++// 1 depth in grey (needs the INTZ depth of brief B3), 2 magenta tint over the world view, 3 test grid. The value is
++// read every frame, so no restart is needed.
++bool CWorldParam::WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    int32_t mode = -1;
++
++    if (value && value[0] >= '0' && value[0] <= '3' && value[1] == '\0') {
++        mode = value[0] - '0';
++    }
++
++    if (mode < 0) {
++        ConsoleWrite("wolVolFogDebug must be 0 (off), 1 (depth), 2 (tint) or 3 (grid).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    VolFog::s_debugMode = mode;
++
++    // No message while the CVar is first registered (no previous value).
++    if (oldValue && *oldValue) {
++        char buffer[64];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFogDebug: %d", mode);
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
+ // VERIFY: 9acf82a1 auto
+ // OFFSET: 0x0078E400
+ void CWorldParam::Initialize() {
+@@ -720,6 +752,8 @@ void CWorldParam::Initialize() {
+     CWorldParam::cvar_wolFarClipFactor = CVar::Register("wolFarclipFactor", "Scales the view distance limits (1.0 original, up to 3.0)", 1, "1.0", CWorldParam::WolFarClipFactorCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Not in the original client: also before extShadowQuality, so the saved shadow map size is in place when the shadow cache starts.
+     CWorldParam::cvar_wolShadowMapSize = CVar::Register("wolShadowMapSize", "Exterior shadow map size (0 original, 1024, 2048 or 4096)", 1, "0", CWorldParam::WolShadowMapSizeCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Not in the original client: debug view of the native volumetric fog pass (brief B2); B4 adds the other wolVolFog* CVars.
++    CWorldParam::cvar_wolVolFogDebug = CVar::Register("wolVolFogDebug", "Volumetric fog debug view (0 off, 1 depth, 2 tint, 3 grid)", 1, "0", CWorldParam::WolVolFogDebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_farClipOverride = CVar::Register("farClipOverride", "Override old world graphic settings", 1, "0", CWorldParam::FarClipOverrideCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_lod = CVar::Register("lod", "Video option: Toggle Lod", 1, "0", CWorldParam::LodCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_mapShadows = CVar::Register("mapShadows", "Video option: Toggle map shadows", 1, "1", CWorldParam::MapShadowsCallback, CATEGORY_GRAPHICS, false, nullptr, false);

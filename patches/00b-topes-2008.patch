@@ -1,0 +1,995 @@
+diff --git a/Engine/Source/Gx/CGxDevice/CGxDevice.cpp b/Engine/Source/Gx/CGxDevice/CGxDevice.cpp
+index 925f7cd..f722a22 100644
+--- a/Engine/Source/Gx/CGxDevice/CGxDevice.cpp
++++ b/Engine/Source/Gx/CGxDevice/CGxDevice.cpp
+@@ -1854,6 +1854,13 @@ void CGxDevice::WaitForFPSCap() {
+         return;
+     }
+ 
++    // Not in the original client: wolMaxFPSPrecise (off by default) paces frames with a high-resolution timer instead
++    // of whole milliseconds.
++    if (GxGetMaxFPSPrecise()) {
++        GxWaitForFrameRatePrecise(maxFps);
++        return;
++    }
++
+     uint32_t frameMs = 1000 / maxFps;
+     uint32_t now = OsGetAsyncTimeMs();
+ 
+diff --git a/Engine/Source/Gx/Gx.h b/Engine/Source/Gx/Gx.h
+index c82d192..9a1ba0e 100644
+--- a/Engine/Source/Gx/Gx.h
++++ b/Engine/Source/Gx/Gx.h
+@@ -122,6 +122,10 @@ void GxTexSetFlags(CGxTex* texId, CGxTexFlags flags);
+ void GxTexSetWrap(CGxTex* texId, EGxTexWrapMode wrapU, EGxTexWrapMode wrapV);
+ void GxSetMaxFPS(uint32_t maxFPS);
+ void GxSetMaxFPSBk(uint32_t maxFPSBk);
++// Not in the original client (World of Legends): precise frame cap, see GxFramePacer.cpp.
++void GxSetMaxFPSPrecise(int32_t enable);
++int32_t GxGetMaxFPSPrecise();
++void GxWaitForFrameRatePrecise(uint32_t maxFps);
+ void GxShaderConstantsSet(EGxShTarget target, uint32_t index, const float* constants, uint32_t count);
+ int32_t GxTexCopy(CGxTex* dest, const C2iVector& destPos, const C2iVector& sourcePos, const C2iVector& size, uint32_t level, uint32_t plane);
+ void GxTexDestroy(CGxTex* texId);
+diff --git a/Engine/Source/Gx/GxFramePacer.cpp b/Engine/Source/Gx/GxFramePacer.cpp
+new file mode 100644
+index 0000000..0c95788
+--- /dev/null
++++ b/Engine/Source/Gx/GxFramePacer.cpp
+@@ -0,0 +1,77 @@
++// Not in the original client (World of Legends): precise frame cap for maxFPS / maxFPSBk, switched on with the CVar
++// wolMaxFPSPrecise (off by default). See patches-cliente/topes-2008/README-topes.md.
++//
++// The original CGxDevice::WaitForFPSCap waits a whole number of milliseconds per frame (1000 / maxFPS, rounded down), so
++// maxFPS 144 caps at ~166 fps and maxFPS 240 at 250. This version keeps a QueryPerformanceCounter cadence, sleeps on a
++// high-resolution waitable timer until about half a millisecond before the deadline and spins the rest.
++
++#include <windows.h>
++#include <cstdint>
++#include "Engine/Source/Gx/Gx.h"
++
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++
++static int32_t s_preciseFpsCap;
++static LARGE_INTEGER s_frequency;
++static int64_t s_nextFrame;
++static HANDLE s_timer;
++static bool s_timerTried;
++
++void GxSetMaxFPSPrecise(int32_t enable) {
++    s_preciseFpsCap = enable ? 1 : 0;
++    s_nextFrame = 0;
++}
++
++int32_t GxGetMaxFPSPrecise() {
++    return s_preciseFpsCap;
++}
++
++void GxWaitForFrameRatePrecise(uint32_t maxFps) {
++    if (!maxFps) {
++        return;
++    }
++
++    if (!s_frequency.QuadPart) {
++        QueryPerformanceFrequency(&s_frequency);
++    }
++
++    if (!s_timerTried) {
++        s_timerTried = true;
++        // Windows 10 1803 and later; without it the wait below falls back to Sleep(0) spinning.
++        s_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++    }
++
++    int64_t frequency = s_frequency.QuadPart;
++    int64_t period = frequency / maxFps;
++
++    LARGE_INTEGER now;
++    QueryPerformanceCounter(&now);
++
++    int64_t remaining = s_nextFrame - now.QuadPart;
++
++    // Late, first frame, or a deadline more than a second away (maxFPS changed): restart the cadence from now.
++    if (remaining <= 0 || remaining > frequency) {
++        s_nextFrame = now.QuadPart + period;
++        return;
++    }
++
++    int64_t spin = frequency / 2000;
++
++    if (remaining > spin && s_timer) {
++        LARGE_INTEGER due;
++        due.QuadPart = -((remaining - spin) * 10000000 / frequency);
++
++        if (SetWaitableTimerEx(s_timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
++            WaitForSingleObject(s_timer, INFINITE);
++        }
++    }
++
++    do {
++        Sleep(0);
++        QueryPerformanceCounter(&now);
++    } while (now.QuadPart < s_nextFrame);
++
++    s_nextFrame += period;
++}
+diff --git a/WoW/Source/ConsoleDevice/ConsoleDevice_CVar.cpp b/WoW/Source/ConsoleDevice/ConsoleDevice_CVar.cpp
+index bde6fed..e7eaa83 100644
+--- a/WoW/Source/ConsoleDevice/ConsoleDevice_CVar.cpp
++++ b/WoW/Source/ConsoleDevice/ConsoleDevice_CVar.cpp
+@@ -61,6 +61,35 @@ static CVar* s_cvGxStereoConvergence;
+ // STATIC: 0x00CABB6C
+ static CVar* s_cvMaxFPSBk;
+ 
++// Not in the original client (World of Legends): see patches-cliente/topes-2008/README-topes.md.
++static CVar* s_cvWolMaxFPSPrecise;
++static CVar* s_cvWolDpiAware;
++static bool s_wolDpiAwareApplied;
++
++// WolDpi.cpp
++bool WolSetProcessDpiAware();
++
++static bool CVWolDpiAwareCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    bool enable = SStrToInt(value) != 0;
++
++    // Only possible before the game window exists: at start-up this runs when the CVar is registered, with the value
++    // from Config.wtf, before the device is created.
++    if (enable && !s_wolDpiAwareApplied && !g_theGxDevicePtr) {
++        s_wolDpiAwareApplied = WolSetProcessDpiAware();
++        GxLog("wolDpiAware: process DPI awareness %s", s_wolDpiAwareApplied ? "set (system aware)" : "could not be set");
++    } else if (enable != s_wolDpiAwareApplied) {
++        ConsoleWrite("wolDpiAware takes effect on restart", DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++static bool CVWolMaxFPSPreciseCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    GxSetMaxFPSPrecise(SStrToInt(value) != 0);
++
++    return true;
++}
++
+ // STATIC: 0x00CABB70
+ static CVar* s_cvGxTripleBuffer;
+ 
+@@ -539,6 +568,9 @@ void RegisterGxCVars() {
+     bool window = s_locale == 4;
+     char value[260];
+ 
++    // Not in the original client: first, so that it applies before the monitor modes are read and the window exists.
++    s_cvWolDpiAware = CVar::Register("wolDpiAware", "Real pixels with Windows display scaling above 100% (0 = original, restart)", 1, "0", CVWolDpiAwareCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++
+     s_cvWidescreen = CVar::Register("widescreen", "Allow widescreen support", 0, "1", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);
+     s_cvGxWindow = CVar::Register("gxWindow", "toggle fullscreen/window", 3, window ? "1" : "0", CVGxWindowCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     s_cvGxMaximize = CVar::Register("gxMaximize", "maximize game window", 3, window ? "1" : "0", CVGxMaximizeCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+@@ -571,6 +603,8 @@ void RegisterGxCVars() {
+     s_cvGxOverride = CVar::Register("gxOverride", "gx overrides", 1, "", CVGxOverrideCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     s_cvMaxFPS = CVar::Register("maxFPS", "Set FPS limit", 1, "200", CVGxMaxFPSCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     s_cvMaxFPSBk = CVar::Register("maxFPSBk", "Set background FPS limit", 1, "30", CVGxMaxFPSBkCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Not in the original client: 1 = precise frame cap for maxFPS / maxFPSBk (0 = original whole-millisecond waits).
++    s_cvWolMaxFPSPrecise = CVar::Register("wolMaxFPSPrecise", "Precise maxFPS / maxFPSBk frame cap (0 = original)", 1, "0", CVWolMaxFPSPreciseCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     s_cvVideoOptionsVersion = CVar::Register("videoOptionsVersion", "Video options version", 3, "0", CVVideoOptionsVersionCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     s_cvWindowResizeLock = CVar::Register("windowResizeLock", "prevent resizing in windowed mode", 1, "0", CVGxWindowResizeLockCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     s_cvFixedFunction = CVar::Register("fixedFunction", "Force fixed function rendering", 3, "0", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);
+diff --git a/WoW/Source/ConsoleDevice/WolDpi.cpp b/WoW/Source/ConsoleDevice/WolDpi.cpp
+new file mode 100644
+index 0000000..db3787a
+--- /dev/null
++++ b/WoW/Source/ConsoleDevice/WolDpi.cpp
+@@ -0,0 +1,28 @@
++// Not in the original client (World of Legends): CVar wolDpiAware, see patches-cliente/topes-2008/README-topes.md.
++//
++// The client has no DPI awareness in its manifest. With Windows display scaling above 100% (the default on most 4K
++// monitors is 150%) Windows shows it a scaled-down desktop (3840x2160 at 150% looks like 2560x1440), so a windowed
++// 3840x2160 falls back to 1600x1200 in ValidateFormatMonitor and a maximized window is rendered small and stretched by
++// the desktop compositor (blurry). Declaring the process system DPI aware before the first window is created makes it
++// see and render the real pixels.
++
++#include <windows.h>
++#include <cstdint>
++
++bool WolSetProcessDpiAware() {
++    typedef BOOL(WINAPI * SetProcessDpiAwarenessContextFn)(HANDLE);
++
++    HMODULE user32 = GetModuleHandleW(L"user32.dll");
++
++    if (user32) {
++        SetProcessDpiAwarenessContextFn setContext = reinterpret_cast<SetProcessDpiAwarenessContextFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
++
++        if (setContext) {
++            // DPI_AWARENESS_CONTEXT_SYSTEM_AWARE (Windows 10 1703 and later).
++            return setContext(reinterpret_cast<HANDLE>(static_cast<intptr_t>(-2))) != FALSE;
++        }
++    }
++
++    // Windows Vista and later.
++    return SetProcessDPIAware() != FALSE;
++}
+diff --git a/WoW/Source/Glue/GlueScriptEvents_Scripts.cpp b/WoW/Source/Glue/GlueScriptEvents_Scripts.cpp
+index e04dd14..fcd6f89 100644
+--- a/WoW/Source/Glue/GlueScriptEvents_Scripts.cpp
++++ b/WoW/Source/Glue/GlueScriptEvents_Scripts.cpp
+@@ -37,6 +37,7 @@
+ #include "WoW/Source/Glue/CharacterSelection.h"
+ #include "WoW/Source/WowServices/BattlenetLogin.h"
+ #include "WoW/Source/WowSvcs/WowSvcsClient/AccountData.h"
++#include "WoW/Source/WorldClient/World.h"
+ 
+ int32_t Script_GetLocale(lua_State* L);
+ int32_t Script_PlayCreditsMusic(lua_State* L);
+@@ -722,7 +723,8 @@ static int32_t Script_GetCVarMax(lua_State* L) {
+     }
+ 
+     if (!SStrCmpI(name, "farclip", STORM_MAX_STR)) {
+-        lua_pushnumber(L, 1277.0);
++        // Not in the original client: scaled by wolFarclipFactor (1.0 by default gives the original 1277).
++        lua_pushnumber(L, 1277.0 * World::s_wolFarClipFactor);
+     } else {
+         lua_pushnil(L);
+     }
+diff --git a/WoW/Source/UIUtil/Camera.cpp b/WoW/Source/UIUtil/Camera.cpp
+index 11ea494..abaf160 100644
+--- a/WoW/Source/UIUtil/Camera.cpp
++++ b/WoW/Source/UIUtil/Camera.cpp
+@@ -170,7 +170,9 @@ C3Vector CGCamera::Up() const {
+ 
+ // VERIFY: 6dc11132 auto
+ // OFFSET: 0x00606B30
+-CGCamera::CGCamera() : CSimpleCamera(World::s_nearClip, World::s_farClip, 1.5707964f) {
++CGCamera::CGCamera() : CSimpleCamera(World::s_nearClip, World::s_farClip, CameraGetBaseFov()) {
++    // Not in the original client: the field of view above was a fixed 1.5707964f (wolFov, 54 degrees vertical by
++    // default, which gives that same value).
+     this->m_model = nullptr;
+     this->m_someTime = OsGetAsyncTimeMs();
+     this->unk_0050 = nullptr;
+@@ -1758,7 +1760,9 @@ int32_t CGCamera::IsViewDefault(uint32_t view) {
+ // OFFSET: 0x005FF3E0
+ void CGCamera::LoadCameraSettings() {
+     float distance = s_cvCameraSavedDistance->m_floatValue;
+-    distance = 0.0f > distance ? 0.0f : (50.0f <= distance ? 50.0f : distance);
++    // Not in the original client: the cap was a fixed 50.0 (wolCameraDistanceMax).
++    float limit = CameraGetDistanceLimit();
++    distance = 0.0f > distance ? 0.0f : (limit <= distance ? limit : distance);
+     this->m_distance = distance;
+     this->m_smoothDistance.m_target = distance;
+ 
+@@ -2020,7 +2024,9 @@ void CGCamera::SetVehicleZoomEnabled(int32_t enabled, float duration, int32_t an
+         }
+     } else {
+         distance = s_cvCameraSavedDistance->m_floatValue;
+-        distance = distance < 0.0f ? 0.0f : (distance >= 50.0f ? 50.0f : distance);
++        // Not in the original client: the cap was a fixed 50.0 (wolCameraDistanceMax). Vehicles keep their 50.
++        float limit = CameraGetDistanceLimit();
++        distance = distance < 0.0f ? 0.0f : (distance >= limit ? limit : distance);
+     }
+ 
+     if (animate && fabsf(distance - this->m_distance) >= 0.001f) {
+@@ -2863,11 +2869,13 @@ void CGCamera::UpdateMotion(uint32_t time) {
+         maxDistance = 50.0f;
+     } else {
+         maxDistance = s_cvCameraDistanceMaxFactor->m_floatValue * s_cvCameraDistanceMax->m_floatValue;
++        // Not in the original client: the cap was a fixed 50.0 (wolCameraDistanceMax, 50 by default).
++        float limit = CameraGetDistanceLimit();
+ 
+         if (maxDistance < 0.0f) {
+             maxDistance = 0.0f;
+-        } else if (50.0f <= maxDistance) {
+-            maxDistance = 50.0f;
++        } else if (limit <= maxDistance) {
++            maxDistance = limit;
+         }
+     }
+ 
+diff --git a/WoW/Source/UIUtil/Camera.h b/WoW/Source/UIUtil/Camera.h
+index 113b307..fde901d 100644
+--- a/WoW/Source/UIUtil/Camera.h
++++ b/WoW/Source/UIUtil/Camera.h
+@@ -320,6 +320,20 @@ extern CVar* s_cvMouseInvertYaw;
+ 
+ void CameraRegisterCVars();
+ 
++// Not in the original client (World of Legends): limits that were hard-coded, now set with the CVars wolCameraDistanceMax
++// and wolFov. The defaults are the original values. See patches-cliente/topes-2008/README-topes.md.
++#define WOL_CAMERA_DISTANCE_DEFAULT 50.0f
++#define WOL_CAMERA_DISTANCE_MAX 150.0f
++#define WOL_FOV_DEFAULT 54.0f
++#define WOL_FOV_MIN 30.0f
++#define WOL_FOV_MAX 90.0f
++extern CVar* s_cvWolCameraDistanceMax;
++extern CVar* s_cvWolFov;
++// Camera zoom-out limit in yards (the original fixed 50.0).
++float CameraGetDistanceLimit();
++// Base value for CSimpleCamera::m_fov of the world camera (the original fixed PI / 2).
++float CameraGetBaseFov();
++
+ void CameraRegisterScriptFunctions();
+ void CameraUnregisterScriptFunctions();
+ 
+diff --git a/WoW/Source/UIUtil/Camera_CVar.cpp b/WoW/Source/UIUtil/Camera_CVar.cpp
+index 97e9c04..7fd0f3f 100644
+--- a/WoW/Source/UIUtil/Camera_CVar.cpp
++++ b/WoW/Source/UIUtil/Camera_CVar.cpp
+@@ -2,6 +2,7 @@
+ #include "Engine/Source/ConsoleBase/IConsole.h"
+ #include "Engine/Source/Storm/H/storm.h"
+ #include "WoW/Source/UIUtil/Camera.h"
++#include "WoW/Source/Ui/WorldFrame.h"
+ 
+ // STATIC: 0x00C24970
+ CVar* s_cvCameraSmoothTimeMax;
+@@ -337,6 +338,59 @@ static const char* s_cameraTerrainTiltStateDefaults[5][10][3] = {
+     },
+ };
+ 
++// Not in the original client (World of Legends): configurable camera limits that were hard-coded in 2008. With the
++// defaults ("50" and "54") the client behaves exactly like the original. See patches-cliente/topes-2008/README-topes.md.
++CVar* s_cvWolCameraDistanceMax;
++CVar* s_cvWolFov;
++
++// The value the callbacks accepted last. CVar callbacks run before the new value is stored, so the CVar itself cannot be
++// read from inside them.
++static float s_wolCameraDistanceLimit = WOL_CAMERA_DISTANCE_DEFAULT;
++static float s_wolFovVertical = WOL_FOV_DEFAULT;
++
++float CameraGetDistanceLimit() {
++    return s_wolCameraDistanceLimit;
++}
++
++float CameraGetBaseFov() {
++    // CSimpleCamera::SetGxProjectionAndView uses FOV() * 0.6 as the vertical field of view, so the original fixed
++    // m_fov of PI / 2 is a 54 degree vertical angle. Computed in double so that 54 gives exactly 1.5707964f again.
++    return static_cast<float>(static_cast<double>(s_wolFovVertical) / 0.6 * (3.14159265358979323846 / 180.0));
++}
++
++static bool ValidateWolCameraDistanceMax(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float distance = SStrToFloat(value);
++
++    if (distance >= WOL_CAMERA_DISTANCE_DEFAULT && distance <= WOL_CAMERA_DISTANCE_MAX) {
++        s_wolCameraDistanceLimit = distance;
++        return true;
++    }
++
++    ConsoleWriteA("Value out of range (%f - %f)\n", DEFAULT_COLOR, static_cast<double>(WOL_CAMERA_DISTANCE_DEFAULT), static_cast<double>(WOL_CAMERA_DISTANCE_MAX));
++    return false;
++}
++
++static bool ValidateWolFov(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float fov = SStrToFloat(value);
++
++    if (fov < WOL_FOV_MIN || fov > WOL_FOV_MAX) {
++        ConsoleWriteA("Value out of range (%f - %f)\n", DEFAULT_COLOR, static_cast<double>(WOL_FOV_MIN), static_cast<double>(WOL_FOV_MAX));
++        return false;
++    }
++
++    s_wolFovVertical = fov;
++
++    // The world camera keeps the angle in m_fov (drunkenness and the telescope add offsets on top of it). A camera
++    // created later picks the value up in its constructor.
++    CGCamera* camera = CGWorldFrame::GetActiveCamera();
++
++    if (camera) {
++        camera->m_fov = CameraGetBaseFov();
++    }
++
++    return true;
++}
++
+ // VERIFY: 53117c38 auto
+ // OFFSET: 0x005FD630
+ static bool ValidateCameraView(CVar* var, const char* oldValue, const char* value, void* arg) {
+@@ -354,12 +408,14 @@ static bool ValidateCameraView(CVar* var, const char* oldValue, const char* valu
+ // OFFSET: 0x005FD680
+ static bool ValidateCameraDistance(CVar* var, const char* oldValue, const char* value, void* arg) {
+     float distance = SStrToFloat(value);
++    // Not in the original client: the upper bound was a fixed 50.0 (wolCameraDistanceMax, 50 by default).
++    float limit = CameraGetDistanceLimit();
+ 
+-    if (distance >= 0.0f && distance <= 50.0f) {
++    if (distance >= 0.0f && distance <= limit) {
+         return true;
+     }
+ 
+-    ConsoleWriteA("Value out of range (%f - %f)\n", DEFAULT_COLOR, 0.0, 50.0);
++    ConsoleWriteA("Value out of range (%f - %f)\n", DEFAULT_COLOR, 0.0, static_cast<double>(limit));
+     return false;
+ }
+ 
+@@ -449,6 +505,11 @@ static bool (*s_cameraViewDataValidators[3])(CVar*, const char*, const char*, vo
+ // VERIFY: f67b59e2 manual
+ // OFFSET: 0x005FD910
+ void CameraRegisterCVars() {
++    // Not in the original client. Registered first: the saved values of cameraDistanceMax and the per-view distances are
++    // validated against wolCameraDistanceMax when they are registered or loaded with the account settings.
++    s_cvWolCameraDistanceMax = CVar::Register("wolCameraDistanceMax", "Camera zoom-out limit in yards (original 50, up to 150)", 0, "50", ValidateWolCameraDistanceMax, CATEGORY_GAME, false, nullptr, false);
++    s_cvWolFov = CVar::Register("wolFov", "Vertical field of view of the world camera in degrees (original 54, 30 to 90)", 0, "54", ValidateWolFov, CATEGORY_GRAPHICS, false, nullptr, false);
++
+     s_cvCameraSavedDistance = CVar::Register("cameraSavedDistance", nullptr, 0x20, s_cameraViewDefaults[SStrToInt(s_defaultCameraView)].m_values[0], nullptr, CATEGORY_DEFAULT, false, nullptr, false);
+     s_cvCameraSavedVehicleDistance = CVar::Register("cameraSavedVehicleDistance", nullptr, 0x20, "-1.0", nullptr, CATEGORY_DEFAULT, false, nullptr, false);
+     s_cvCameraSavedPitch = CVar::Register("cameraSavedPitch", nullptr, 0x20, s_cameraViewDefaults[SStrToInt(s_defaultCameraView)].m_values[1], nullptr, CATEGORY_DEFAULT, false, nullptr, false);
+diff --git a/WoW/Source/Ui/GameUI.cpp b/WoW/Source/Ui/GameUI.cpp
+index 43b1560..81d9d5b 100644
+--- a/WoW/Source/Ui/GameUI.cpp
++++ b/WoW/Source/Ui/GameUI.cpp
+@@ -2231,7 +2231,8 @@ void CGGameUI::HandleDisplaySizeChanged(const CSizeEvent& evt) {
+             scale = CGGameUI::m_aspect * 0.75f;
+         }
+ 
+-        if (scale >= 0.63999999f) {
++        // Not in the original client: the floor was a fixed 0.64 (wolUiScaleMin, 0.64 by default).
++        if (scale >= GameUIGetUiScaleMin()) {
+             CGGameUI::SetUIScale(scale);
+             float aspect = Screen::GetAspectRatio();
+ 
+@@ -3941,9 +3942,11 @@ void CGGameUI::SetSummonRequest(WOWGUID summoner, uint32_t area, uint32_t timeou
+ // VERIFY: ed4947e0 auto
+ // OFFSET: 0x00513240
+ void CGGameUI::SetUIScale(float scale) {
+-    float clamped = 0.64f;
++    // Not in the original client: the floor was a fixed 0.64 (wolUiScaleMin, 0.64 by default).
++    float minScale = GameUIGetUiScaleMin();
++    float clamped = minScale;
+ 
+-    if (scale > 0.64f) {
++    if (scale > minScale) {
+         clamped = scale;
+     }
+ 
+diff --git a/WoW/Source/Ui/GameUI.h b/WoW/Source/Ui/GameUI.h
+index 2f0856c..40060a6 100644
+--- a/WoW/Source/Ui/GameUI.h
++++ b/WoW/Source/Ui/GameUI.h
+@@ -84,6 +84,19 @@ extern CVar* g_taintLogCVar;
+ extern CVar* g_guildMemberNotifyCVar;
+ extern CVar* g_uiScaleCVar;
+ extern CVar* g_useUiScaleCVar;
++
++// Not in the original client (World of Legends): wolUiScaleMin / wolUiScaleMax, see
++// patches-cliente/topes-2008/README-topes.md. The defaults are the original limits.
++#define WOL_UI_SCALE_MIN_DEFAULT 0.64f
++#define WOL_UI_SCALE_MIN_LOWEST 0.2f
++#define WOL_UI_SCALE_MAX_DEFAULT 1.0f
++#define WOL_UI_SCALE_MAX_HIGHEST 2.0f
++extern CVar* g_wolUiScaleMinCVar;
++extern CVar* g_wolUiScaleMaxCVar;
++// Smallest UI scale the client applies (the original fixed 0.64).
++float GameUIGetUiScaleMin();
++// Top of the UI scale slider in the video options (the original 1.0 of FrameXML, returned by GetCVarMax).
++float GameUIGetUiScaleMax();
+ extern CVar* g_rotateMinimapCVar;
+ extern CVar* g_cvAutoInteract;
+ extern CVar* g_autoStandCVar;
+diff --git a/WoW/Source/Ui/GameUI_CVar.cpp b/WoW/Source/Ui/GameUI_CVar.cpp
+index 2b34076..d7908df 100644
+--- a/WoW/Source/Ui/GameUI_CVar.cpp
++++ b/WoW/Source/Ui/GameUI_CVar.cpp
+@@ -1,5 +1,6 @@
+ #include "GameUI.h"
+ #include "Engine/Source/ConsoleBase/ConsoleVar.h"
++#include "Engine/Source/ConsoleBase/IConsole.h"
+ #include "Engine/Source/ConsoleBase/Types.h"
+ #include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
+ #include "Engine/Source/Storm/H/storm.h"
+@@ -180,6 +181,53 @@ CVar* g_useUiScaleCVar;
+ // STATIC: 0x00BD09B4
+ CVar* g_uiScaleCVar;
+ 
++// Not in the original client (World of Legends): see GameUI.h.
++CVar* g_wolUiScaleMinCVar;
++CVar* g_wolUiScaleMaxCVar;
++
++// The values the callbacks accepted last (a callback runs before its CVar stores the new value).
++static float s_wolUiScaleMin = WOL_UI_SCALE_MIN_DEFAULT;
++static float s_wolUiScaleMax = WOL_UI_SCALE_MAX_DEFAULT;
++
++float GameUIGetUiScaleMin() {
++    return s_wolUiScaleMin;
++}
++
++float GameUIGetUiScaleMax() {
++    return s_wolUiScaleMax;
++}
++
++static bool CVarHandler_wolUiScaleMin(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float scale = SStrToFloat(value);
++
++    if (scale < WOL_UI_SCALE_MIN_LOWEST || scale > WOL_UI_SCALE_MIN_DEFAULT) {
++        ConsoleWriteA("Value out of range (%f - %f)\n", DEFAULT_COLOR, static_cast<double>(WOL_UI_SCALE_MIN_LOWEST), static_cast<double>(WOL_UI_SCALE_MIN_DEFAULT));
++        return false;
++    }
++
++    s_wolUiScaleMin = scale;
++
++    // Re-apply uiScale with the new floor (CGGameUI::SetUIScale does nothing before the game UI exists).
++    if (g_uiScaleCVar && g_useUiScaleCVar && g_useUiScaleCVar->m_intValue) {
++        CVarHandler_uiScale(g_uiScaleCVar, g_uiScaleCVar->m_stringValue.m_str, g_uiScaleCVar->m_stringValue.m_str, nullptr);
++    }
++
++    return true;
++}
++
++static bool CVarHandler_wolUiScaleMax(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float scale = SStrToFloat(value);
++
++    if (scale < WOL_UI_SCALE_MAX_DEFAULT || scale > WOL_UI_SCALE_MAX_HIGHEST) {
++        ConsoleWriteA("Value out of range (%f - %f)\n", DEFAULT_COLOR, static_cast<double>(WOL_UI_SCALE_MAX_DEFAULT), static_cast<double>(WOL_UI_SCALE_MAX_HIGHEST));
++        return false;
++    }
++
++    s_wolUiScaleMax = scale;
++
++    return true;
++}
++
+ // STATIC: 0x00BD09B8
+ CVar* g_nameplateShowEnemiesCVar;
+ 
+@@ -665,6 +713,10 @@ void CGGameUI::RegisterGameCVars() {
+ // VERIFY: d0dc1b08 auto
+ // OFFSET: 0x005238A0
+ void CGGameUI::Initialize() {
++    // Not in the original client. Registered first: the saved uiScale is applied (and clamped) when uiScale is
++    // registered just below.
++    g_wolUiScaleMinCVar = CVar::Register("wolUiScaleMin", "Smallest UI scale (original 0.64, down to 0.2)", 0, "0.64", CVarHandler_wolUiScaleMin, 4, false, nullptr, false);
++    g_wolUiScaleMaxCVar = CVar::Register("wolUiScaleMax", "Top of the UI scale slider (original 1.0, up to 2.0)", 0, "1.0", CVarHandler_wolUiScaleMax, 4, false, nullptr, false);
+     g_uiScaleCVar = CVar::Register("uiScale", "The current UI scale", 0, "1.0", CVarHandler_uiScale, 4, false, nullptr, false);
+     g_useUiScaleCVar = CVar::Register("useUiScale", "Whether or not the UI scale should be used", 0, "0", CVarHandler_useUiScale, 4, false, nullptr, false);
+ }
+diff --git a/WoW/Source/Ui/GameUI_Scripts.cpp b/WoW/Source/Ui/GameUI_Scripts.cpp
+index 76a84d4..225cf09 100644
+--- a/WoW/Source/Ui/GameUI_Scripts.cpp
++++ b/WoW/Source/Ui/GameUI_Scripts.cpp
+@@ -1797,6 +1797,10 @@ static int32_t Script_GetCVarMin(lua_State* L) {
+         lua_pushnumber(L, 0.0);
+     } else if (!SStrCmpI(name, "farclip", STORM_MAX_STR)) {
+         lua_pushnumber(L, 177.0);
++    } else if (!SStrCmpI(name, "uiScale", STORM_MAX_STR) && GameUIGetUiScaleMin() != WOL_UI_SCALE_MIN_DEFAULT) {
++        // Not in the original client: the options panels take a slider's range from GetCVarMin / GetCVarMax when they
++        // return a number. Returned only when wolUiScaleMin is set, so the default is the original nil.
++        lua_pushnumber(L, GameUIGetUiScaleMin());
+     } else {
+         lua_pushnil(L);
+     }
+@@ -1835,7 +1839,21 @@ static int32_t Script_GetCVarMax(lua_State* L) {
+ 
+         lua_pushnumber(L, mode - 1);
+     } else if (!SStrCmpI(name, "farclip", STORM_MAX_STR)) {
+-        lua_pushnumber(L, 1277.0);
++        // Not in the original client: scaled by wolFarclipFactor (1.0 by default gives the original 1277).
++        lua_pushnumber(L, 1277.0 * World::s_wolFarClipFactor);
++    } else if (!SStrCmpI(name, "groundEffectDist", STORM_MAX_STR) && World::s_wolFarClipFactor > 1.0f) {
++        // Not in the original client (this and the cases below): slider tops for the World of Legends limits, returned
++        // only when they differ from the original ones, so the default stays the original nil.
++        lua_pushnumber(L, 140.0 * World::s_wolFarClipFactor);
++    } else if (!SStrCmpI(name, "environmentDetail", STORM_MAX_STR) && World::s_wolFarClipFactor > 1.0f) {
++        lua_pushnumber(L, 1.5 * World::s_wolFarClipFactor);
++    } else if (!SStrCmpI(name, "cameraDistanceMaxFactor", STORM_MAX_STR) && CameraGetDistanceLimit() != WOL_CAMERA_DISTANCE_DEFAULT && s_cvCameraDistanceMax->m_floatValue > 1.0f) {
++        // The Max Camera Distance slider moves cameraDistanceMaxFactor (1 - 2 in FrameXML); its top now reaches
++        // wolCameraDistanceMax yards.
++        float top = CameraGetDistanceLimit() / s_cvCameraDistanceMax->m_floatValue;
++        lua_pushnumber(L, top > 2.0f ? top : 2.0f);
++    } else if (!SStrCmpI(name, "uiScale", STORM_MAX_STR) && GameUIGetUiScaleMax() != WOL_UI_SCALE_MAX_DEFAULT) {
++        lua_pushnumber(L, GameUIGetUiScaleMax());
+     } else {
+         lua_pushnil(L);
+     }
+diff --git a/WoW/Source/WorldClient/DayNight.cpp b/WoW/Source/WorldClient/DayNight.cpp
+index b2509e6..552bacc 100644
+--- a/WoW/Source/WorldClient/DayNight.cpp
++++ b/WoW/Source/WorldClient/DayNight.cpp
+@@ -2130,8 +2130,13 @@ void DayNight::UpdateFog() {
+         info.m_fog.m_start = end * s_overrideFogStart;
+         info.m_fog.m_density = s_overrideFogRate;
+     } else {
+-        if (info.m_bands.m_fogEnd < end) {
+-            end = info.m_bands.m_fogEnd;
++        // Not in the original client: the zone fog distance is scaled by wolFarclipFactor (1.0 by default), so a longer
++        // far clip also shows more land where the fog ends at the zone's distance (Light.dbc, ~390 yards median; the
++        // old continents) instead of at the far clip. The fog keeps its shape: the start is a fraction of the end.
++        float zoneEnd = info.m_bands.m_fogEnd * World::s_wolFarClipFactor;
++
++        if (zoneEnd < end) {
++            end = zoneEnd;
+         }
+ 
+         info.m_fog.m_end = end;
+diff --git a/WoW/Source/WorldClient/SortTable.cpp b/WoW/Source/WorldClient/SortTable.cpp
+index 4ff63d6..994b1dd 100644
+--- a/WoW/Source/WorldClient/SortTable.cpp
++++ b/WoW/Source/WorldClient/SortTable.cpp
+@@ -1 +1,19 @@
+ #include "SortTable.h"
++
++// Not in the original client (wolFarclipFactor): see SortTable.h.
++int32_t CSortTable::s_bucketCount = 64;
++
++int32_t CSortTable::BucketCountForFarClip(float farClip) {
++    // Far clip in buckets plus a margin for object bounds; never fewer than the original 64.
++    int32_t count = static_cast<int32_t>(farClip * 0.03f) + 8;
++
++    if (count < 64) {
++        return 64;
++    }
++
++    if (count > SORT_TABLE_MAX_BUCKETS) {
++        return SORT_TABLE_MAX_BUCKETS;
++    }
++
++    return count;
++}
+diff --git a/WoW/Source/WorldClient/SortTable.h b/WoW/Source/WorldClient/SortTable.h
+index 33ddd12..28891fe 100644
+--- a/WoW/Source/WorldClient/SortTable.h
++++ b/WoW/Source/WorldClient/SortTable.h
+@@ -12,10 +12,16 @@
+ 
+ class CDetailDoodadInst;
+ 
++// Not in the original client (World of Legends, wolFarclipFactor): the table had 64 buckets of 33.3 yards, which covers
++// 2133 yards, enough for the original 1583-yard far clip cap and nothing beyond. It now has room for 160 buckets
++// (5333 yards) and uses s_bucketCount of them: 64 unless the far clip goes past ~1900 yards, so the original
++// behaviour is unchanged. The struct offsets below are the original 32-bit ones (64 buckets).
++#define SORT_TABLE_MAX_BUCKETS 160
++
+ class CSortTable {
+     public:
+-    /* 0000 */ CSortEntry m_table [64];
+-    /* 1B00 */ C4Vector m_bucketPlanes [64];
++    /* 0000 */ CSortEntry m_table [SORT_TABLE_MAX_BUCKETS];
++    /* 1B00 */ C4Vector m_bucketPlanes [SORT_TABLE_MAX_BUCKETS];
+     /* 1F00 */ TSList<CMapObjDefGroup, TSGetExplicitLink<CMapObjDefGroup> > m_pendingExteriorGroupList;
+     /* 1F0C */ TSList<CDetailDoodadInst, TSGetExplicitLink<CDetailDoodadInst> > m_detailDoodadInstList;
+     /* 1F18 */ TSExplicitList<CMapRenderChunk, offsetof(CMapRenderChunk, m_renderChunkLink)> m_renderChunkList [24];
+@@ -30,6 +36,10 @@ class CSortTable {
+     CSortTable();
+     void Clear();
+     void BuildPlanes(const C3Vector& dir, const C3Vector& origin);
++
++    // Not in the original client: number of buckets in use this frame (64 in the original).
++    static int32_t s_bucketCount;
++    static int32_t BucketCountForFarClip(float farClip);
+ };
+ 
+ #endif
+diff --git a/WoW/Source/WorldClient/World.cpp b/WoW/Source/WorldClient/World.cpp
+index e0ff5fd..273b24c 100644
+--- a/WoW/Source/WorldClient/World.cpp
++++ b/WoW/Source/WorldClient/World.cpp
+@@ -301,6 +301,9 @@ float World::s_prevFarClip;
+ // STATIC: 0x00CD7748
+ float World::s_farClip;
+ 
++// Not in the original client: set by the wolFarclipFactor callback (CWorldParam::WolFarClipFactorCallback).
++float World::s_wolFarClipFactor = 1.0f;
++
+ // STATIC: 0x00ADEEE0
+ int32_t World::s_texCacheDirty = 1;
+ 
+@@ -727,6 +730,11 @@ void CWorld::UpdateTextureCacheBudget() {
+         megabytes = farClip <= 177 ? 16 : 32;
+     } else {
+         megabytes = farClip <= 727 ? 64 : 128;
++
++        // Not in the original client: a far clip past the original 1583 yards (wolFarclipFactor) gets a bigger budget.
++        if (farClip > 1600) {
++            megabytes = 256;
++        }
+     }
+ 
+     g_theGxDevicePtr->TexSetCacheSize(megabytes << 20);
+@@ -1327,6 +1335,9 @@ float World::ValidateFarClip(float farClip, int32_t mapID) {
+         maxFarClip = 2375.0f / 3.0f;
+     }
+ 
++    // Not in the original client: wolFarclipFactor (1.0 by default) scales the cap.
++    maxFarClip *= World::s_wolFarClipFactor;
++
+     if (farClip < 550.0f / 3.0f) {
+         return 550.0f / 3.0f;
+     }
+@@ -1865,7 +1876,8 @@ void CWorldScene::GetNearestCornerToCamera(CAaBox* box, C3Vector* outCorner) {
+ void CSortTable::BuildPlanes(const C3Vector& dir, const C3Vector& origin) {
+     float dist = 0.0f;
+ 
+-    for (uint32_t i = 0; i < 64; i++) {
++    // Not in the original client: 64 buckets; now every bucket of the enlarged table (cheap, and always valid).
++    for (uint32_t i = 0; i < SORT_TABLE_MAX_BUCKETS; i++) {
+         C3Vector point(dir.x * dist + origin.x, dist * dir.y + origin.y, dist * dir.z + origin.z);
+         this->m_bucketPlanes[i].x = dir.x;
+         this->m_bucketPlanes[i].y = dir.y;
+@@ -2211,7 +2223,7 @@ void CWorldScene::AddMapObjDefGroup(CMapObjDef* mapObjDef, CMapObjDefGroup* mapO
+     if (dist > 0.0f) {
+         bucket = CMath::fint_(dist * 0.03f - 0.5f);
+ 
+-        if (bucket >= 64) {
++        if (bucket >= CSortTable::s_bucketCount) {
+             return;
+         }
+     }
+@@ -2239,7 +2251,7 @@ void CWorldScene::ComputeExteriorSortDistances() {
+         if (dist > 0.0f) {
+             bucket = CMath::fint_(dist * 0.03f - 0.5f);
+ 
+-            if (bucket >= 64) {
++            if (bucket >= CSortTable::s_bucketCount) {
+                 return;
+             }
+         }
+@@ -2255,7 +2267,7 @@ void CWorldScene::AddMapChunkToRenderList(CMapChunk* mapChunk, C3Vector* pos) {
+     int32_t bucket = 0;
+     float distance = pos->y * CWorldScene::camPlaneXY.n.y + pos->z * CWorldScene::camPlaneXY.n.z + pos->x * CWorldScene::camPlaneXY.n.x + CWorldScene::camPlaneXY.d;
+ 
+-    if (distance <= 0.0f || (bucket = CMath::fint_(distance * 0.029999999f - 0.5f)) < 64) {
++    if (distance <= 0.0f || (bucket = CMath::fint_(distance * 0.029999999f - 0.5f)) < CSortTable::s_bucketCount) {
+         CWorldScene::sortTable.m_table[bucket].m_mapChunkList.LinkToTail(mapChunk);
+     }
+ }
+@@ -2270,7 +2282,7 @@ void CWorldScene::AddToDistanceBucket(CChunkLiquid* liquid, const C3Vector& pos)
+         float scaled = distance * 0.03f;
+         bucket = CMath::fint_(scaled - 0.5f);
+ 
+-        if (bucket >= 64) {
++        if (bucket >= CSortTable::s_bucketCount) {
+             return;
+         }
+     }
+@@ -2736,7 +2748,8 @@ void CWorldScene::PrepareLiquidInstances() {
+ // VERIFY: 065faca9 manual
+ // OFFSET: 0x00794250
+ void CSortTable::Clear() {
+-    for (uint32_t i = 0; i < 64; i++) {
++    // Not in the original client: 64 buckets; now every bucket of the enlarged table, whatever s_bucketCount is now.
++    for (uint32_t i = 0; i < SORT_TABLE_MAX_BUCKETS; i++) {
+         CSortEntry& entry = this->m_table[i];
+         entry.m_mapChunkList.UnlinkAll();
+ 
+@@ -2804,6 +2817,10 @@ void CWorldScene::Update(C3Vector* camPos, C3Vector* camTarget) {
+         CWorldScene::s_lodFarClip = 400.0f;
+     }
+ 
++    // Not in the original client: the sort table always had 64 buckets of 33.3 yards (2133 yards). Decided once per
++    // frame, before anything is sorted into it this frame.
++    CSortTable::s_bucketCount = CSortTable::BucketCountForFarClip(World::s_farClip);
++
+     C3Vector dirXY(CWorldScene::camVec.x, CWorldScene::camVec.y, 0.0f);
+     float lenSqXY = dirXY.y * dirXY.y + dirXY.x * dirXY.x;
+ 
+@@ -3837,7 +3854,7 @@ void CWorldScene::AddDoodadDefs(TSList<CMapBaseObjLink, TSGetExplicitLink<CMapBa
+         if (dist > 0.0f) {
+             bucket = CMath::fint_(dist * 0.03f - 0.5f);
+ 
+-            if (bucket >= 64) {
++            if (bucket >= static_cast<uint32_t>(CSortTable::s_bucketCount)) {
+                 continue;
+             }
+ 
+@@ -3958,7 +3975,8 @@ void CWorldScene::CullDoodadsInterior(TSList<CMapBaseObjLink, TSGetExplicitLink<
+ // OFFSET: 0x00799D40
+ void CWorldScene::CullChunks(CSortEntry* entry, uint32_t index) {
+     C3Vector corner(0.0f, 0.0f, 0.0f);
+-    int32_t occlude = (CWorld::enables & Enable_Culling) && index < 63;
++    // Not in the original client: the last bucket was a fixed 63 (CSortTable::s_bucketCount - 1).
++    int32_t occlude = (CWorld::enables & Enable_Culling) && index < static_cast<uint32_t>(CSortTable::s_bucketCount - 1);
+ 
+     CMapChunk* chunk = entry->m_mapChunkList.Head();
+ 
+@@ -3998,7 +4016,7 @@ void CWorldScene::CullChunks(CSortEntry* entry, uint32_t index) {
+                         int32_t bucket = 0;
+                         float distance = CWorldScene::DistanceToCamPlaneXY(&corner);
+ 
+-                        if (distance <= 0.0f || (bucket = CMath::fint_(distance * 0.029999999f - 0.5f)) < 64) {
++                        if (distance <= 0.0f || (bucket = CMath::fint_(distance * 0.029999999f - 0.5f)) < CSortTable::s_bucketCount) {
+                             CWorldScene::sortTable.m_table[bucket].m_holedChunkList.LinkToTail(chunk);
+                         }
+                     }
+@@ -4092,7 +4110,8 @@ void CWorldScene::CullMapObjDefGroup() {
+ // VERIFY: ce664a92 manual
+ // OFFSET: 0x0079A320
+ CSortTable::CSortTable() {
+-    for (uint32_t i = 0; i < 64; i++) {
++    // Not in the original client: 64 buckets (SORT_TABLE_MAX_BUCKETS now).
++    for (uint32_t i = 0; i < SORT_TABLE_MAX_BUCKETS; i++) {
+         this->m_bucketPlanes[i].x = 0.0f;
+         this->m_bucketPlanes[i].w = 0.0f;
+         this->m_bucketPlanes[i].y = 0.0f;
+@@ -4120,7 +4139,8 @@ void CWorldScene::CullSortTable(CRect* rect) {
+ 
+     CSortEntry* entry = CWorldScene::sortTable.m_table;
+ 
+-    for (uint32_t i = 0; i < 64; i++) {
++    // Not in the original client: a fixed 64 buckets (CSortTable::s_bucketCount, 64 unless the far clip is past ~1900).
++    for (uint32_t i = 0; i < static_cast<uint32_t>(CSortTable::s_bucketCount); i++) {
+         CWorldScene::CullChunks(entry, i);
+         CWorldScene::CullMapObjDefGroups(entry, rect, i);
+         CWorldScene::CullLiquid(entry);
+@@ -4269,7 +4289,7 @@ void CWorldScene::AddEntityToSortTable(CMapEntity* entity) {
+     if (distance > 0.0f) {
+         bucket = static_cast<int32_t>(distance * 0.029999999f);
+ 
+-        if (bucket >= 64) {
++        if (bucket >= CSortTable::s_bucketCount) {
+             return;
+         }
+     }
+diff --git a/WoW/Source/WorldClient/World.h b/WoW/Source/WorldClient/World.h
+index 01c2785..8cd2089 100644
+--- a/WoW/Source/WorldClient/World.h
++++ b/WoW/Source/WorldClient/World.h
+@@ -452,6 +452,9 @@ void SetFrameCntCallback(void (*callback)());
+ extern int32_t lodMin;
+ extern C44Matrix idMat;
+ extern float s_farClip;
++// Not in the original client (World of Legends): CVar wolFarclipFactor, 1.0 (original limits) to 3.0. Scales the far
++// clip cap and the limits that go with it. See patches-cliente/topes-2008/README-topes.md.
++extern float s_wolFarClipFactor;
+ extern float s_horizonFarClipScale;
+ extern float s_horizonNearClipScale;
+ extern int32_t s_detailDoodadDensity;
+diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
+index 39ba9db..4aa224e 100644
+--- a/WoW/Source/WorldClient/WorldParam.h
++++ b/WoW/Source/WorldClient/WorldParam.h
+@@ -38,6 +38,8 @@ class CWorldParam {
+     static CVar* cvar_extShadowQuality;
+     static CVar* cvar_projectedTextures;
+     static CVar* cvar_gxTextureCacheSize;
++    // Not in the original client (World of Legends): see patches-cliente/topes-2008/README-topes.md.
++    static CVar* cvar_wolFarClipFactor;
+ 
+     static bool BaseMipCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool BspCacheCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+@@ -73,6 +75,8 @@ class CWorldParam {
+     static bool SpecularCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool TerrainAlphaBitDepthCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool TexLodBiasCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    // Not in the original client.
++    static bool WolFarClipFactorCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool TextureFilteringCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WaterLodCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WorldPoolUsageCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index c29a8be..98a33ea 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -109,6 +109,58 @@ CVar* CWorldParam::cvar_projectedTextures;
+ // STATIC: 0x00CD85E4
+ CVar* CWorldParam::cvar_gxTextureCacheSize;
+ 
++// Not in the original client (World of Legends): wolFarclipFactor, see patches-cliente/topes-2008/README-topes.md.
++CVar* CWorldParam::cvar_wolFarClipFactor;
++
++#define WOL_FARCLIP_FACTOR_MAX 3.0f
++
++static float ClampEnvironmentDetail(float detail) {
++    // Original range 0.5 - 1.5; the top scales with wolFarclipFactor (1.0 by default).
++    float maxDetail = 1.5f * World::s_wolFarClipFactor;
++
++    if (detail < 0.5f) {
++        detail = 0.5f;
++    } else if (detail > maxDetail) {
++        detail = maxDetail;
++    }
++
++    return detail;
++}
++
++// Not in the original client. Scales the far clip cap (1583 yards, 791 in the old continents without
++// farClipOverride), the in-game View Distance / Ground Clutter Radius / Environment Detail limits, the fade distance of
++// the biggest objects, the zone fog distance and the sort table. Re-applies the CVars that depend on it.
++bool CWorldParam::WolFarClipFactorCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float factor = SStrToFloat(value);
++
++    if (factor < 1.0f || factor > WOL_FARCLIP_FACTOR_MAX) {
++        char buffer[256];
++        SStrPrintf(buffer, sizeof(buffer), "wolFarclipFactor must be in range 1.0 to %.1f.", static_cast<double>(WOL_FARCLIP_FACTOR_MAX));
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++
++        return false;
++    }
++
++    World::s_wolFarClipFactor = factor;
++
++    // The CVars below are registered after this one; at start-up they are still null here.
++    if (CWorldParam::cvar_farClip) {
++        World::SetFarClip(CWorldParam::cvar_farClip->m_floatValue);
++    }
++
++    if (CWorldParam::cvar_environmentDetail) {
++        CWorldScene::ScaleFadeDist(ClampEnvironmentDetail(CWorldParam::cvar_environmentDetail->m_floatValue));
++    }
++
++    if (CWorldParam::cvar_groundEffectDist) {
++        float dist = CWorldParam::cvar_groundEffectDist->m_floatValue;
++        float maxDist = 140.0f * factor;
++        World::SetDetailDoodadDist(dist > maxDist ? maxDist : dist);
++    }
++
++    return true;
++}
++
+ // VERIFY: 54f5415a manual
+ // OFFSET: 0x004023C0
+ bool CWorldParam::TextureFilteringCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
+@@ -376,10 +428,12 @@ bool CWorldParam::GroundEffectDensityCallback(CVar* var, const char* oldValue, c
+ // OFFSET: 0x0078DB10
+ bool CWorldParam::GroundEffectDistCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
+     float dist = SStrToFloat(value);
++    // Not in the original client: the top was a fixed 140.0 (scaled by wolFarclipFactor, 1.0 by default).
++    float maxDist = 140.0f * World::s_wolFarClipFactor;
+ 
+-    if (dist < 0.0f || dist > 140.0f) {
++    if (dist < 0.0f || dist > maxDist) {
+         char buffer[256];
+-        sprintf(buffer, "Ground effect distance must be in range %0f to %0f.", 0.0, 140.0);
++        sprintf(buffer, "Ground effect distance must be in range %0f to %0f.", 0.0, static_cast<double>(maxDist));
+         ConsoleWriteA(buffer, DEFAULT_COLOR);
+ 
+         return false;
+@@ -433,13 +487,9 @@ bool CWorldParam::FarClipOverrideCallback(CVar* var, const char* oldValue, const
+ // VERIFY: 82f0dd4a auto
+ // OFFSET: 0x0078DC60
+ bool CWorldParam::EnvironmentDetailCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
+-    float detail = SStrToFloat(value);
+-
+-    if (detail < 0.5f) {
+-        detail = 0.5f;
+-    } else if (detail > 1.5f) {
+-        detail = 1.5f;
+-    }
++    // Not in the original client: the clamp to 0.5 - 1.5 is in ClampEnvironmentDetail, whose top scales with
++    // wolFarclipFactor (1.0 by default).
++    float detail = ClampEnvironmentDetail(SStrToFloat(value));
+ 
+     CWorldScene::ScaleFadeDist(detail);
+ 
+@@ -622,6 +672,9 @@ bool CWorldParam::GxTextureCacheSizeCallback(CVar* var, const char* oldValue, co
+ // VERIFY: 9acf82a1 auto
+ // OFFSET: 0x0078E400
+ void CWorldParam::Initialize() {
++    // Not in the original client. Registered first so that the saved farclip, groundEffectDist and environmentDetail
++    // values above the original limits are accepted when those CVars are registered below.
++    CWorldParam::cvar_wolFarClipFactor = CVar::Register("wolFarclipFactor", "Scales the view distance limits (1.0 original, up to 3.0)", 1, "1.0", CWorldParam::WolFarClipFactorCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_farClipOverride = CVar::Register("farClipOverride", "Override old world graphic settings", 1, "0", CWorldParam::FarClipOverrideCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_lod = CVar::Register("lod", "Video option: Toggle Lod", 1, "0", CWorldParam::LodCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_mapShadows = CVar::Register("mapShadows", "Video option: Toggle map shadows", 1, "1", CWorldParam::MapShadowsCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+diff --git a/WoW/Source/WorldClient/WorldScene.cpp b/WoW/Source/WorldClient/WorldScene.cpp
+index 0ddf757..f9b9ba5 100644
+--- a/WoW/Source/WorldClient/WorldScene.cpp
++++ b/WoW/Source/WorldClient/WorldScene.cpp
+@@ -161,7 +161,9 @@ void CWorldScene::ScaleFadeDist(float scale) {
+     CWorldScene::s_fadeDistMinSqr[3] = CWorldScene::s_fadeDistMin[3] * CWorldScene::s_fadeDistMin[3];
+ 
+     CWorldView::s_fadeSize[4] = CWorldScene::s_fadeSizeDefault[4];
+-    CWorldScene::s_fadeDist[4] = CWorldScene::s_fadeDistDefault[4];
++    // Not in the original client: the biggest objects always faded out at 1250 yards; scaled by wolFarclipFactor
++    // (1.0 by default) so they do not vanish inside a far clip longer than the original one.
++    CWorldScene::s_fadeDist[4] = CWorldScene::s_fadeDistDefault[4] * World::s_wolFarClipFactor;
+     CWorldScene::s_fadeDistMin[4] = CWorldScene::s_fadeDist[4] - CWorldScene::s_fadeRangeDefault[4];
+     CWorldView::s_fadeDistSqr[4] = CWorldScene::s_fadeDist[4] * CWorldScene::s_fadeDist[4];
+     CWorldScene::s_fadeDistMinSqr[4] = CWorldScene::s_fadeDistMin[4] * CWorldScene::s_fadeDistMin[4];
+diff --git a/WoW/Source/WorldClient/WorldView.cpp b/WoW/Source/WorldClient/WorldView.cpp
+index eb131e2..8b24cd9 100644
+--- a/WoW/Source/WorldClient/WorldView.cpp
++++ b/WoW/Source/WorldClient/WorldView.cpp
+@@ -56,7 +56,8 @@ void CWorldView::AddOccluder(const C3Vector& a, const C3Vector& b) {
+     int32_t bucketA = CMath::fint_(distA * 0.029999999f - 0.5f);
+     int32_t bucketB = CMath::fint_(distB * 0.029999999f - 0.5f);
+ 
+-    if (bucketA >= 64 && bucketB >= 64) {
++    // Not in the original client: a fixed 64 buckets (CSortTable::s_bucketCount).
++    if (bucketA >= CSortTable::s_bucketCount && bucketB >= CSortTable::s_bucketCount) {
+         return;
+     }
+ 
+@@ -87,8 +88,8 @@ void CWorldView::AddOccluder(const C3Vector& a, const C3Vector& b) {
+             first = 0;
+         }
+ 
+-        if (last >= 64) {
+-            last = 63;
++        if (last >= CSortTable::s_bucketCount) {
++            last = CSortTable::s_bucketCount - 1;
+         }
+ 
+         if (first < last) {

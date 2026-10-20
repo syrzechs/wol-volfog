@@ -1,0 +1,19 @@
+﻿diff --git a/Tools/WowClient/crash_log.cpp b/Tools/WowClient/crash_log.cpp
+index d0483fa..3522038 100644
+--- a/Tools/WowClient/crash_log.cpp
++++ b/Tools/WowClient/crash_log.cpp
+@@ -140,10 +140,14 @@ static struct CrashLogInit {
+         DeleteFileA(s_logPath);
+         s_logFile = CreateFileA(s_logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+ 
++        // Not in the original client (World of Legends): sin ventana de consola; el registro de cierres sigue en
++        // WowClient_crash.log. Define WOWCLIENT_CRASH_CONSOLE para recuperar la consola de depuracion.
++#ifdef WOWCLIENT_CRASH_CONSOLE
+         if (AllocConsole()) {
+             SetConsoleTitleA("WowClient");
+             s_console = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+         }
++#endif
+ 
+         AddVectoredExceptionHandler(1, FirstChanceHandler);
+         _CrtSetReportHook(CrtReportHook);

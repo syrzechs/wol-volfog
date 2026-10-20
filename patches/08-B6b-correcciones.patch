@@ -1,0 +1,199 @@
+diff --git a/Engine/Source/VolFog/VolFog.cpp b/Engine/Source/VolFog/VolFog.cpp
+index a5ba711..478430e 100644
+--- a/Engine/Source/VolFog/VolFog.cpp
++++ b/Engine/Source/VolFog/VolFog.cpp
+@@ -37,7 +37,7 @@ namespace {
+ }
+ 
+ bool VolFog::Armed() {
+-    return VolFog::s_mode > 0 && VolFog::s_caps.intz && VolFog::s_caps.ps30Slots >= 1024 && VolFog::DepthTexture() != nullptr && !s_hardFailure && s_lastFrameOk && !s_inLiquid && (VolFog::s_debugMode == 0 || (VolFog::s_debugMode >= 2 && VolFog::s_debugMode <= 4));
++    return VolFog::s_mode > 0 && VolFog::s_caps.intz && VolFog::s_caps.ps30Slots >= VolFog::kMinPs30Slots && VolFog::DepthTexture() != nullptr && !s_hardFailure && s_lastFrameOk && !s_inLiquid && (VolFog::s_debugMode == 0 || (VolFog::s_debugMode >= 2 && VolFog::s_debugMode <= 4));
+ }
+ 
+ void VolFog::SetFrameResult(bool ok, bool inLiquid) {
+diff --git a/Engine/Source/VolFog/VolFog.h b/Engine/Source/VolFog/VolFog.h
+index ce6e36d..49aeebf 100644
+--- a/Engine/Source/VolFog/VolFog.h
++++ b/Engine/Source/VolFog/VolFog.h
+@@ -23,6 +23,10 @@ namespace VolFog {
+ 
+     extern Caps s_caps;
+ 
++    // Brief B6b: the smallest MaxPixelShader30InstructionSlots the pass accepts. The longest shader is WolVolFogComposite with local lights
++    // (1628 slots, fxc), and a card that declares between 1024 and 1627 would fail CreatePixelShader with a message that blames patch-Z.MPQ.
++    constexpr uint32_t kMinPs30Slots = 2048;
++
+     // Brief B2: wolVolFogDebug, set by the CVar in WorldParam_CVar.cpp. 0 = off, 1 depth in grey, 2 raw march buffer (was a magenta tint in B2),
+     // 3 filtered history (brief B7; was the test grid), 4 normal image without the temporal filter (B7; the beam mask comes with B9),
+     // 5 test grid (moved here from 3 in B7). B3 and later add the real wolVolFog CVar next to it.
+@@ -91,7 +95,7 @@ namespace VolFog {
+     void RunPendingDump();
+ 
+     // Brief B6: the fog is "armed" when the pass is going to draw the fog of the world this frame, so the client's own linear fog has to be
+-    // pushed out of range (DayNight::UpdateFog, design 1.3): wolVolFog > 0, the caps allow it (INTZ, at least 1024 pixel shader slots), the
++    // pushed out of range (DayNight::UpdateFog, design 1.3): wolVolFog > 0, the caps allow it (INTZ, at least kMinPs30Slots pixel shader slots), the
+     // INTZ depth exists, the pass has not failed for good (shaders, targets), the view is not underwater, wolVolFogDebug is not showing
+     // another view, and the last frame that ran drew without error. If a frame fails, Armed() is false from the next frame on and the
+     // client goes back to its linear fog; the world is never left without fog for more than that one frame.
+diff --git a/Engine/Source/VolFog/VolFogInputs.h b/Engine/Source/VolFog/VolFogInputs.h
+index b05bcf3..07a3f28 100644
+--- a/Engine/Source/VolFog/VolFogInputs.h
++++ b/Engine/Source/VolFog/VolFogInputs.h
+@@ -38,14 +38,14 @@ namespace VolFog {
+         float camTarget[3];             // the camera target (DNInfo.m_lightRefPos: the followed unit, or the camera itself)
+         Viewport viewport;
+         float dayFraction;              // DNInfo.m_dayProgression 0..1 (0.5 = noon)
+-        float toLight[3];               // unit vector to the light that scatters: -DNInfo.m_light1.m_dir
++        float toLight[3];               // unit vector to the light that scatters: the visible sun or moon (= toRaySource, brief B6b)
+         bool lightIsMoon;               // the sun is below the horizon
+-        uint32_t fogColor;              // A8R8G8B8, DNInfo.m_fogInterior.m_color (= m_fog.m_color outside; blended inside a WMO)
++        uint32_t fogColor;              // A8R8G8B8, DayNight::s_volFogSourceFog.m_color (= m_fogInterior before UpdateFog pushes it out of range)
+         uint32_t sunColor;              // DNInfo.m_bands.m_sunCloudColors[0]
+         uint32_t directColor;           // DNInfo.m_bands.m_diffuse (SetLightColors: m_light1.m_diffuse)
+         uint32_t ambientColor;          // DNInfo.m_bands.m_ambient (SetLightColors: m_light1.m_ambient)
+-        float fogStart;                 // DNInfo.m_fogInterior.m_start after UpdateFog
+-        float fogEnd;                   // DNInfo.m_fogInterior.m_end after UpdateFog
++        float fogStart;                 // DayNight::s_volFogSourceFog.m_start (brief B6b)
++        float fogEnd;                   // DayNight::s_volFogSourceFog.m_end (brief B6b)
+         float zoneFogDistance;          // DNInfo.m_bands.m_fogEnd (Light.dbc, before the far clip and the wolFarclipFactor)
+         float farClip;                  // DNInfo.m_farClip = camera far plane
+         float clientGlowAmount;         // DNInfo.m_bands.m_glow, only while ffxGlow is the active screen effect (0 otherwise, 0 in liquid)
+diff --git a/Engine/Source/VolFog/VolFogRender.cpp b/Engine/Source/VolFog/VolFogRender.cpp
+index 4e57f4f..9851a66 100644
+--- a/Engine/Source/VolFog/VolFogRender.cpp
++++ b/Engine/Source/VolFog/VolFogRender.cpp
+@@ -606,10 +606,10 @@ namespace {
+             return FogTransient;
+         }
+ 
+-        if (VolFog::s_caps.ps30Slots < 1024 || !g_theGxDevicePtr->Caps().m_texTarget[GxTex_NonPow2]) {
++        if (VolFog::s_caps.ps30Slots < VolFog::kMinPs30Slots || !g_theGxDevicePtr->Caps().m_texTarget[GxTex_NonPow2]) {
+             if (!s_fog.hardMessage) {
+                 s_fog.hardMessage = true;
+-                Say("wolVolFog: this video card cannot run the fog (it needs a ps_3_0 with at least 1024 instruction slots and non power of two textures); the fog stays off.");
++                Say("wolVolFog: this video card cannot run the fog (it needs a ps_3_0 with at least 2048 instruction slots, the composition shader takes up to 1628, and non power of two textures); the fog stays off.");
+             }
+ 
+             VolFog::SetHardFailure(true);
+diff --git a/WoW/Source/WorldClient/DayNight.cpp b/WoW/Source/WorldClient/DayNight.cpp
+index 7a0eb5c..02eaa4f 100644
+--- a/WoW/Source/WorldClient/DayNight.cpp
++++ b/WoW/Source/WorldClient/DayNight.cpp
+@@ -2115,6 +2115,9 @@ void DayNight::DoAreaLights(CurrentLight* light, int32_t underwater) {
+     }
+ }
+ 
++// Not in the original client (World of Legends), brief B6b: see DayNight.h.
++DayNight::VolFogSourceFog DayNight::s_volFogSourceFog;
++
+ // VERIFY: 729edd43 manual
+ // OFFSET: 0x007F16F0
+ void DayNight::UpdateFog() {
+@@ -2272,13 +2275,26 @@ void DayNight::UpdateFog() {
+     // Not in the original client (World of Legends), brief B6 (design 1.3): while the native volumetric fog draws the fog of the world
+     // (wolVolFog > 0 and VolFog::Armed()), the client's own linear fog is pushed out of range, so the world is drawn without it: start at
+     // 4 x the far clip, density 0 (fogMode 1 maps), and the end a bit further so that SetFogParams does not divide by zero (the design
+-    // said start == end). m_fogInterior keeps the final values the volumetric model reads; the colour (also the clear colour) is not touched.
++    // said start == end). The colour (also the clear colour) is not touched.
+     // Armed() is false underwater, so the client keeps its own fog there, and from the frame after the pass fails.
++    // Brief B6b: both groups go out of range. m_fogInterior is the one the interior WMO groups, the doodads and M2 marked 0x8000 and the
++    // interior liquids read (MapObj.cpp SetShaderFogFromDayNight without bit 2, MapDoodadDef, MapEntity, MapObjDef, LiquidEnvironment): left
++    // alone it kept its linear fog on top of the volumetric one in every inn and dungeon. Before overwriting it, its final values (interior
++    // blend, eclipse, glow) are copied to s_volFogSourceFog, which is what VolFogWorld.cpp gives to the fog model (as coa-vfog reads them
++    // before hooking, src/hooks.cpp:266-276). The copy is taken every frame, armed or not, so it never goes stale.
++    DayNight::s_volFogSourceFog.m_color = info.m_fogInterior.m_color;
++    DayNight::s_volFogSourceFog.m_start = info.m_fogInterior.m_start;
++    DayNight::s_volFogSourceFog.m_end = info.m_fogInterior.m_end;
++    DayNight::s_volFogSourceFog.m_density = info.m_fogInterior.m_density;
++
+     if (liquidStatus == 0 && VolFog::Armed()) {
+         float outOfRange = info.m_farClip * 4.0f;
+         info.m_fog.m_start = outOfRange;
+         info.m_fog.m_end = outOfRange + info.m_farClip;
+         info.m_fog.m_density = 0.0f;
++        info.m_fogInterior.m_start = outOfRange;
++        info.m_fogInterior.m_end = outOfRange + info.m_farClip;
++        info.m_fogInterior.m_density = 0.0f;
+     }
+ }
+ 
+diff --git a/WoW/Source/WorldClient/DayNight.h b/WoW/Source/WorldClient/DayNight.h
+index ebbeae5..adce6a1 100644
+--- a/WoW/Source/WorldClient/DayNight.h
++++ b/WoW/Source/WorldClient/DayNight.h
+@@ -353,6 +353,16 @@ extern TSHashTable<DNOverrideSky, HASHKEY_STRI> g_overrideSky;
+ }
+ 
+ namespace DayNight {
++// Not in the original client (World of Legends), brief B6b: a copy of DNInfo::m_fogInterior (same layout as DNFogInfo) taken by UpdateFog
++// before it pushes the linear fog out of range while the native volumetric fog is armed. VolFogWorld.cpp feeds the fog model from it.
++struct VolFogSourceFog {
++    CImVector m_color;
++    float m_start;
++    float m_end;
++    float m_density;
++};
++extern VolFogSourceFog s_volFogSourceFog;
++
+ // INLINED
+ inline CImVector InterpColor(const CImVector& a, const CImVector& b, float t) {
+     CImVector color = a;
+diff --git a/WoW/Source/WorldClient/VolFogWorld.cpp b/WoW/Source/WorldClient/VolFogWorld.cpp
+index 936ef0f..8af4b3d 100644
+--- a/WoW/Source/WorldClient/VolFogWorld.cpp
++++ b/WoW/Source/WorldClient/VolFogWorld.cpp
+@@ -27,9 +27,10 @@
+ // fixed addresses of the 3.3.5 binary; see Shaders/VolFog/NOTICE-modificaciones.txt). Written 2026-10-20 (brief B5).
+ //
+ // Names that differ from the table in the design (1.3):
+-//  - fogColor / fogStart / fogEnd come from DNInfo::m_fogInterior, not m_fog: UpdateFog leaves m_fogInterior holding the final values
+-//    (interior blend, eclipse and glow included; it equals m_fog outside WMOs, and inside only the colour differs), and brief B6
+-//    will overwrite m_fog to switch the linear fog off. coa-vfog reads the same group (kFrameInputsFogGroup = 1).
++//  - fogColor / fogStart / fogEnd come from the copy of DNInfo::m_fogInterior that UpdateFog keeps (DayNight::s_volFogSourceFog, brief B6b),
++//    not from m_fog: it holds the final values (interior blend, eclipse and glow included; it equals m_fog outside WMOs, and inside only the
++//    colour differs). UpdateFog pushes both live groups out of range to switch the linear fog off, so the live values are not the real ones.
++//    coa-vfog reads the same group (kFrameInputsFogGroup = 1).
+ //  - sunColor / directColor / ambientColor are DNInfo::m_bands.m_sunCloudColors[0] / m_diffuse / m_ambient (SetLightColors copies
+ //    the last two to m_light1.m_diffuse / m_ambient).
+ //  - camTarget is DNInfo::m_lightRefPos (UpdateDayNight: the followed object, or the camera if there is none); CSimpleCamera has no
+@@ -105,17 +106,10 @@ namespace {
+ 
+         out.dayFraction = info.m_dayProgression;
+ 
+-        // Scattering: the direction of the light that lights the world (SetDirection), reversed: it points from the world to the light.
+-        out.toLight[0] = -info.m_light1.m_dir.x;
+-        out.toLight[1] = -info.m_light1.m_dir.y;
+-        out.toLight[2] = -info.m_light1.m_dir.z;
+-
+-        if (!Normalize(out.toLight)) {
+-            return false;
+-        }
+-
+-        // Beams: the visual positions of the sun and the moon (SetPlanets: 12 yards from DNInfo::m_cameraPos). The light is the moon
+-        // while the sun is below the horizon.
++        // The visual positions of the sun and the moon (SetPlanets: 12 yards from DNInfo::m_cameraPos). The light is the moon while the sun is
++        // below the horizon. Brief B6b: the scattering light (toLight) is that same visible body, as in coa-vfog (src/engine.cpp:417-425), and
++        // not the direction of the client's own lighting (-m_light1.m_dir: its z only goes from 0.34 to 0.60 over the day, so the sun never
++        // faded at dusk and the forward lobe of the haze was centred above the visible disc). The beams (B9) start at the same point.
+         float toSun[3] = { DayNight::g_planets.m_sun.m_position.x - info.m_cameraPos.x, DayNight::g_planets.m_sun.m_position.y - info.m_cameraPos.y, DayNight::g_planets.m_sun.m_position.z - info.m_cameraPos.z };
+         float toMoon[3] = { DayNight::g_planets.m_moon.m_position.x - info.m_cameraPos.x, DayNight::g_planets.m_moon.m_position.y - info.m_cameraPos.y, DayNight::g_planets.m_moon.m_position.z - info.m_cameraPos.z };
+ 
+@@ -126,13 +120,15 @@ namespace {
+         out.sunElevation = toSun[2];
+         out.lightIsMoon = toSun[2] < 0.0f;
+         std::memcpy(out.toRaySource, out.lightIsMoon ? toMoon : toSun, sizeof(out.toRaySource));
++        std::memcpy(out.toLight, out.toRaySource, sizeof(out.toLight));
+ 
+-        out.fogColor = Pack(info.m_fogInterior.m_color);
++        const DayNight::VolFogSourceFog& sourceFog = DayNight::s_volFogSourceFog; // brief B6b: the real values of the frame, before UpdateFog pushes the live ones out of range
++        out.fogColor = Pack(sourceFog.m_color);
+         out.sunColor = Pack(info.m_bands.m_sunCloudColors[0]);
+         out.directColor = Pack(info.m_bands.m_diffuse);
+         out.ambientColor = Pack(info.m_bands.m_ambient);
+-        out.fogStart = info.m_fogInterior.m_start;
+-        out.fogEnd = info.m_fogInterior.m_end;
++        out.fogStart = sourceFog.m_start;
++        out.fogEnd = sourceFog.m_end;
+         out.zoneFogDistance = info.m_bands.m_fogEnd;
+ 
+         out.farClip = info.m_farClip;

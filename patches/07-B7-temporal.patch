@@ -1,0 +1,845 @@
+diff --git a/Engine/Source/VolFog/VolFog.cpp b/Engine/Source/VolFog/VolFog.cpp
+index 65508e2..101a52e 100644
+--- a/Engine/Source/VolFog/VolFog.cpp
++++ b/Engine/Source/VolFog/VolFog.cpp
+@@ -37,7 +37,7 @@ namespace {
+ }
+ 
+ bool VolFog::Armed() {
+-    return VolFog::s_mode > 0 && VolFog::s_caps.intz && VolFog::s_caps.ps30Slots >= 1024 && VolFog::DepthTexture() != nullptr && !s_hardFailure && s_lastFrameOk && !s_inLiquid && (VolFog::s_debugMode == 0 || VolFog::s_debugMode == 2);
++    return VolFog::s_mode > 0 && VolFog::s_caps.intz && VolFog::s_caps.ps30Slots >= 1024 && VolFog::DepthTexture() != nullptr && !s_hardFailure && s_lastFrameOk && !s_inLiquid && (VolFog::s_debugMode == 0 || (VolFog::s_debugMode >= 2 && VolFog::s_debugMode <= 4));
+ }
+ 
+ void VolFog::SetFrameResult(bool ok, bool inLiquid) {
+diff --git a/Engine/Source/VolFog/VolFog.h b/Engine/Source/VolFog/VolFog.h
+index 82826f3..75bf7aa 100644
+--- a/Engine/Source/VolFog/VolFog.h
++++ b/Engine/Source/VolFog/VolFog.h
+@@ -23,8 +23,9 @@ namespace VolFog {
+ 
+     extern Caps s_caps;
+ 
+-    // Brief B2: wolVolFogDebug (0 = off, 1 depth in grey, 2 magenta tint, 3 test grid), set by the CVar in
+-    // WorldParam_CVar.cpp. B3 and later add the real wolVolFog CVar next to it.
++    // Brief B2: wolVolFogDebug, set by the CVar in WorldParam_CVar.cpp. 0 = off, 1 depth in grey, 2 raw march buffer (was a magenta tint in B2),
++    // 3 filtered history (brief B7; was the test grid), 4 normal image without the temporal filter (B7; the beam mask comes with B9),
++    // 5 test grid (moved here from 3 in B7). B3 and later add the real wolVolFog CVar next to it.
+     extern int32_t s_debugMode;
+ 
+     // Brief B3: wolVolFog (0-3), set by the CVar in WorldParam_CVar.cpp. 0 = original client.
+@@ -111,8 +112,9 @@ namespace VolFog {
+ 
+     // Draws the fog sub-passes over the world viewport of CGWorldFrame::OnWorldRender, between
+     // DayNight::RenderGlares and PlayerNameUpdateLate. Brief B6: with wolVolFog > 0 (and the INTZ depth) it ray-marches the fog into a
+-    // low-resolution target, copies the scene and composites the fog over the back buffer; wolVolFogDebug 2 shows the march buffer
+-    // instead, 1 the depth, 3 the test grid. If the shaders are not valid it writes one line to the console and does nothing else.
++    // low-resolution target, filters it with the reprojected history of the previous frame (brief B7), copies the scene and composites the
++    // fog over the back buffer; wolVolFogDebug 2 shows the raw march buffer instead, 3 the filtered history, 4 the image without the temporal
++    // filter, 1 the depth, 5 the test grid. If the shaders are not valid it writes one line to the console and does nothing else.
+     void Render();
+ }
+ 
+diff --git a/Engine/Source/VolFog/VolFogRender.cpp b/Engine/Source/VolFog/VolFogRender.cpp
+index fa6b36a..53ef730 100644
+--- a/Engine/Source/VolFog/VolFogRender.cpp
++++ b/Engine/Source/VolFog/VolFogRender.cpp
+@@ -21,6 +21,8 @@
+ // Renderer::Draw of src/renderer.cpp in coa-vfog 205ade5 (copyright of the authors of CoAVolFog, jealous-sound and the contributors of the
+ // Raz0r1337 fork); modified 2026-10-20 (brief B6): rewritten over the Gx layer (FFX plumbing, Gx render targets and texture units instead of
+ // raw Direct3D 9 calls), without the temporal filter, the local lights and the light shafts, which come in later briefs.
++// Modified 2026-10-20 (brief B7): temporal filter (history ping-pong, previous depth, reprojection matrix, per-frame jitter) as in
++// Renderer::FilterWithHistory / Renderer::Draw of renderer.cpp; wolVolFogDebug 3 = filtered history, 4 = no temporal filter, 5 = test grid.
+ 
+ int32_t VolFog::s_debugMode;
+ 
+@@ -129,15 +131,23 @@ namespace {
+         float localControl[4];      // c53 cLocalLightControl: no lights in B6
+         float variation[4];         // c78 cDensityVariation
+         float composite[3][4];      // c96-c98 cComposite, cGodRayColour, cSun
++        float viewToPreviousClip[16]; // c9-c12 cViewToPreviousClip (temporal pass only, B7): current view -> previous clip, row major
++        float temporal[4];          // c13 cTemporal (temporal pass only): history weight, history valid, adaptive lighting, 0
++        float worldToView[16];      // not uploaded: becomes the "previous" view of the next frame
+     };
+ 
++    constexpr float kTemporalWeight = 0.85f;            // `Temporal` of coa-vfog: weight of the history in the blend
++    constexpr double kHistoryMaxSeconds = 0.25;         // renderer.cpp kHistoryMaxSeconds: older history is dropped
++    constexpr float kHistoryMaxMove = 30.0f;            // renderer.cpp kHistoryMaxMove: yards of camera movement in one frame (teleport, mount jump)
++    constexpr float kHistoryMinForwardDot = 0.70710678f; // renderer.cpp kHistoryMinForwardDot: turns of more than 45 degrees in one frame
++
+     void NullTexFunc(EGxTexCommand command, uint32_t width, uint32_t height, uint32_t face, uint32_t level, void* userArg, uint32_t& texelStrideInBytes, const void*& texels) {
+     }
+ 
+     // One pass object per shader (WolVolFogMarch / WolVolFogComposite, six permutations each: (quality - 1) * 2 + localLights).
+     class FogPass : public VolFog::Pass {
+         public:
+-        explicit FogPass(const char* pixelName) : VolFog::Pass(pixelName, 6, "WolVolFogQuad", GxBlend_Opaque) {}
++        explicit FogPass(const char* pixelName, uint32_t permutations = 6) : VolFog::Pass(pixelName, permutations, "WolVolFogQuad", GxBlend_Opaque) {}
+ 
+         void Execute() override {}
+ 
+@@ -187,8 +197,73 @@ namespace {
+             return true;
+         }
+ 
++        // Temporal filter (sub-pass 2, first half): the current march, the previous history and its packed depth, plus the depth of this frame,
++        // blended into `target` (the history that is not the previous one). False if the target could not be created on the device.
++        bool DrawTemporal(const FogFrame& f, CGxTex* current, CGxTex* history, CGxTex* depth, CGxTex* historyDepth, CGxTex* target) {
++            this->SetPixelPermutation(0);
++            this->Begin();
++
++            GxRenderTargetSet(GxBuffers_Color, target, 0);
++
++            if (target->m_needsCreation) {
++                GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++                this->End();
++
++                return false;
++            }
++
++            GxXformSetViewport(0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f);
++            GxRsSet(GxRs_ColorWrite, 15);
++            GxRsSet(GxRs_ScissorTest, 0);
++
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, &f.common[0][0], 9);  // c0-c8 (the shader reads c0-c3 and c8)
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 9, f.viewToPreviousClip, 4); // c9-c12 cViewToPreviousClip
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 13, f.temporal, 1);      // c13 cTemporal
++            FogPass::SetTexture(0, current);      // sCurrent
++            FogPass::SetTexture(1, history);      // sHistory (history[prev])
++            FogPass::SetTexture(2, depth);        // sDepth (INTZ)
++            FogPass::SetTexture(3, historyDepth); // sHistoryDepth (the depth packed by the previous frame)
++
++            this->DrawQuad();
++
++            GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++            this->End();
++
++            return true;
++        }
++
++        // Temporal filter (sub-pass 2, second half): the linear depth of this frame packed into RGB for the reprojection test of the next one.
++        bool DrawHistoryDepth(const FogFrame& f, CGxTex* depth, CGxTex* target) {
++            this->SetPixelPermutation(0);
++            this->Begin();
++
++            GxRenderTargetSet(GxBuffers_Color, target, 0);
++
++            if (target->m_needsCreation) {
++                GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++                this->End();
++
++                return false;
++            }
++
++            GxXformSetViewport(0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f);
++            GxRsSet(GxRs_ColorWrite, 15);
++            GxRsSet(GxRs_ScissorTest, 0);
++
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, &f.common[0][0], 9);  // c0-c8 (the shader reads c0, c1 and c3)
++            FogPass::SetTexture(0, depth);   // sDepth
++            FogPass::SetTexture(3, nullptr); // the temporal pass sampled this very texture as sHistoryDepth: never leave it bound while it is the target
++
++            this->DrawQuad();
++
++            GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++            this->End();
++
++            return true;
++        }
++
+         // Composite over the back buffer, full resolution inside the world viewport (sub-pass 6).
+-        void DrawComposite(const FogFrame& f, uint32_t permutation, CGxTex* depth, CGxTex* march, CGxTex* scene) {
++        void DrawComposite(const FogFrame& f, uint32_t permutation, CGxTex* depth, CGxTex* fog, CGxTex* march, CGxTex* scene) {
+             this->SetPixelPermutation(permutation);
+             this->Begin();
+ 
+@@ -198,10 +273,10 @@ namespace {
+             FogPass::UploadShared(f);
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 96, &f.composite[0][0], 3);
+             FogPass::SetTexture(0, depth);  // sDepth
+-            FogPass::SetTexture(1, march);  // sFog: no temporal filter in B6, the march itself
++            FogPass::SetTexture(1, fog);    // sFog: the filtered history[cur] (B7); the march itself without the temporal filter
+             FogPass::SetTexture(2, march);  // sGodRays: unused (cComposite.y = 0), bound so that the sampler is never empty
+             FogPass::SetTexture(3, scene);  // sSceneBeforeFog
+-            FogPass::SetTexture(4, march);  // sCurrentMarch
++            FogPass::SetTexture(4, march);  // sCurrentMarch: the unfiltered march of this frame
+ 
+             this->DrawQuad();
+             this->End();
+@@ -226,6 +301,28 @@ namespace {
+         bool noDepthDebugWarned;
+         FogPass* marchPass;
+         FogPass* compositePass;
++        // Brief B7: temporal filter. history[historyIndex] is the last one written (the "previous" of the next frame); historyDepth is the packed
++        // linear depth of that frame (ARGB8: the shader reads RGB = high byte, low byte, depth class).
++        FogPass* temporalPass;
++        FogPass* historyDepthPass;
++        CGxTex* history[2];
++        CGxTex* historyDepth;
++        uint32_t historyWidth;
++        uint32_t historyHeight;
++        EGxTexFormat historyFormat;
++        uint32_t historyIndex;
++        bool historyValid;      // the last frame drew with the temporal filter and everything below describes it
++        bool temporalOff;       // the history targets could not be made: the fog runs without the filter until the device or wolVolFog changes
++        float prevWorldToView[16];
++        float prevProj[16];
++        float prevCam[3];
++        uint32_t prevViewport[4];
++        float prevDepthRange[2];
++        uint32_t prevScale;
++        int32_t prevQuality;
++        float prevDensity;
++        int32_t prevMap;
++        double prevSeconds;
+     };
+ 
+     FogState s_fog;
+@@ -245,7 +342,30 @@ namespace {
+         return texture;
+     }
+ 
+-    bool EnsureTargets(uint32_t lowWidth, uint32_t lowHeight, uint32_t sceneWidth, uint32_t sceneHeight) {
++    void DestroyHistory() {
++        for (int i = 0; i < 2; i++) {
++            if (s_fog.history[i]) {
++                GxTexDestroy(s_fog.history[i]);
++                s_fog.history[i] = nullptr;
++            }
++        }
++
++        if (s_fog.historyDepth) {
++            GxTexDestroy(s_fog.historyDepth);
++            s_fog.historyDepth = nullptr;
++        }
++
++        s_fog.historyWidth = 0;
++        s_fog.historyHeight = 0;
++        s_fog.historyIndex = 0;
++        s_fog.historyValid = false;
++    }
++
++    // `wantHistory`: the temporal filter is going to run (B7), so its two history targets and the packed depth are needed. `historyReset` is set when
++    // they were just (re)made: whatever the old history held is gone.
++    bool EnsureTargets(uint32_t lowWidth, uint32_t lowHeight, uint32_t sceneWidth, uint32_t sceneHeight, bool wantHistory, bool& historyReset) {
++        historyReset = false;
++
+         if (s_fog.device != g_theGxDevicePtr) {
+             // The device that owned the textures is gone (gxApi change): they went with it.
+             s_fog.march = nullptr;
+@@ -254,7 +374,15 @@ namespace {
+             s_fog.marchHeight = 0;
+             s_fog.sceneWidth = 0;
+             s_fog.sceneHeight = 0;
++            s_fog.history[0] = nullptr;
++            s_fog.history[1] = nullptr;
++            s_fog.historyDepth = nullptr;
++            s_fog.historyWidth = 0;
++            s_fog.historyHeight = 0;
++            s_fog.historyIndex = 0;
++            s_fog.historyValid = false;
+             s_fog.device = g_theGxDevicePtr;
++            historyReset = true;
+         }
+ 
+         if (s_fog.marchFormat == GxTex_Unknown) {
+@@ -289,9 +417,31 @@ namespace {
+             Say(line);
+         }
+ 
++        if (wantHistory && (!s_fog.history[0] || !s_fog.history[1] || !s_fog.historyDepth || s_fog.historyWidth != lowWidth || s_fog.historyHeight != lowHeight || s_fog.historyFormat != s_fog.marchFormat)) {
++            // Two history targets in the format of the march (ping-pong) and the packed depth of the frame they describe: RGB = (high byte,
++            // low byte, depth class) of vf_history_depth.hlsl, so an 8 bit target (R32F would not hold it).
++            DestroyHistory();
++            historyReset = true;
++
++            s_fog.history[0] = CreateTargetTexture(lowWidth, lowHeight, s_fog.marchFormat, "VolFog history 0");
++            s_fog.history[1] = CreateTargetTexture(lowWidth, lowHeight, s_fog.marchFormat, "VolFog history 1");
++            s_fog.historyDepth = CreateTargetTexture(lowWidth, lowHeight, GxTex_Argb8888, "VolFog history depth");
++            s_fog.historyWidth = lowWidth;
++            s_fog.historyHeight = lowHeight;
++            s_fog.historyFormat = s_fog.marchFormat;
++
++            char line[160];
++            std::snprintf(line, sizeof(line), "wolVolFog: temporal history %ux%u %s x2 + depth ARGB8", lowWidth, lowHeight, s_fog.marchFormat == GxTex_Abgr16F ? "ABGR16F" : "ARGB8");
++            Say(line);
++        }
++
+         return s_fog.march && s_fog.scene;
+     }
+ 
++    bool HistoryTargetsExist() {
++        return s_fog.history[0] && s_fog.history[1] && s_fog.historyDepth;
++    }
++
+     bool Normalize3(float* v) {
+         float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+ 
+@@ -307,7 +457,9 @@ namespace {
+     }
+ 
+     // The constants of one frame (Renderer::Draw of renderer.cpp, without the temporal filter, the local lights and the beams).
+-    bool PackFrame(const VolFog::FrameInputs& in, const VolFog::FogParams& fog, uint32_t scale, uint32_t lowWidth, uint32_t lowHeight, float debugView, FogFrame& f) {
++    // B7: `temporal` = the temporal filter runs this frame (step jitter on, history blended); `previousUsable` = the last frame wrote a history that
++    // is still around (no reset, no resize, no failure in between).
++    bool PackFrame(const VolFog::FrameInputs& in, const VolFog::FogParams& fog, uint32_t scale, uint32_t lowWidth, uint32_t lowHeight, float debugView, bool temporal, bool previousUsable, FogFrame& f) {
+         std::memset(&f, 0, sizeof(f));
+ 
+         const float* proj = in.glProjection;
+@@ -332,6 +484,11 @@ namespace {
+         viewToWorld[13] = in.camPos[1];
+         viewToWorld[14] = in.camPos[2];
+ 
++        // WorldViewFromCameraRelative: the view with the camera position in it (the inverse of the above); also the "previous view" of the next frame.
++        if (!VolFog::Invert4x4(viewToWorld, f.worldToView)) {
++            return false;
++        }
++
+         float depthTexelX = VolFog::DepthWidth() ? 1.0f / static_cast<float>(VolFog::DepthWidth()) : 0.0f;
+         float depthTexelY = VolFog::DepthHeight() ? 1.0f / static_cast<float>(VolFog::DepthHeight()) : 0.0f;
+ 
+@@ -359,8 +516,9 @@ namespace {
+         f.light[2] = toLightInView[2];
+         f.light[3] = fog.lightAboveHorizon;
+ 
+-        // cMarch: the step jitter is only for the temporal filter (B7), so 0 = fixed 0.5 in the shader.
+-        f.march[0] = 0.0f;
++        // cMarch.x: step jitter on (frac(interleaved gradient noise + frame * golden ratio), frame = cPixelGrid.y) only when the temporal filter
++        // is going to average it away; 0 = fixed 0.5 in the shader.
++        f.march[0] = temporal ? 1.0f : 0.0f;
+         f.march[1] = fog.maxDistance;
+         f.march[2] = fog.horizonStart;
+         f.march[3] = fog.farClip;
+@@ -379,6 +537,44 @@ namespace {
+         f.variation[1] = 0.025f;
+         f.variation[2] = static_cast<float>(std::fmod(seconds * 0.5, windPeriod));
+ 
++        // Temporal filter (B7). The history of the last frame is reused only if that frame drew with the same lens, viewport, scale, quality, density
++        // and map, no more than 0.25 s ago, the camera did not jump (30 yards) or turn (45 degrees) in between: Renderer::Draw of renderer.cpp.
++        // Otherwise cTemporal.y = 0 and the shader uses only the current march (weight 0 for this frame).
++        const VolFog::SettingValues& settings = VolFog::Settings();
++        bool historyValid = false;
++
++        if (temporal && previousUsable) {
++            const float dx = in.camPos[0] - s_fog.prevCam[0];
++            const float dy = in.camPos[1] - s_fog.prevCam[1];
++            const float dz = in.camPos[2] - s_fog.prevCam[2];
++            const float forwardDot = f.worldToView[2] * s_fog.prevWorldToView[2] + f.worldToView[6] * s_fog.prevWorldToView[6] + f.worldToView[10] * s_fog.prevWorldToView[10];
++
++            historyValid = s_fog.prevScale == scale
++                && s_fog.prevQuality == settings.quality
++                && s_fog.prevDensity == settings.density
++                && s_fog.prevMap == in.mapId
++                && forwardDot > kHistoryMinForwardDot
++                && std::memcmp(s_fog.prevProj, proj, sizeof(s_fog.prevProj)) == 0
++                && s_fog.prevViewport[0] == in.viewport.x && s_fog.prevViewport[1] == in.viewport.y
++                && s_fog.prevViewport[2] == in.viewport.width && s_fog.prevViewport[3] == in.viewport.height
++                && s_fog.prevDepthRange[0] == in.viewport.minZ && s_fog.prevDepthRange[1] == in.viewport.maxZ
++                && seconds - s_fog.prevSeconds < kHistoryMaxSeconds
++                && dx * dx + dy * dy + dz * dz < kHistoryMaxMove * kHistoryMaxMove;
++        }
++
++        // cViewToPreviousClip = viewToWorld * previousWorldToView * previousProjection (row vectors): a point in the current view space to the clip
++        // space of the previous frame; w is its view depth there.
++        float previousViewProjection[16];
++        VolFog::Mul4x4(s_fog.prevWorldToView, s_fog.prevProj, previousViewProjection);
++        VolFog::Mul4x4(viewToWorld, previousViewProjection, f.viewToPreviousClip);
++
++        // cTemporal: history weight, history valid, adaptive lighting (the density noise moves with the wind: a large change relative to the
++        // brightness lowers the weight, so the history does not smear it), unused.
++        f.temporal[0] = kTemporalWeight;
++        f.temporal[1] = historyValid ? 1.0f : 0.0f;
++        f.temporal[2] = hasNoise ? 1.0f : 0.0f;
++        f.temporal[3] = 0.0f;
++
+         // cComposite: exposure 1, no beams, debug view (0 = none, 2 = transmittance), blend 1 = linear light over the scene copy.
+         f.composite[0][0] = 1.0f;
+         f.composite[0][1] = 0.0f;
+@@ -396,9 +592,15 @@ namespace {
+ 
+     // FogOk: the frame drew (or legitimately had nothing to draw). FogTransient: nothing could be drawn this frame (no depth yet, no camera): Armed() is
+     // false for it, but it does not count towards giving the pass up. FogFailed: a real failure. `liquid` reports the camera.
+-    FogResult RenderFog(bool showMarch, bool& liquid) {
++    // `debugMode`: 0 normal; 2 the raw march buffer on screen; 3 the filtered history on screen; 4 normal image without the temporal filter (B7).
++    FogResult RenderFog(int32_t debugMode, bool& liquid) {
+         liquid = false;
+ 
++        // Brief B7: the history is only good for the very next frame, and only if that one drew everything. It becomes valid again at the end of
++        // a frame that drew with the filter; every early return below (no depth, no camera, underwater, failure) leaves it invalid.
++        const bool previousUsable = s_fog.historyValid;
++        s_fog.historyValid = false;
++
+         if (!VolFog::DepthTex()) {
+             // wolVolFog is on but there is no readable depth yet (waiting for gxRestart): the callback of the CVar already said so.
+             return FogTransient;
+@@ -419,6 +621,8 @@ namespace {
+             // Created on first use, kept for the whole run.
+             s_fog.marchPass = new FogPass("WolVolFogMarch");
+             s_fog.compositePass = new FogPass("WolVolFogComposite");
++            s_fog.temporalPass = new FogPass("WolVolFogTemporal", 1);
++            s_fog.historyDepthPass = new FogPass("WolVolFogHistoryDepth", 1);
+         }
+ 
+         const VolFog::SettingValues& settings = VolFog::Settings();
+@@ -457,13 +661,34 @@ namespace {
+         const uint32_t lowWidth = std::max((in.viewport.width + scale - 1) / scale, 8u);
+         const uint32_t lowHeight = std::max((in.viewport.height + scale - 1) / scale, 8u);
+ 
+-        if (!EnsureTargets(lowWidth, lowHeight, in.viewport.width, in.viewport.height)) {
++        // Temporal filter (B7): on unless wolVolFogDebug 4 asks for the plain B6 image or the shaders / targets of the filter are not available.
++        // Without the filter the march uses a fixed step (no jitter) and the composite reads the march itself.
++        bool temporal = debugMode != 4 && !s_fog.temporalOff;
++
++        if (temporal && (!s_fog.temporalPass->Valid() || !s_fog.historyDepthPass->Valid())) {
++            Say("wolVolFog: the shaders WolVolFogTemporal / WolVolFogHistoryDepth are not valid (is Data\\patch-Z.MPQ up to date?); the fog runs without the temporal filter.");
++            s_fog.temporalOff = true;
++            temporal = false;
++        }
++
++        bool historyReset = false;
++
++        if (!EnsureTargets(lowWidth, lowHeight, in.viewport.width, in.viewport.height, temporal, historyReset)) {
+             return FogFailed;
+         }
+ 
++        if (temporal && !HistoryTargetsExist()) {
++            Say("wolVolFog: the temporal history targets could not be created; the fog runs without the temporal filter.");
++            s_fog.temporalOff = true;
++            temporal = false;
++        }
++
+         FogFrame frame;
+ 
+-        if (!PackFrame(in, fog, scale, lowWidth, lowHeight, showMarch ? 2.0f : 0.0f, frame)) {
++        // debug view in the composite: 2 = transmittance of the fog it is given (debug 2: the march, debug 3: the filtered history)
++        const float debugView = (debugMode == 2 || debugMode == 3) ? 2.0f : 0.0f;
++
++        if (!PackFrame(in, fog, scale, lowWidth, lowHeight, debugView, temporal, previousUsable && !historyReset, frame)) {
+             return FogTransient;
+         }
+ 
+@@ -483,6 +708,31 @@ namespace {
+             s_fog.marchWidth = 0;
+         }
+ 
++        CGxTex* fogTex = s_fog.march; // what the composite reads as sFog
++
++        if (drawn && temporal) {
++            // Sub-pass 2: filter the march with the reprojected history into the other history target, then pack this frame's depth for the next one.
++            const uint32_t write = s_fog.historyIndex ^ 1u;
++            drawn = s_fog.temporalPass->DrawTemporal(frame, s_fog.march, s_fog.history[s_fog.historyIndex], depth, s_fog.historyDepth, s_fog.history[write]);
++
++            if (drawn) {
++                drawn = s_fog.historyDepthPass->DrawHistoryDepth(frame, depth, s_fog.historyDepth);
++            }
++
++            if (drawn) {
++                s_fog.historyIndex = write;
++                fogTex = s_fog.history[write];
++            } else {
++                // The device would not make the history targets (they were created, but not on the device): run without the filter from the next frame on.
++                Say("wolVolFog: the temporal history targets could not be created on the device; the fog runs without the temporal filter.");
++                s_fog.temporalOff = true;
++            }
++        }
++
++        if (debugMode == 2) {
++            fogTex = s_fog.march; // wolVolFogDebug 2 keeps showing the raw march
++        }
++
+         if (drawn) {
+             // Sub-pass 3: the scene as it is before the fog, the world viewport of the back buffer into a texture of exactly that size.
+             C2iVector destination = { 0, 0 };
+@@ -491,7 +741,7 @@ namespace {
+             drawn = GxTexCopy(s_fog.scene, destination, source, size, 0, 0) != 0;
+ 
+             if (drawn) {
+-                s_fog.compositePass->DrawComposite(frame, permutation, depth, s_fog.march, s_fog.scene);
++                s_fog.compositePass->DrawComposite(frame, permutation, depth, fogTex, s_fog.march, s_fog.scene);
+             }
+         }
+ 
+@@ -499,6 +749,24 @@ namespace {
+ 
+         if (drawn) {
+             s_fog.frame++;
++
++            // What the next frame's reprojection needs: this frame's view, projection, position, viewport and settings.
++            const VolFog::SettingValues& settings = VolFog::Settings();
++            std::memcpy(s_fog.prevWorldToView, frame.worldToView, sizeof(s_fog.prevWorldToView));
++            std::memcpy(s_fog.prevProj, in.glProjection, sizeof(s_fog.prevProj));
++            std::memcpy(s_fog.prevCam, in.camPos, sizeof(s_fog.prevCam));
++            s_fog.prevViewport[0] = in.viewport.x;
++            s_fog.prevViewport[1] = in.viewport.y;
++            s_fog.prevViewport[2] = in.viewport.width;
++            s_fog.prevViewport[3] = in.viewport.height;
++            s_fog.prevDepthRange[0] = in.viewport.minZ;
++            s_fog.prevDepthRange[1] = in.viewport.maxZ;
++            s_fog.prevScale = scale;
++            s_fog.prevQuality = settings.quality;
++            s_fog.prevDensity = settings.density;
++            s_fog.prevMap = in.mapId;
++            s_fog.prevSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_clockStart).count();
++            s_fog.historyValid = temporal;
+         }
+ 
+         return drawn ? FogOk : FogFailed;
+@@ -521,7 +789,8 @@ namespace {
+             s_debugPass = new DebugPass();
+         }
+ 
+-        s_debugPass->SetPixelPermutation(static_cast<uint32_t>(mode - 1));
++        // Brief B7: the grid moved from 3 to 5 (3 is now the filtered history); the permutations of WolVolFogDebug are still 0 depth, 1 tint, 2 grid.
++        s_debugPass->SetPixelPermutation(mode == 5 ? 2u : static_cast<uint32_t>(mode - 1));
+ 
+         if (!s_debugPass->Valid()) {
+             // Failure policy (design 1.3): say it once, draw nothing, touch nothing else.
+@@ -570,22 +839,24 @@ void VolFog::Render() {
+         s_fog.consecutiveFailures = 0;
+         s_fog.shadersMessage = false;
+         s_fog.hardMessage = false;
++        s_fog.temporalOff = false; // B7: the history targets are made again, and the contents of the old ones are gone
++        s_fog.historyValid = false;
+         VolFog::SetHardFailure(false);
+         VolFog::SetFrameResult(true, false);
+     }
+ 
+     int32_t debugMode = VolFog::s_debugMode;
+ 
+-    if (debugMode == 1 || debugMode == 3) {
++    if (debugMode == 1 || debugMode == 5) {
+         RenderDebugView(debugMode);
+ 
+         return;
+     }
+ 
+     if (VolFog::s_mode <= 0) {
+-        if (debugMode == 2 && !s_fog.noDepthDebugWarned) {
++        if (debugMode >= 2 && debugMode <= 4 && !s_fog.noDepthDebugWarned) {
+             s_fog.noDepthDebugWarned = true;
+-            Say("wolVolFogDebug 2 shows the march buffer of the volumetric fog: set wolVolFog 1-3 first (and gxRestart).");
++            Say("wolVolFogDebug 2-4 show the volumetric fog (2 march buffer, 3 filtered history, 4 no temporal filter): set wolVolFog 1-3 first (and gxRestart).");
+         }
+ 
+         return;
+@@ -596,7 +867,7 @@ void VolFog::Render() {
+     }
+ 
+     bool liquid = false;
+-    FogResult result = RenderFog(debugMode == 2, liquid);
++    FogResult result = RenderFog(debugMode, liquid);
+ 
+     if (result == FogOk) {
+         s_fog.consecutiveFailures = 0;
+diff --git a/Shaders/VolFog/CMakeLists.txt b/Shaders/VolFog/CMakeLists.txt
+index 5dbc6f8..922d1d0 100644
+--- a/Shaders/VolFog/CMakeLists.txt
++++ b/Shaders/VolFog/CMakeLists.txt
+@@ -1,125 +1,131 @@
+-# Not in the original client (World of Legends): HLSL shaders of the native volumetric fog (wolVolFog), brief B2.
+-# Chain (design 2026-10-19-fase3-niebla-volumetrica-design.md, section 3): fxc -> Tools/VolFog/mkbls.py (GXSH .bls) ->
+-# Tools/VolFog/mkmpq.py -> bin/Win/Data/patch-Z.MPQ. Only the target VolFogShaders is defined here; WowClient depends on it.
+-
+-set(VOLFOG_OUT ${CMAKE_BINARY_DIR}/volfog)
+-set(VOLFOG_STAGE ${VOLFOG_OUT}/stage)
+-set(VOLFOG_MPQ ${CMAKE_SOURCE_DIR}/bin/Win/Data/patch-Z.MPQ)
+-
+-# fxc.exe: newest Windows SDK that has it (override with -DVOLFOG_FXC=<path>).
+-set(VOLFOG_FXC "" CACHE FILEPATH "HLSL compiler (fxc.exe) used for the volumetric fog shaders")
+-if (NOT VOLFOG_FXC OR NOT EXISTS "${VOLFOG_FXC}")
+-    file(GLOB VOLFOG_FXC_CANDIDATES "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.*/x64/fxc.exe"
+-                                    "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64/fxc.exe")
+-    list(REMOVE_DUPLICATES VOLFOG_FXC_CANDIDATES)
+-    list(SORT VOLFOG_FXC_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
+-    if (VOLFOG_FXC_CANDIDATES)
+-        list(GET VOLFOG_FXC_CANDIDATES 0 VOLFOG_FXC_FOUND)
+-        set(VOLFOG_FXC "${VOLFOG_FXC_FOUND}" CACHE FILEPATH "HLSL compiler (fxc.exe) used for the volumetric fog shaders" FORCE)
+-    endif ()
+-endif ()
+-if (NOT VOLFOG_FXC OR NOT EXISTS "${VOLFOG_FXC}")
+-    message(FATAL_ERROR
+-        "WOWDECOMP_VOLFOG: fxc.exe not found. Install the Windows 10/11 SDK (it provides "
+-        "'C:/Program Files (x86)/Windows Kits/10/bin/<version>/x64/fxc.exe'), pass -DVOLFOG_FXC=<path to fxc.exe>, "
+-        "or configure with -DWOWDECOMP_VOLFOG=OFF to skip the volumetric fog shaders.")
+-endif ()
+-
+-# Python 3 (standard library only) runs mkbls.py and mkmpq.py (override with -DVOLFOG_PYTHON=<python.exe>).
+-set(VOLFOG_PYTHON "" CACHE FILEPATH "Python 3 interpreter used by Tools/VolFog")
+-if (NOT VOLFOG_PYTHON OR NOT EXISTS "${VOLFOG_PYTHON}")
+-    find_package(Python3 COMPONENTS Interpreter QUIET)
+-    if (Python3_Interpreter_FOUND)
+-        set(VOLFOG_PYTHON "${Python3_EXECUTABLE}" CACHE FILEPATH "Python 3 interpreter used by Tools/VolFog" FORCE)
+-    endif ()
+-endif ()
+-if (NOT VOLFOG_PYTHON OR NOT EXISTS "${VOLFOG_PYTHON}")
+-    message(FATAL_ERROR
+-        "WOWDECOMP_VOLFOG: Python 3 not found (needed by Tools/VolFog/mkbls.py and mkmpq.py). Install it, pass "
+-        "-DVOLFOG_PYTHON=<path to python.exe>, or configure with -DWOWDECOMP_VOLFOG=OFF.")
+-endif ()
+-
+-file(GLOB VOLFOG_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.hlsli")
+-set(VOLFOG_MKBLS ${CMAKE_SOURCE_DIR}/Tools/VolFog/mkbls.py)
+-set(VOLFOG_MKMPQ ${CMAKE_SOURCE_DIR}/Tools/VolFog/mkmpq.py)
+-set(VOLFOG_BLS_FILES "")
+-
+-# volfog_shader(<Name> <ps|vs> <source.hlsl> [PERMUTATIONS <defs> ...])
+-# One fxc run per permutation: each <defs> is a comma separated list of preprocessor definitions (e.g.
+-# "STEPS=16,LOCAL_LIGHTS=0"); without PERMUTATIONS there is one permutation with no definitions. The .bls holds the
+-# permutations in the order given and is staged as Shaders/Pixel/ps_3_0/<Name>.bls or Shaders/Vertex/vs_3_0/<Name>.bls.
+-function(volfog_shader NAME KIND SOURCE)
+-    cmake_parse_arguments(ARG "" "" "PERMUTATIONS" ${ARGN})
+-    if (KIND STREQUAL "ps")
+-        set(PROFILE ps_3_0)
+-        set(BLS_DIR Shaders/Pixel/ps_3_0)
+-    elseif (KIND STREQUAL "vs")
+-        set(PROFILE vs_3_0)
+-        set(BLS_DIR Shaders/Vertex/vs_3_0)
+-    else ()
+-        message(FATAL_ERROR "volfog_shader(${NAME}): kind must be ps or vs")
+-    endif ()
+-    if (NOT ARG_PERMUTATIONS)
+-        set(ARG_PERMUTATIONS "-")
+-    endif ()
+-    list(LENGTH ARG_PERMUTATIONS PERM_COUNT)
+-
+-    set(PSOS "")
+-    set(INDEX 0)
+-    foreach (PERM IN LISTS ARG_PERMUTATIONS)
+-        set(DEFINE_ARGS "")
+-        if (NOT PERM STREQUAL "-")
+-            string(REPLACE "," ";" DEFINES "${PERM}")
+-            foreach (DEFINE IN LISTS DEFINES)
+-                list(APPEND DEFINE_ARGS /D ${DEFINE})
+-            endforeach ()
+-        endif ()
+-        set(PSO ${VOLFOG_OUT}/${NAME}_${INDEX}.pso)
+-        set(ASM ${VOLFOG_OUT}/${NAME}_${INDEX}.asm)
+-        add_custom_command(
+-            OUTPUT ${PSO} ${ASM}
+-            COMMAND ${CMAKE_COMMAND} -E make_directory ${VOLFOG_OUT}
+-            COMMAND "${VOLFOG_FXC}" /nologo /O3 /T ${PROFILE} /E main ${DEFINE_ARGS} /Fo ${PSO} /Fc ${ASM} ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE}
+-            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE} ${VOLFOG_HEADERS}
+-            COMMENT "fxc ${PROFILE} ${NAME} [${INDEX}] ${PERM}"
+-            VERBATIM)
+-        list(APPEND PSOS ${PSO})
+-        math(EXPR INDEX "${INDEX} + 1")
+-    endforeach ()
+-
+-    set(BLS ${VOLFOG_STAGE}/${BLS_DIR}/${NAME}.bls)
+-    add_custom_command(
+-        OUTPUT ${BLS}
+-        COMMAND ${CMAKE_COMMAND} -E make_directory ${VOLFOG_STAGE}/${BLS_DIR}
+-        COMMAND "${VOLFOG_PYTHON}" -I ${VOLFOG_MKBLS} ${BLS} ${PSOS}
+-        DEPENDS ${PSOS} ${VOLFOG_MKBLS}
+-        COMMENT "mkbls ${NAME}.bls (${PERM_COUNT} permutation(s))"
+-        VERBATIM)
+-    set(VOLFOG_BLS_FILES ${VOLFOG_BLS_FILES} ${BLS} PARENT_SCOPE)
+-endfunction ()
+-
+-# B2: quad vertex shader (vf_fullscreen_vs.hlsl as it is) and the debug pixel shader (wolVolFogDebug 1..3).
+-# The remaining vf_*.hlsl are compiled from brief B7 on (design, section 3).
+-volfog_shader(WolVolFogQuad vs vf_fullscreen_vs.hlsl)
+-volfog_shader(WolVolFogDebug ps WolVolFogDebug.hlsl PERMUTATIONS "DEBUG_MODE=1" "DEBUG_MODE=2" "DEBUG_MODE=3")
+-
+-# B6: ray march and composite. Six permutations each, index = (quality - 1) * 2 + localLights: STEPS 16 / 24 / 32 (wolVolFog 1 / 2 / 3)
+-# times LOCAL_LIGHTS 0 / 1 (the macros of vf_integrate.hlsli). B6 draws only the LOCAL_LIGHTS=0 ones; the others are compiled for B8.
+-# SAMPLES_AUTHORED_NOISE keeps its default (0): the authored noise of the Classic layers is not used (design, section 2).
+-volfog_shader(WolVolFogMarch ps vf_march.hlsl PERMUTATIONS
+-    "STEPS=16,LOCAL_LIGHTS=0" "STEPS=16,LOCAL_LIGHTS=1"
+-    "STEPS=24,LOCAL_LIGHTS=0" "STEPS=24,LOCAL_LIGHTS=1"
+-    "STEPS=32,LOCAL_LIGHTS=0" "STEPS=32,LOCAL_LIGHTS=1")
+-volfog_shader(WolVolFogComposite ps vf_composite.hlsl PERMUTATIONS
+-    "STEPS=16,LOCAL_LIGHTS=0" "STEPS=16,LOCAL_LIGHTS=1"
+-    "STEPS=24,LOCAL_LIGHTS=0" "STEPS=24,LOCAL_LIGHTS=1"
+-    "STEPS=32,LOCAL_LIGHTS=0" "STEPS=32,LOCAL_LIGHTS=1")
+-
+-add_custom_command(
+-    OUTPUT ${VOLFOG_MPQ}
+-    COMMAND "${VOLFOG_PYTHON}" -I ${VOLFOG_MKMPQ} ${VOLFOG_MPQ} ${VOLFOG_STAGE} ${VOLFOG_BLS_FILES}
+-    DEPENDS ${VOLFOG_BLS_FILES} ${VOLFOG_MKMPQ}
+-    COMMENT "mkmpq patch-Z.MPQ"
+-    VERBATIM)
+-
+-add_custom_target(VolFogShaders ALL DEPENDS ${VOLFOG_MPQ})
++# Not in the original client (World of Legends): HLSL shaders of the native volumetric fog (wolVolFog), brief B2.
++# Chain (design 2026-10-19-fase3-niebla-volumetrica-design.md, section 3): fxc -> Tools/VolFog/mkbls.py (GXSH .bls) ->
++# Tools/VolFog/mkmpq.py -> bin/Win/Data/patch-Z.MPQ. Only the target VolFogShaders is defined here; WowClient depends on it.
++
++set(VOLFOG_OUT ${CMAKE_BINARY_DIR}/volfog)
++set(VOLFOG_STAGE ${VOLFOG_OUT}/stage)
++set(VOLFOG_MPQ ${CMAKE_SOURCE_DIR}/bin/Win/Data/patch-Z.MPQ)
++
++# fxc.exe: newest Windows SDK that has it (override with -DVOLFOG_FXC=<path>).
++set(VOLFOG_FXC "" CACHE FILEPATH "HLSL compiler (fxc.exe) used for the volumetric fog shaders")
++if (NOT VOLFOG_FXC OR NOT EXISTS "${VOLFOG_FXC}")
++    file(GLOB VOLFOG_FXC_CANDIDATES "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.*/x64/fxc.exe"
++                                    "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64/fxc.exe")
++    list(REMOVE_DUPLICATES VOLFOG_FXC_CANDIDATES)
++    list(SORT VOLFOG_FXC_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
++    if (VOLFOG_FXC_CANDIDATES)
++        list(GET VOLFOG_FXC_CANDIDATES 0 VOLFOG_FXC_FOUND)
++        set(VOLFOG_FXC "${VOLFOG_FXC_FOUND}" CACHE FILEPATH "HLSL compiler (fxc.exe) used for the volumetric fog shaders" FORCE)
++    endif ()
++endif ()
++if (NOT VOLFOG_FXC OR NOT EXISTS "${VOLFOG_FXC}")
++    message(FATAL_ERROR
++        "WOWDECOMP_VOLFOG: fxc.exe not found. Install the Windows 10/11 SDK (it provides "
++        "'C:/Program Files (x86)/Windows Kits/10/bin/<version>/x64/fxc.exe'), pass -DVOLFOG_FXC=<path to fxc.exe>, "
++        "or configure with -DWOWDECOMP_VOLFOG=OFF to skip the volumetric fog shaders.")
++endif ()
++
++# Python 3 (standard library only) runs mkbls.py and mkmpq.py (override with -DVOLFOG_PYTHON=<python.exe>).
++set(VOLFOG_PYTHON "" CACHE FILEPATH "Python 3 interpreter used by Tools/VolFog")
++if (NOT VOLFOG_PYTHON OR NOT EXISTS "${VOLFOG_PYTHON}")
++    find_package(Python3 COMPONENTS Interpreter QUIET)
++    if (Python3_Interpreter_FOUND)
++        set(VOLFOG_PYTHON "${Python3_EXECUTABLE}" CACHE FILEPATH "Python 3 interpreter used by Tools/VolFog" FORCE)
++    endif ()
++endif ()
++if (NOT VOLFOG_PYTHON OR NOT EXISTS "${VOLFOG_PYTHON}")
++    message(FATAL_ERROR
++        "WOWDECOMP_VOLFOG: Python 3 not found (needed by Tools/VolFog/mkbls.py and mkmpq.py). Install it, pass "
++        "-DVOLFOG_PYTHON=<path to python.exe>, or configure with -DWOWDECOMP_VOLFOG=OFF.")
++endif ()
++
++file(GLOB VOLFOG_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.hlsli")
++set(VOLFOG_MKBLS ${CMAKE_SOURCE_DIR}/Tools/VolFog/mkbls.py)
++set(VOLFOG_MKMPQ ${CMAKE_SOURCE_DIR}/Tools/VolFog/mkmpq.py)
++set(VOLFOG_BLS_FILES "")
++
++# volfog_shader(<Name> <ps|vs> <source.hlsl> [PERMUTATIONS <defs> ...])
++# One fxc run per permutation: each <defs> is a comma separated list of preprocessor definitions (e.g.
++# "STEPS=16,LOCAL_LIGHTS=0"); without PERMUTATIONS there is one permutation with no definitions. The .bls holds the
++# permutations in the order given and is staged as Shaders/Pixel/ps_3_0/<Name>.bls or Shaders/Vertex/vs_3_0/<Name>.bls.
++function(volfog_shader NAME KIND SOURCE)
++    cmake_parse_arguments(ARG "" "" "PERMUTATIONS" ${ARGN})
++    if (KIND STREQUAL "ps")
++        set(PROFILE ps_3_0)
++        set(BLS_DIR Shaders/Pixel/ps_3_0)
++    elseif (KIND STREQUAL "vs")
++        set(PROFILE vs_3_0)
++        set(BLS_DIR Shaders/Vertex/vs_3_0)
++    else ()
++        message(FATAL_ERROR "volfog_shader(${NAME}): kind must be ps or vs")
++    endif ()
++    if (NOT ARG_PERMUTATIONS)
++        set(ARG_PERMUTATIONS "-")
++    endif ()
++    list(LENGTH ARG_PERMUTATIONS PERM_COUNT)
++
++    set(PSOS "")
++    set(INDEX 0)
++    foreach (PERM IN LISTS ARG_PERMUTATIONS)
++        set(DEFINE_ARGS "")
++        if (NOT PERM STREQUAL "-")
++            string(REPLACE "," ";" DEFINES "${PERM}")
++            foreach (DEFINE IN LISTS DEFINES)
++                list(APPEND DEFINE_ARGS /D ${DEFINE})
++            endforeach ()
++        endif ()
++        set(PSO ${VOLFOG_OUT}/${NAME}_${INDEX}.pso)
++        set(ASM ${VOLFOG_OUT}/${NAME}_${INDEX}.asm)
++        add_custom_command(
++            OUTPUT ${PSO} ${ASM}
++            COMMAND ${CMAKE_COMMAND} -E make_directory ${VOLFOG_OUT}
++            COMMAND "${VOLFOG_FXC}" /nologo /O3 /T ${PROFILE} /E main ${DEFINE_ARGS} /Fo ${PSO} /Fc ${ASM} ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE}
++            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE} ${VOLFOG_HEADERS}
++            COMMENT "fxc ${PROFILE} ${NAME} [${INDEX}] ${PERM}"
++            VERBATIM)
++        list(APPEND PSOS ${PSO})
++        math(EXPR INDEX "${INDEX} + 1")
++    endforeach ()
++
++    set(BLS ${VOLFOG_STAGE}/${BLS_DIR}/${NAME}.bls)
++    add_custom_command(
++        OUTPUT ${BLS}
++        COMMAND ${CMAKE_COMMAND} -E make_directory ${VOLFOG_STAGE}/${BLS_DIR}
++        COMMAND "${VOLFOG_PYTHON}" -I ${VOLFOG_MKBLS} ${BLS} ${PSOS}
++        DEPENDS ${PSOS} ${VOLFOG_MKBLS}
++        COMMENT "mkbls ${NAME}.bls (${PERM_COUNT} permutation(s))"
++        VERBATIM)
++    set(VOLFOG_BLS_FILES ${VOLFOG_BLS_FILES} ${BLS} PARENT_SCOPE)
++endfunction ()
++
++# B2: quad vertex shader (vf_fullscreen_vs.hlsl as it is) and the debug pixel shader (wolVolFogDebug 1..3).
++# The remaining vf_*.hlsl are compiled from brief B7 on (design, section 3).
++volfog_shader(WolVolFogQuad vs vf_fullscreen_vs.hlsl)
++volfog_shader(WolVolFogDebug ps WolVolFogDebug.hlsl PERMUTATIONS "DEBUG_MODE=1" "DEBUG_MODE=2" "DEBUG_MODE=3")
++
++# B6: ray march and composite. Six permutations each, index = (quality - 1) * 2 + localLights: STEPS 16 / 24 / 32 (wolVolFog 1 / 2 / 3)
++# times LOCAL_LIGHTS 0 / 1 (the macros of vf_integrate.hlsli). B6 draws only the LOCAL_LIGHTS=0 ones; the others are compiled for B8.
++# SAMPLES_AUTHORED_NOISE keeps its default (0): the authored noise of the Classic layers is not used (design, section 2).
++volfog_shader(WolVolFogMarch ps vf_march.hlsl PERMUTATIONS
++    "STEPS=16,LOCAL_LIGHTS=0" "STEPS=16,LOCAL_LIGHTS=1"
++    "STEPS=24,LOCAL_LIGHTS=0" "STEPS=24,LOCAL_LIGHTS=1"
++    "STEPS=32,LOCAL_LIGHTS=0" "STEPS=32,LOCAL_LIGHTS=1")
++volfog_shader(WolVolFogComposite ps vf_composite.hlsl PERMUTATIONS
++    "STEPS=16,LOCAL_LIGHTS=0" "STEPS=16,LOCAL_LIGHTS=1"
++    "STEPS=24,LOCAL_LIGHTS=0" "STEPS=24,LOCAL_LIGHTS=1"
++    "STEPS=32,LOCAL_LIGHTS=0" "STEPS=32,LOCAL_LIGHTS=1")
++
++# B7: temporal filter and the packed linear depth of the previous frame (one permutation each). vf_temporal.hlsl and vf_history_depth.hlsl
++# are compiled as they are in coa-vfog; the history depth is written as RGB = (high byte, low byte, depth class) of the linear depth, so it
++# needs an 8 bit target (ARGB8), not R32F.
++volfog_shader(WolVolFogTemporal ps vf_temporal.hlsl)
++volfog_shader(WolVolFogHistoryDepth ps vf_history_depth.hlsl)
++
++add_custom_command(
++    OUTPUT ${VOLFOG_MPQ}
++    COMMAND "${VOLFOG_PYTHON}" -I ${VOLFOG_MKMPQ} ${VOLFOG_MPQ} ${VOLFOG_STAGE} ${VOLFOG_BLS_FILES}
++    DEPENDS ${VOLFOG_BLS_FILES} ${VOLFOG_MKMPQ}
++    COMMENT "mkmpq patch-Z.MPQ"
++    VERBATIM)
++
++add_custom_target(VolFogShaders ALL DEPENDS ${VOLFOG_MPQ})
+diff --git a/Shaders/VolFog/NOTICE-modificaciones.txt b/Shaders/VolFog/NOTICE-modificaciones.txt
+index c4abdaa..3a5f5aa 100644
+--- a/Shaders/VolFog/NOTICE-modificaciones.txt
++++ b/Shaders/VolFog/NOTICE-modificaciones.txt
+@@ -62,3 +62,12 @@ Modifications (GPLv3 section 5a), dated
+   - Engine/Source/VolFog/VolFogRender.cpp: the packing of the constants (c0-c13 common block, layers at c12, c53, c78, c96-c98) and the order of the
+     passes follow Renderer::Draw of src/renderer.cpp, rewritten over Gx (render targets, texture units, shader constants). Left out for now: the
+     temporal filter (B7), the local lights (B8) and the light shafts (B9).
++
++2026-10-20  Brief B7 (World of Legends, native volumetric fog, phase 3: temporal filter).
++  - vf_temporal.hlsl and vf_history_depth.hlsl are compiled as they are (CMakeLists.txt, one permutation each); no shader file was changed in this brief.
++    vf_history_depth.hlsl writes RGB = (high byte, low byte, depth class) of the linear depth, so its target is ARGB8 and not R32F.
++  - Engine/Source/VolFog/VolFogRender.cpp: the history ping-pong, the previous-frame matrix (viewToWorld * previousWorldToView * previousProjection),
++    the validity test (same projection, viewport, scale, quality, density and map; less than 0.25 s; less than 30 yards and 45 degrees in one frame;
++    the constants kHistoryMaxSeconds, kHistoryMaxMove and kHistoryMinForwardDot of src/renderer.cpp), the history weight 0.85, cMarch.x = 1 (step jitter,
++    frame index in cPixelGrid.y modulo 1024) and the order of the two sub-passes follow Renderer::FilterWithHistory and Renderer::Draw of
++    src/renderer.cpp, rewritten over Gx. Added here: wolVolFogDebug 3 (filtered history), 4 (image without the temporal filter), 5 (the B2 grid, moved from 3).
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index 9b2d856..291d942 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -775,17 +775,18 @@ bool CWorldParam::WolVolFogCallback(CVar* var, const char* oldValue, const char*
+ }
+ 
+ // Not in the original client. Debug view of the native volumetric fog pass (VolFog::Render, brief B2): 0 draws nothing,
+-// 1 depth in grey (needs the INTZ depth of brief B3), 2 the march buffer of the fog (brief B6; was a magenta tint in B2), 3 test grid.
++// 1 depth in grey (needs the INTZ depth of brief B3), 2 the raw march buffer of the fog (brief B6; was a magenta tint in B2), 3 the filtered
++// history (brief B7; was the test grid), 4 the image without the temporal filter (B7), 5 test grid (moved from 3 in B7).
+ // The value is read every frame, so no restart is needed.
+ bool CWorldParam::WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
+     int32_t mode = -1;
+ 
+-    if (value && value[0] >= '0' && value[0] <= '3' && value[1] == '\0') {
++    if (value && value[0] >= '0' && value[0] <= '5' && value[1] == '\0') {
+         mode = value[0] - '0';
+     }
+ 
+     if (mode < 0) {
+-        ConsoleWrite("wolVolFogDebug must be 0 (off), 1 (depth), 2 (march buffer) or 3 (grid).", DEFAULT_COLOR);
++        ConsoleWrite("wolVolFogDebug must be 0 (off), 1 (depth), 2 (march buffer), 3 (filtered history), 4 (no temporal filter) or 5 (grid).", DEFAULT_COLOR);
+ 
+         return false;
+     }
+@@ -892,7 +893,7 @@ void CWorldParam::RegisterVolFogCVars() {
+     VolFog::s_messageHook = WolVolFogMessage;
+     CWorldParam::cvar_wolVolFog = CVar::Register("wolVolFog", "Native volumetric fog (0 off, 1 low, 2 medium, 3 high); needs gxRestart to turn on or off", 1, "0", CWorldParam::WolVolFogCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Debug view of the native volumetric fog pass (brief B2).
+-    CWorldParam::cvar_wolVolFogDebug = CVar::Register("wolVolFogDebug", "Volumetric fog debug view (0 off, 1 depth, 2 march buffer, 3 grid)", 1, "0", CWorldParam::WolVolFogDebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolVolFogDebug = CVar::Register("wolVolFogDebug", "Volumetric fog debug view (0 off, 1 depth, 2 march buffer, 3 filtered history, 4 no temporal filter, 5 grid)", 1, "0", CWorldParam::WolVolFogDebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Brief B4: density, light shafts and scattered point lights; saved, applied at once.
+     CWorldParam::cvar_wolVolFogDensity = CVar::Register("wolVolFogDensity", "Volumetric fog density multiplier (0.0 to 4.0)", 1, "1.0", CWorldParam::WolVolFogDensityCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolVolFogGodRays = CVar::Register("wolVolFogGodRays", "Volumetric fog light shaft strength (0.0 off to 1.0)", 1, "0.0", CWorldParam::WolVolFogGodRaysCallback, CATEGORY_GRAPHICS, false, nullptr, false);

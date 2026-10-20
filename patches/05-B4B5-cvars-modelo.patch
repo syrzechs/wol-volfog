@@ -1,0 +1,1139 @@
+diff --git a/Engine/Source/VolFog/VolFog.cpp b/Engine/Source/VolFog/VolFog.cpp
+index 7cdcf5c..ffec6b3 100644
+--- a/Engine/Source/VolFog/VolFog.cpp
++++ b/Engine/Source/VolFog/VolFog.cpp
+@@ -3,3 +3,27 @@
+ // Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B1.
+ 
+ VolFog::Caps VolFog::s_caps;
++
++// Brief B4: the live values of wolVolFogDensity / wolVolFogGodRays / wolVolFogLocalLights. The CVar callbacks (WorldParam_CVar.cpp)
++// validate and call the setters; wolVolFog itself stays in s_mode (VolFogDepth.cpp) and is mirrored in `quality` on every read.
++namespace {
++    VolFog::SettingValues s_settings;
++}
++
++const VolFog::SettingValues& VolFog::Settings() {
++    s_settings.quality = VolFog::s_mode;
++
++    return s_settings;
++}
++
++void VolFog::SetDensity(float value) {
++    s_settings.density = value;
++}
++
++void VolFog::SetGodRays(float value) {
++    s_settings.godRays = value;
++}
++
++void VolFog::SetLocalLights(bool value) {
++    s_settings.localLights = value;
++}
+diff --git a/Engine/Source/VolFog/VolFog.h b/Engine/Source/VolFog/VolFog.h
+index dc52b01..61db663 100644
+--- a/Engine/Source/VolFog/VolFog.h
++++ b/Engine/Source/VolFog/VolFog.h
+@@ -30,6 +30,22 @@ namespace VolFog {
+     // Brief B3: wolVolFog (0-3), set by the CVar in WorldParam_CVar.cpp. 0 = original client.
+     extern int32_t s_mode;
+ 
++    // Brief B4: the other wolVolFog* CVars (WorldParam_CVar.cpp validates them and writes here; every consumer reads them each
++    // frame, so a change applies at once). `quality` mirrors wolVolFog (s_mode). Defaults = the CVar defaults.
++    struct SettingValues {
++        float density = 1.0f;       // wolVolFogDensity 0.0-4.0: multiplies the haze, the low fog and the distance fog
++        float godRays = 0.0f;       // wolVolFogGodRays 0.0-1.0: strength of the radial light shafts (0 = off)
++        bool localLights = true;    // wolVolFogLocalLights 0/1: point lights scattered in the fog
++        int32_t quality = 0;        // wolVolFog 0-3 (0 = original client)
++    };
++
++    // Live values of the CVars above. Not a copy: the reference stays valid for the whole run.
++    const SettingValues& Settings();
++    // Written by the CVar callbacks only.
++    void SetDensity(float value);
++    void SetGodRays(float value);
++    void SetLocalLights(bool value);
++
+     // True when the main depth should be the readable INTZ texture: wolVolFog > 0 and the device reports INTZ. The Gx
+     // backends ask it in ISetPresentParms (to drop MSAA) and in IStateSetD3DDefaults (to create the texture).
+     bool WantsReadableDepth();
+@@ -67,6 +83,12 @@ namespace VolFog {
+     // wolVolFogDebug 1 without a readable depth: the warning is written once per change of the CVar.
+     extern bool s_noDepthWarned;
+ 
++    // Brief B5: console command wolVolFogDump (registered by WoW/Source/WorldClient/VolFogWorld.cpp). RequestDump only marks it;
++    // VolFog::Render() calls RunPendingDump() first thing in the next world frame (the Gx matrices are the world camera's there),
++    // which prints the frame inputs and the model layers to the console and appends them to Logs\volfog.log.
++    void RequestDump();
++    void RunPendingDump();
++
+     // Draws the fog sub-passes over the world viewport of CGWorldFrame::OnWorldRender, between
+     // DayNight::RenderGlares and PlayerNameUpdateLate. With wolVolFogDebug 0 it draws nothing. If the shaders are
+     // not valid it writes one line to the console and does nothing else.
+diff --git a/Engine/Source/VolFog/VolFogDump.cpp b/Engine/Source/VolFog/VolFogDump.cpp
+new file mode 100644
+index 0000000..a012480
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogDump.cpp
+@@ -0,0 +1,119 @@
++#include <cmath>
++#include <cstdio>
++#include <ctime>
++#include <direct.h>
++#include "Engine/Source/ConsoleBase/IConsole.h"
++#include "Engine/Source/VolFog/VolFog.h"
++#include "Engine/Source/VolFog/VolFogInputs.h"
++#include "Engine/Source/VolFog/VolFogModel.h"
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B5.
++// Licensed under GPL-3.0-only (the layer fields are the ones of coa-vfog's FogLayer; see Shaders/VolFog/NOTICE-modificaciones.txt).
++//
++// wolVolFogDump: prints to the game console and appends to Logs\volfog.log (with a time stamp) the inputs the fog reads from the
++// client for the frame and the layers the model derives from them. It only prints; it is a console command, not a CVar. The
++// command runs on the event thread between frames, when the Gx matrices are not the world camera's, so it only asks for a dump
++// (RequestDump) and VolFog::Render() performs it inside the next world frame (RunPendingDump).
++
++namespace {
++    bool s_dumpPending;
++
++    void Emit(std::FILE* file, const char* line) {
++        ConsoleWrite(line, DEFAULT_COLOR);
++
++        if (file) {
++            std::fputs(line, file);
++            std::fputc('\n', file);
++        }
++    }
++
++    float Length3(const float* v) {
++        return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
++    }
++
++    void DumpNow() {
++        char line[512];
++        std::time_t now = std::time(nullptr);
++        std::tm local = {};
++        localtime_s(&local, &now);
++        char stamp[32];
++        std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &local);
++
++        _mkdir("Logs");
++        std::FILE* file = std::fopen("Logs\\volfog.log", "a");
++
++        const VolFog::SettingValues& settings = VolFog::Settings();
++        std::snprintf(line, sizeof(line), "[%s] wolVolFogDump  wolVolFog=%d density=%.2f godRays=%.2f localLights=%d intzDepth=%d debug=%d", stamp, settings.quality, settings.density, settings.godRays, settings.localLights ? 1 : 0, VolFog::DepthTexture() ? 1 : 0, VolFog::s_debugMode);
++        Emit(file, line);
++
++        VolFog::FrameInputs in;
++
++        if (!VolFog::CollectInputs(in)) {
++            Emit(file, "  inputs: not available (no world frame, no camera, or a value is not finite)");
++
++            if (file) {
++                std::fclose(file);
++            }
++
++            return;
++        }
++
++        float fogColor[3];
++        float sunColor[3];
++        float directColor[3];
++        float ambientColor[3];
++        VolFog::UnpackColor(in.fogColor, fogColor);
++        VolFog::UnpackColor(in.sunColor, sunColor);
++        VolFog::UnpackColor(in.directColor, directColor);
++        VolFog::UnpackColor(in.ambientColor, ambientColor);
++
++        float hours = in.dayFraction * 24.0f;
++        int hour = static_cast<int>(hours);
++        int minute = static_cast<int>((hours - static_cast<float>(hour)) * 60.0f);
++
++        std::snprintf(line, sizeof(line), "  in: dayFraction=%.4f (game time %02d:%02d) mapId=%d lightIsMoon=%d inLiquid=%d (type %u, depth %.2f) glow=%.3f (ffxGlow %d)", in.dayFraction, hour, minute, in.mapId, in.lightIsMoon ? 1 : 0, in.inLiquid ? 1 : 0, in.liquidTypeId, in.viewerLiquidDepth, in.clientGlowAmount, in.glowEffectActive ? 1 : 0);
++        Emit(file, line);
++        std::snprintf(line, sizeof(line), "  in: toLight=(%.4f, %.4f, %.4f) |toLight|=%.4f  toRaySource=(%.4f, %.4f, %.4f) sunElevation=%.4f", in.toLight[0], in.toLight[1], in.toLight[2], Length3(in.toLight), in.toRaySource[0], in.toRaySource[1], in.toRaySource[2], in.sunElevation);
++        Emit(file, line);
++        std::snprintf(line, sizeof(line), "  in: fogColor=(%.3f, %.3f, %.3f) sunColor=(%.3f, %.3f, %.3f) directColor=(%.3f, %.3f, %.3f) ambientColor=(%.3f, %.3f, %.3f)", fogColor[0], fogColor[1], fogColor[2], sunColor[0], sunColor[1], sunColor[2], directColor[0], directColor[1], directColor[2], ambientColor[0], ambientColor[1], ambientColor[2]);
++        Emit(file, line);
++        std::snprintf(line, sizeof(line), "  in: fogStart=%.2f fogEnd=%.2f zoneFogDistance=%.2f farClip=%.2f", in.fogStart, in.fogEnd, in.zoneFogDistance, in.farClip);
++        Emit(file, line);
++        std::snprintf(line, sizeof(line), "  in: cameraInterior=%d interiorBlend=%.3f fullyInterior=%d  camPos=(%.2f, %.2f, %.2f) camTarget=(%.2f, %.2f, %.2f)", in.localLights.cameraInterior ? 1 : 0, in.localLights.interiorBlend, in.fullyInterior ? 1 : 0, in.camPos[0], in.camPos[1], in.camPos[2], in.camTarget[0], in.camTarget[1], in.camTarget[2]);
++        Emit(file, line);
++        std::snprintf(line, sizeof(line), "  in: viewport=%u,%u %ux%u z %.2f..%.2f  projection far plane=%.2f", in.viewport.x, in.viewport.y, in.viewport.width, in.viewport.height, in.viewport.minZ, in.viewport.maxZ, in.glProjection[14] / (1.0f - in.glProjection[10]));
++        Emit(file, line);
++
++        VolFog::ModelTuning tuning = VolFog::CurrentTuning();
++        VolFog::FogParams fog = VolFog::BuildFogParams(in, tuning);
++
++        std::snprintf(line, sizeof(line), "  fog: active=%d linear=%d lightVisibility=%.4f lightAboveHorizon=%.4f referenceZ=%.2f farLimit=%.2f maxDistance=%.1f horizonStart=%.1f farClip=%.1f", fog.active ? 1 : 0, fog.linear ? 1 : 0, fog.lightVisibility, fog.lightAboveHorizon, fog.referenceZ, fog.farLimit, fog.maxDistance, fog.horizonStart, fog.farClip);
++        Emit(file, line);
++
++        static const char* const s_layerNames[VolFog::kFogLayers] = { "haze", "low fog", "unused", "distance" };
++
++        for (int i = 0; i < VolFog::kFogLayers; ++i) {
++            const VolFog::FogLayer& l = fog.layers[i];
++            std::snprintf(line, sizeof(line), "  layer %d (%s): start=%.2f density=%.7f g=%.2f isotropic=%.2f emissive=(%.3f, %.3f, %.3f) diffuse=(%.3f, %.3f, %.3f) upper=%.2f/%.5f lower=%.2f/%.5f strength=%.1f exponent=%.1f skyFalloff=%.1f endDistance=%.2f", i, s_layerNames[i], l.start, l.density, l.g, l.isotropic, l.emissive[0], l.emissive[1], l.emissive[2], l.diffuse[0], l.diffuse[1], l.diffuse[2], l.upperHeight, l.upperFalloff, l.lowerHeight, l.lowerFalloff, l.strength, l.exponent, l.skyFalloff, l.endDistance);
++            Emit(file, line);
++        }
++
++        if (file) {
++            std::fclose(file);
++        }
++    }
++}
++
++void VolFog::RequestDump() {
++    if (!s_dumpPending) {
++        s_dumpPending = true;
++        ConsoleWrite("wolVolFogDump: the dump is written in the next world frame (Logs\\volfog.log).", DEFAULT_COLOR);
++    }
++}
++
++void VolFog::RunPendingDump() {
++    if (s_dumpPending) {
++        s_dumpPending = false;
++        DumpNow();
++    }
++}
+diff --git a/Engine/Source/VolFog/VolFogInputs.cpp b/Engine/Source/VolFog/VolFogInputs.cpp
+new file mode 100644
+index 0000000..35dec68
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogInputs.cpp
+@@ -0,0 +1,55 @@
++#include "Engine/Source/VolFog/VolFogInputs.h"
++
++#include <cmath>
++#include <cstring>
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B5.
++// Licensed under GPL-3.0-only (see VolFogInputs.h and Shaders/VolFog/NOTICE-modificaciones.txt).
++
++VolFog::InputsProvider VolFog::s_inputsProvider;
++
++namespace {
++    bool Finite(const float* values, int count) {
++        for (int i = 0; i < count; ++i) {
++            if (!std::isfinite(values[i])) {
++                return false;
++            }
++        }
++
++        return true;
++    }
++}
++
++// Same conversion as UnpackColor in coa-vfog's fog_model.cpp.
++void VolFog::UnpackColor(uint32_t argb, float* rgb) {
++    rgb[0] = static_cast<float>((argb >> 16) & 0xFF) / 255.0f;
++    rgb[1] = static_cast<float>((argb >> 8) & 0xFF) / 255.0f;
++    rgb[2] = static_cast<float>(argb & 0xFF) / 255.0f;
++}
++
++bool VolFog::CollectInputs(FrameInputs& out) {
++    std::memset(&out, 0, sizeof(out));
++    out.viewport.maxZ = 1.0f;
++
++    if (!VolFog::s_inputsProvider || !VolFog::s_inputsProvider(out)) {
++        std::memset(&out, 0, sizeof(out));
++        out.viewport.maxZ = 1.0f;
++
++        return false;
++    }
++
++    bool finite = Finite(out.cameraRelativeView, 16) && Finite(out.glProjection, 16) && Finite(out.camPos, 3)
++        && Finite(out.camTarget, 3) && Finite(out.toLight, 3) && Finite(out.toRaySource, 3)
++        && std::isfinite(out.dayFraction) && std::isfinite(out.fogStart) && std::isfinite(out.fogEnd)
++        && std::isfinite(out.zoneFogDistance) && std::isfinite(out.farClip) && std::isfinite(out.clientGlowAmount)
++        && std::isfinite(out.localLights.interiorBlend);
++
++    if (!finite) {
++        std::memset(&out, 0, sizeof(out));
++        out.viewport.maxZ = 1.0f;
++
++        return false;
++    }
++
++    return true;
++}
+diff --git a/Engine/Source/VolFog/VolFogInputs.h b/Engine/Source/VolFog/VolFogInputs.h
+new file mode 100644
+index 0000000..ac44b91
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogInputs.h
+@@ -0,0 +1,78 @@
++#ifndef ENGINE_SOURCE_VOLFOG_VOLFOGINPUTS_H
++#define ENGINE_SOURCE_VOLFOG_VOLFOGINPUTS_H
++
++#include <cstdint>
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B5.
++// Licensed under GPL-3.0-only. FrameInputs is derived from `struct FrameInputs` of src/engine.h in coa-vfog 205ade5 (copyright of
++// the authors of CoAVolFog, jealous-sound and the contributors of the Raz0r1337 fork; see Shaders/VolFog/NOTICE-modificaciones.txt).
++// Modified 2026-10-20 (brief B5): in the namespace VolFog; D3DVIEWPORT9 replaced by VolFog::Viewport; the Classic-only members
++// (lightParams, point light table) are gone; toRaySource added; the values are read straight from the client instead of from fixed
++// addresses (WoW/Source/WorldClient/VolFogWorld.cpp).
++
++namespace VolFog {
++    // The world viewport that CGWorldFrame::OnWorldRender left set, in pixels from the top-left corner of the back buffer (same
++    // meaning as D3DVIEWPORT9), plus its depth range (z 0..0.94 for the world).
++    struct Viewport {
++        uint32_t x = 0;
++        uint32_t y = 0;
++        uint32_t width = 0;
++        uint32_t height = 0;
++        float minZ = 0.0f;
++        float maxZ = 1.0f;
++    };
++
++    // Brief B5: only the two interior values are filled; the point light table (up to 8 lights) is brief B8.
++    struct LocalLightInputs {
++        bool cameraInterior = false;    // the viewer is inside a WMO group that is not an exterior group (flags & 0x48 == 0)
++        float interiorBlend = 0.0f;     // 0..1: DNInfo.m_interiorFogBlend (distance to the nearest exterior portal * 0.04); 1 when no portal sees outside
++        uint32_t pointLightCount = 0;   // B8
++    };
++
++    // Everything the fog model and the passes need from the client for one frame (design 1.3). The member names are the ones of
++    // coa-vfog's FrameInputs, so that the packing of the constants (renderer.cpp) can be followed one to one.
++    struct FrameInputs {
++        float cameraRelativeView[16];   // GxXformView: eye at the origin, row-major, the same layout as the D3D matrix
++        float glProjection[16];         // GxXformProjection (GxuXformCreateProjection_Exact): ndc z = c2 + d2 / z, so far plane = [14] / (1 - [10])
++        float camPos[3];                // active camera position (world space)
++        float camTarget[3];             // the camera target (DNInfo.m_lightRefPos: the followed unit, or the camera itself)
++        Viewport viewport;
++        float dayFraction;              // DNInfo.m_dayProgression 0..1 (0.5 = noon)
++        float toLight[3];               // unit vector to the light that scatters: -DNInfo.m_light1.m_dir
++        bool lightIsMoon;               // the sun is below the horizon
++        uint32_t fogColor;              // A8R8G8B8, DNInfo.m_fogInterior.m_color (= m_fog.m_color outside; blended inside a WMO)
++        uint32_t sunColor;              // DNInfo.m_bands.m_sunCloudColors[0]
++        uint32_t directColor;           // DNInfo.m_bands.m_diffuse (SetLightColors: m_light1.m_diffuse)
++        uint32_t ambientColor;          // DNInfo.m_bands.m_ambient (SetLightColors: m_light1.m_ambient)
++        float fogStart;                 // DNInfo.m_fogInterior.m_start after UpdateFog
++        float fogEnd;                   // DNInfo.m_fogInterior.m_end after UpdateFog
++        float zoneFogDistance;          // DNInfo.m_bands.m_fogEnd (Light.dbc, before the far clip and the wolFarclipFactor)
++        float farClip;                  // DNInfo.m_farClip = camera far plane
++        float clientGlowAmount;         // DNInfo.m_bands.m_glow, only while ffxGlow is the active screen effect (0 otherwise, 0 in liquid)
++        bool inLiquid;                  // World::SceneCamLiquidStatus != 0
++        int32_t mapId;                  // World::QueryMapId
++        LocalLightInputs localLights;
++        // Added in brief B5 (not in coa-vfog's struct): the beams (brief B9) come from the visual position of the body, which does not
++        // coincide with the light direction.
++        float toRaySource[3];           // unit vector to the visual position of the sun, or of the moon when lightIsMoon
++        float sunElevation;             // z of the unit vector to the visual sun position (negative = below the horizon); lightIsMoon = it is < 0
++        float viewerLiquidDepth;        // World::SceneCamLiquidStatus(&depth): for the dump
++        uint32_t liquidTypeId;          // the same call, return value
++        bool fullyInterior;             // the viewer is in a WMO and no portal sees the outside (CPortalView::m_maxViewDepth < 0)
++        bool glowEffectActive;          // ffxGlow is the active screen effect
++    };
++
++    // The client side (WoW/Source/WorldClient/VolFogWorld.cpp) installs this when the CVars are registered: Engine/ does not depend
++    // on WoW/, so it only sees a function pointer. It returns false when it cannot fill the structure (no world frame, no camera).
++    typedef bool (*InputsProvider)(FrameInputs& out);
++    extern InputsProvider s_inputsProvider;
++
++    // Fills `out` from the client for the frame being drawn (call it from inside the world render: the matrices are the world camera's).
++    // Returns false, with `out` zeroed, when there is no provider, the provider fails or a value is not finite.
++    bool CollectInputs(FrameInputs& out);
++
++    // Small float helpers shared with the model: ARGB to 0..1 RGB.
++    void UnpackColor(uint32_t argb, float* rgb);
++}
++
++#endif
+diff --git a/Engine/Source/VolFog/VolFogModel.cpp b/Engine/Source/VolFog/VolFogModel.cpp
+new file mode 100644
+index 0000000..a145be4
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogModel.cpp
+@@ -0,0 +1,265 @@
++#include "Engine/Source/VolFog/VolFogModel.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include "Engine/Source/VolFog/VolFog.h"
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B5.
++// Licensed under GPL-3.0-only. Derived from src/fog_model.cpp of coa-vfog 205ade5 (copyright of the authors of CoAVolFog,
++// jealous-sound and the contributors of the Raz0r1337 fork; see Shaders/VolFog/NOTICE-modificaciones.txt).
++// Modified 2026-10-20 (brief B5): in the namespace VolFog; only the derived mode is kept (DerivedLayers, DistanceLayer,
++// ApplyInteriorFog and the matrix helpers; the authored/Classic layers, noise and direct-light matching are gone); Config is
++// replaced by ModelTuning; FogParams gains `active` (false in liquid).
++
++namespace {
++    constexpr float kHazeDensity = 0.00035f;
++    constexpr float kHazeG = 0.75f;
++    constexpr float kHazeIsotropic = 0.3f;
++    constexpr float kHazeFalloff = 1.0f / 220.0f;
++    constexpr float kHazeSun = 1.3f;
++    constexpr float kHazeAmbient = 0.8f;
++
++    constexpr float kGroundStart = 12.0f;
++    constexpr float kGroundOpticalDepth = 1.1f;
++    constexpr float kGroundG = 0.4f;
++    constexpr float kGroundIsotropic = 0.5f;
++    constexpr float kGroundFalloff = 1.0f / 18.0f;
++    constexpr float kGroundSun = 0.8f;
++    constexpr float kGroundAmbient = 0.75f;
++
++    constexpr float kFarOpticalDepth = 3.0f;
++    constexpr float kFarRamp = 60.0f;
++    constexpr float kFarStartFraction = 0.25f;
++    constexpr float kFarG = 0.2f;
++    constexpr float kFarIsotropic = 0.7f;
++    constexpr float kFarSun = 0.45f;
++    constexpr float kFarAmbient = 0.6f;
++    constexpr float kFarSkyFalloff = 10.0f;
++    constexpr float kFarExponent = 2.0f;
++
++    constexpr float kDerivedLayerLimit = 1500.0f;
++
++    constexpr float kLightSettingHalfWidth = 0.02f;
++    constexpr float kReferenceFarTarget = 200.0f;
++    constexpr float kNoLimit = 1.0e9f;
++
++    float SmoothStep(float e0, float e1, float x) {
++        float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
++
++        return t * t * (3.0f - 2.0f * t);
++    }
++
++    void Scale(const float* rgb, float s, float* out) {
++        out[0] = rgb[0] * s;
++        out[1] = rgb[1] * s;
++        out[2] = rgb[2] * s;
++    }
++
++    void Encode(float* rgb, bool linear) {
++        if (linear) {
++            for (int i = 0; i < 3; ++i) {
++                rgb[i] = std::pow(std::max(rgb[i], 0.0f), 2.2f);
++            }
++        }
++    }
++
++    float ReferenceZ(const VolFog::FrameInputs& in) {
++        float dx = in.camTarget[0] - in.camPos[0];
++        float dy = in.camTarget[1] - in.camPos[1];
++        float dz = in.camTarget[2] - in.camPos[2];
++
++        if (dx * dx + dy * dy + dz * dz > kReferenceFarTarget * kReferenceFarTarget) {
++            return in.camPos[2] - 2.0f;
++        }
++
++        return std::min(in.camPos[2], in.camTarget[2]) - 1.0f;
++    }
++
++    void Unshadowed(VolFog::FogLayer& l) {
++        std::memcpy(l.shadowEmissive, l.emissive, sizeof(l.emissive));
++        l.shadowDensity = 1.0f;
++        l.shadowed = 0.0f;
++    }
++
++    void Unbounded(VolFog::FogLayer& l) {
++        l.skyFalloff = 0.0f;
++        l.endDistance = kNoLimit;
++        l.densityVariation = 1.0f;
++    }
++
++    void DerivedLayers(const VolFog::ModelTuning& cfg, const VolFog::FogParams& p, float sunScatter, float fogDistance, const float* fogColor, VolFog::FogLayer* out) {
++        float foggyZone = std::clamp(700.0f / fogDistance, 0.6f, 2.5f);
++
++        VolFog::FogLayer& haze = out[0];
++        haze = VolFog::FogLayer{};
++        haze.start = 0.0f;
++        haze.density = kHazeDensity * cfg.haze * cfg.density * foggyZone;
++        haze.g = kHazeG;
++        haze.isotropic = kHazeIsotropic;
++        Scale(fogColor, kHazeAmbient * cfg.ambient, haze.emissive);
++        Scale(p.lightColor, kHazeSun * sunScatter, haze.diffuse);
++        haze.exponent = 1.0f;
++        haze.upperHeight = p.referenceZ;
++        haze.upperFalloff = kHazeFalloff;
++        Unshadowed(haze);
++        Unbounded(haze);
++        haze.endDistance = kDerivedLayerLimit;
++
++        VolFog::FogLayer& ground = out[1];
++        ground = VolFog::FogLayer{};
++        ground.start = kGroundStart;
++        ground.density = kGroundOpticalDepth * cfg.groundFog * cfg.density / std::max(fogDistance, 250.0f);
++        ground.g = kGroundG;
++        ground.isotropic = kGroundIsotropic;
++        Scale(fogColor, kGroundAmbient * cfg.ambient, ground.emissive);
++        Scale(p.lightColor, kGroundSun * sunScatter, ground.diffuse);
++        ground.exponent = 1.0f;
++        ground.upperHeight = p.referenceZ;
++        ground.upperFalloff = kGroundFalloff;
++        Unshadowed(ground);
++        Unbounded(ground);
++        ground.endDistance = kDerivedLayerLimit;
++
++        out[2] = VolFog::FogLayer{};
++        Unbounded(out[2]);
++    }
++
++    float DistanceFogOpticalDepthPerDensity(float farStart, float farLimit, float range) {
++        const float spanFraction = (farLimit - farStart) / range;
++
++        return range * (spanFraction + kFarRamp * spanFraction * spanFraction * spanFraction / 3.0f);
++    }
++
++    void DistanceLayer(const VolFog::FrameInputs& in, const VolFog::ModelTuning& cfg, const VolFog::FogParams& p, float sunScatter, const float* fogColor, VolFog::FogLayer& out) {
++        out = VolFog::FogLayer{};
++        float farStart = std::min(std::max(in.fogStart, 0.0f), p.farLimit * kFarStartFraction);
++        float opticalDepthPerDensity = DistanceFogOpticalDepthPerDensity(farStart, p.farLimit, p.maxDistance);
++        out.start = farStart;
++        out.density = cfg.stockFog && opticalDepthPerDensity > 0.0f ? kFarOpticalDepth * cfg.farFog * cfg.density / opticalDepthPerDensity : 0.0f;
++        out.g = kFarG;
++        out.isotropic = kFarIsotropic;
++        out.strength = kFarRamp;
++        out.exponent = kFarExponent;
++        out.skyFalloff = kFarSkyFalloff;
++        out.endDistance = p.farLimit;
++        Scale(fogColor, kFarAmbient * cfg.ambient, out.emissive);
++        Scale(p.lightColor, kFarSun * sunScatter, out.diffuse);
++        Unshadowed(out);
++    }
++
++    float InteriorWeight(const VolFog::FrameInputs& in, const VolFog::ModelTuning& cfg) {
++        return cfg.interiorAware && in.localLights.cameraInterior && std::isfinite(in.localLights.interiorBlend) ? std::clamp(in.localLights.interiorBlend, 0.0f, 1.0f) : 0.0f;
++    }
++
++    void ApplyInteriorFog(float weight, const VolFog::ModelTuning& cfg, VolFog::FogParams& fog) {
++        const float retainedDensity = std::isfinite(cfg.interiorDensity) ? std::clamp(cfg.interiorDensity, 0.0f, 1.0f) : 0.15f;
++        const float densityScale = 1.0f + (retainedDensity - 1.0f) * weight;
++
++        for (int i = 0; i < VolFog::kSceneLayers; ++i) {
++            fog.layers[i].density *= densityScale;
++        }
++
++        const float retainedFarFog = std::isfinite(cfg.interiorFarFog) ? std::clamp(cfg.interiorFarFog, 0.0f, 1.0f) : 1.0f;
++        fog.layers[VolFog::kDistanceFogLayer].density *= 1.0f + (retainedFarFog - 1.0f) * weight;
++
++        for (VolFog::FogLayer& layer : fog.layers) {
++            Scale(layer.diffuse, 1.0f - weight, layer.diffuse);
++        }
++
++        fog.lightVisibility *= 1.0f - weight;
++    }
++}
++
++VolFog::ModelTuning VolFog::CurrentTuning() {
++    ModelTuning tuning;
++    tuning.density = VolFog::Settings().density;
++
++    return tuning;
++}
++
++VolFog::FogParams VolFog::BuildFogParams(const FrameInputs& in, const ModelTuning& cfg) {
++    FogParams p = {};
++    p.linear = cfg.linear;
++    p.active = !in.inLiquid;
++    const float interiorWeight = InteriorWeight(in, cfg);
++    float fogColor[3];
++    VolFog::UnpackColor(in.fogColor, fogColor);
++    VolFog::UnpackColor(in.directColor, p.lightColor);
++    VolFog::UnpackColor(in.lightIsMoon ? in.directColor : in.sunColor, p.rayColor);
++    Encode(fogColor, p.linear);
++    Encode(p.lightColor, p.linear);
++
++    float elevation = SmoothStep(-0.03f, 0.10f, in.toLight[2]);
++    p.lightVisibility = elevation * (in.lightIsMoon ? kMoonLightScale : 1.0f);
++    p.lightAboveHorizon = SmoothStep(-kLightSettingHalfWidth, kLightSettingHalfWidth, in.toLight[2]);
++    p.farClip = in.farClip;
++    p.maxDistance = std::max(cfg.maxDistance, in.farClip);
++    p.horizonStart = in.farClip * 0.85f;
++    p.referenceZ = ReferenceZ(in);
++    p.farLimit = std::clamp(in.fogEnd, 100.0f, in.farClip);
++
++    float fogDistance = in.zoneFogDistance > 50.0f && in.zoneFogDistance < 20000.0f ? in.zoneFogDistance : in.fogEnd;
++    fogDistance = std::clamp(fogDistance, 50.0f, 5000.0f);
++    float elevationFadedScatter = p.lightVisibility * cfg.sunScatter;
++
++    FogLayer& distanceFog = p.layers[kDistanceFogLayer];
++    DerivedLayers(cfg, p, elevationFadedScatter, fogDistance, fogColor, p.layers);
++    DistanceLayer(in, cfg, p, elevationFadedScatter, fogColor, distanceFog);
++    ApplyInteriorFog(interiorWeight, cfg, p);
++
++    return p;
++}
++
++void VolFog::Mul4x4(const float* a, const float* b, float* out) {
++    float r[16];
++
++    for (int i = 0; i < 4; ++i) {
++        for (int j = 0; j < 4; ++j) {
++            r[i * 4 + j] = a[i * 4 + 0] * b[0 * 4 + j] + a[i * 4 + 1] * b[1 * 4 + j] + a[i * 4 + 2] * b[2 * 4 + j] + a[i * 4 + 3] * b[3 * 4 + j];
++        }
++    }
++
++    std::memcpy(out, r, sizeof(r));
++}
++
++bool VolFog::Invert4x4(const float* m, float* out) {
++    double inv[16];
++    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
++    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
++    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
++    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
++    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
++    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
++    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
++    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
++    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
++    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
++    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
++    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
++    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
++    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
++    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
++    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
++    double det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
++
++    if (std::fabs(det) < 1e-12) {
++        return false;
++    }
++
++    for (int i = 0; i < 16; ++i) {
++        out[i] = static_cast<float>(inv[i] / det);
++    }
++
++    return true;
++}
++
++void VolFog::TransformDirection(const float* v, const float* m, float* out) {
++    float r[3];
++
++    for (int j = 0; j < 3; ++j) {
++        r[j] = v[0] * m[0 * 4 + j] + v[1] * m[1 * 4 + j] + v[2] * m[2 * 4 + j];
++    }
++
++    std::memcpy(out, r, sizeof(r));
++}
+diff --git a/Engine/Source/VolFog/VolFogModel.h b/Engine/Source/VolFog/VolFogModel.h
+new file mode 100644
+index 0000000..7c399c0
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogModel.h
+@@ -0,0 +1,89 @@
++#ifndef ENGINE_SOURCE_VOLFOG_VOLFOGMODEL_H
++#define ENGINE_SOURCE_VOLFOG_VOLFOGMODEL_H
++
++#include <cstdint>
++#include "Engine/Source/VolFog/VolFogInputs.h"
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B5.
++// Licensed under GPL-3.0-only. Derived from src/fog_model.h of coa-vfog 205ade5 (copyright of the authors of CoAVolFog,
++// jealous-sound and the contributors of the Raz0r1337 fork; see Shaders/VolFog/NOTICE-modificaciones.txt).
++// Modified 2026-10-20 (brief B5): in the namespace VolFog; only the derived mode is kept (AuthoredLayers, AuthoredLayerNoise,
++// ClassicFogThinness, HaloHue, ClientToClassicDirectLight, AuthoredNoiseScroll, WithMeanNoise and the LayerNoise structures are
++// gone); Config is replaced by ModelTuning (the density comes from the wolVolFogDensity CVar through VolFog::Settings());
++// FogParams gains `active`.
++
++namespace VolFog {
++    struct FogLayer {
++        float start;
++        float density;
++        float g;
++        float isotropic;
++        float emissive[3];
++        float strength;
++        float diffuse[3];
++        float exponent;
++        float upperHeight;
++        float upperFalloff;
++        float lowerHeight;
++        float lowerFalloff;
++        float shadowEmissive[3];
++        float shadowDensity;
++        float shadowed;
++        float skyFalloff;
++        float endDistance;
++        float densityVariation;
++    };
++
++    static_assert(sizeof(FogLayer) == 6 * sizeof(float[4]), "FogLayer uploads as a march layer's six float4 registers");
++
++    constexpr float kMoonLightScale = 0.35f;
++
++    constexpr int kFogLayers = 4;
++    constexpr int kSceneLayers = 3;
++    constexpr int kDistanceFogLayer = kSceneLayers;
++    static_assert(kDistanceFogLayer + 1 == kFogLayers, "the distance fog follows the scene layers");
++
++    // Layer 0 = haze, 1 = low fog, 2 = unused in the derived mode (all zero), 3 = distance fog.
++    struct FogParams {
++        FogLayer layers[kFogLayers];
++        float lightColor[3];
++        float rayColor[3];
++        float lightVisibility;
++        float lightAboveHorizon;
++        float maxDistance;
++        float horizonStart;
++        float farClip;
++        float referenceZ;
++        float farLimit;
++        bool linear;
++        bool active;    // false while the camera is in liquid: the pass draws nothing and the client keeps its own (underwater) fog
++    };
++
++    // What coa-vfog reads from its Config for the model, minus the Classic and authored members. Only `density` follows a CVar
++    // (wolVolFogDensity); the rest are the values the model was tuned with (Config defaults of 205ade5).
++    struct ModelTuning {
++        float density = 1.0f;
++        float haze = 1.0f;
++        float groundFog = 0.6f;
++        float farFog = 1.0f;
++        float sunScatter = 1.0f;
++        float ambient = 1.0f;
++        float maxDistance = 5000.0f;
++        bool stockFog = true;       // Config::stockFog == 1: the distance layer stands in for the client's linear fog
++        bool linear = true;         // Config::colorSpace == 1: scatter in linear light (colours raised to 2.2)
++        bool interiorAware = true;
++        float interiorDensity = 0.15f;
++        float interiorFarFog = 1.0f;
++    };
++
++    // The tuning with the live wolVolFogDensity.
++    ModelTuning CurrentTuning();
++
++    FogParams BuildFogParams(const FrameInputs& in, const ModelTuning& cfg);
++
++    void Mul4x4(const float* a, const float* b, float* out);
++    bool Invert4x4(const float* m, float* out);
++    void TransformDirection(const float* v, const float* m, float* out);
++}
++
++#endif
+diff --git a/Engine/Source/VolFog/VolFogRender.cpp b/Engine/Source/VolFog/VolFogRender.cpp
+index ffc6613..ddd161d 100644
+--- a/Engine/Source/VolFog/VolFogRender.cpp
++++ b/Engine/Source/VolFog/VolFogRender.cpp
+@@ -97,6 +97,9 @@ namespace {
+ }
+ 
+ void VolFog::Render() {
++    // Brief B5: a pending wolVolFogDump runs here, inside the world frame (it only reads and prints).
++    VolFog::RunPendingDump();
++
+     int32_t mode = VolFog::s_debugMode;
+ 
+     if (mode < 1 || mode > 3) {
+diff --git a/Shaders/VolFog/NOTICE-modificaciones.txt b/Shaders/VolFog/NOTICE-modificaciones.txt
+index 4cfe1b1..2f7c251 100644
+--- a/Shaders/VolFog/NOTICE-modificaciones.txt
++++ b/Shaders/VolFog/NOTICE-modificaciones.txt
+@@ -31,3 +31,17 @@ Modifications (GPLv3 section 5a), dated
+   - WolVolFogDebug.hlsl: new file written for this project (not derived from CoAVolFog code), same licence.
+   - Build: the shaders are compiled with fxc (Windows SDK) from CMake, packed in the GXSH ".bls" container by
+     Tools/VolFog/mkbls.py and stored in bin/Win/Data/patch-Z.MPQ by Tools/VolFog/mkmpq.py.
++
++2026-10-20  Brief B5 (World of Legends, native volumetric fog, phase 3).
++  - Engine/Source/VolFog/VolFogModel.{h,cpp}: derived from src/fog_model.{h,cpp}. Kept: FogLayer, FogParams (without the noise
++    and authored members), DerivedLayers, DistanceLayer, ApplyInteriorFog, the phase constants, Mul4x4, Invert4x4 and
++    TransformDirection. Removed: AuthoredLayers, AuthoredLayerNoise, ClassicFogThinness, HaloHue, ClientToClassicDirectLight,
++    AuthoredNoiseScroll, WithMeanNoise, MeanNoise*, NoiseDensityCurve, AnyLayerNoise, EnergyNormalisedPhaseScale, LocalLightUpload.
++    Config is replaced by ModelTuning (the values of the Config defaults of 205ade5; only the density follows a CVar,
++    wolVolFogDensity, through VolFog::Settings()). FogParams gains `active` (false while the camera is in liquid). Code moved into
++    the namespace VolFog and reformatted to the client's style; the formulas are unchanged.
++  - Engine/Source/VolFog/VolFogInputs.{h,cpp}: FrameInputs derived from src/engine.h. D3DVIEWPORT9 -> VolFog::Viewport; lightParams
++    and the point light table removed (brief B8 adds the lights); added toRaySource, sunElevation, viewerLiquidDepth,
++    liquidTypeId, fullyInterior and glowEffectActive. The values are read from the client by WoW/Source/WorldClient/VolFogWorld.cpp
++    (written for this project; coa-vfog reads the same values from fixed addresses of the 3.3.5 binary).
++  - Engine/Source/VolFog/VolFogDump.cpp, VolFog::Settings(): new, not derived from CoAVolFog code, same licence.
+diff --git a/WoW/Source/WorldClient/VolFogWorld.cpp b/WoW/Source/WorldClient/VolFogWorld.cpp
+new file mode 100644
+index 0000000..49c908f
+--- /dev/null
++++ b/WoW/Source/WorldClient/VolFogWorld.cpp
+@@ -0,0 +1,194 @@
++#include "WoW/Source/WorldClient/VolFogWorld.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include "Engine/Source/ConsoleBase/ConsoleCommand.h"
++#include "Engine/Source/ConsoleBase/ConsoleVar.h"
++#include "Engine/Source/FFX/FFX.h"
++#include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
++#include "Engine/Source/Gx/Gx.h"
++#include "Engine/Source/Tempest/C44Matrix.h"
++#include "Engine/Source/Tempest/CRect.h"
++#include "Engine/Source/VolFog/VolFog.h"
++#include "Engine/Source/VolFog/VolFogInputs.h"
++#include "WoW/Source/UIUtil/Camera.h"
++#include "WoW/Source/Ui/WorldFrame.h"
++#include "WoW/Source/WorldClient/CPortalView.h"
++#include "WoW/Source/WorldClient/DayNight.h"
++#include "WoW/Source/WorldClient/DayNight__DNInfo.h"
++#include "WoW/Source/WorldClient/MapObj.h"
++#include "WoW/Source/WorldClient/MapObjDef.h"
++#include "WoW/Source/WorldClient/MapObjGroup.h"
++#include "WoW/Source/WorldClient/World.h"
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B5.
++// Licensed under GPL-3.0-only. This is the client side of FrameInputs (src/engine.h of coa-vfog 205ade5 reads the same values from
++// fixed addresses of the 3.3.5 binary; see Shaders/VolFog/NOTICE-modificaciones.txt). Written 2026-10-20 (brief B5).
++//
++// Names that differ from the table in the design (1.3):
++//  - fogColor / fogStart / fogEnd come from DNInfo::m_fogInterior, not m_fog: UpdateFog leaves m_fogInterior holding the final values
++//    (interior blend, eclipse and glow included; it equals m_fog outside WMOs, and inside only the colour differs), and brief B6
++//    will overwrite m_fog to switch the linear fog off. coa-vfog reads the same group (kFrameInputsFogGroup = 1).
++//  - sunColor / directColor / ambientColor are DNInfo::m_bands.m_sunCloudColors[0] / m_diffuse / m_ambient (SetLightColors copies
++//    the last two to m_light1.m_diffuse / m_ambient).
++//  - camTarget is DNInfo::m_lightRefPos (UpdateDayNight: the followed object, or the camera if there is none); CSimpleCamera has no
++//    target.
++//  - camPos is CGCamera::m_position (CSimpleCamera); the camera far plane is DNInfo::m_farClip = CGCamera::m_farZ.
++//  - the mapId is World::QueryMapId(); the interior test is CWorldScene::s_viewerMapObjDef + s_viewerMapObjGroups (group flags & 0x48
++//    as in CMapEntity::QueryCameraFog) and CWorldScene::frustumPortalView.m_maxViewDepth < 0 (CWorldScene::Render), not
++//    DNInfo::m_interiorMapObjDef, which UpdateFog clears every frame.
++
++namespace {
++    bool Normalize(float* v) {
++        float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
++
++        if (!(length > 1.0e-6f) || !std::isfinite(length)) {
++            return false;
++        }
++
++        v[0] /= length;
++        v[1] /= length;
++        v[2] /= length;
++
++        return true;
++    }
++
++    uint32_t Pack(const CImVector& color) {
++        return (static_cast<uint32_t>(color.a) << 24) | (static_cast<uint32_t>(color.r) << 16) | (static_cast<uint32_t>(color.g) << 8) | static_cast<uint32_t>(color.b);
++    }
++
++    bool CollectFrameInputs(VolFog::FrameInputs& out) {
++        CGCamera* camera = CGWorldFrame::GetActiveCamera();
++
++        if (!camera || !g_theGxDevicePtr) {
++            return false;
++        }
++
++        DayNight::DNInfo& info = DayNight::g_dnInfo;
++
++        // Matrices and viewport of the frame: GxXformView / GxXformProjection / GxXformViewport are what OnWorldRender left set.
++        C44Matrix view;
++        C44Matrix projection;
++        GxXformView(view);
++        GxXformProjection(projection);
++        static_assert(sizeof(C44Matrix) == sizeof(out.cameraRelativeView), "C44Matrix is 16 floats");
++        std::memcpy(out.cameraRelativeView, &view, sizeof(out.cameraRelativeView));
++        std::memcpy(out.glProjection, &projection, sizeof(out.glProjection));
++
++        CRect window = { 0.0f, 0.0f, 0.0f, 0.0f };
++        g_theGxDevicePtr->CapsWindowSize(window);
++        float width = window.maxX - window.minX;
++        float height = window.maxY - window.minY;
++        float minX = 0.0f;
++        float maxX = 0.0f;
++        float minY = 0.0f;
++        float maxY = 0.0f;
++        float minZ = 0.0f;
++        float maxZ = 1.0f;
++        GxXformViewport(minX, maxX, minY, maxY, minZ, maxZ);
++
++        // Same conversion as VolFog::Render: Gx viewport y grows upwards, pixels from the top-left corner of the back buffer.
++        out.viewport.x = static_cast<uint32_t>(std::max(minX * width, 0.0f));
++        out.viewport.y = static_cast<uint32_t>(std::max((1.0f - maxY) * height, 0.0f));
++        out.viewport.width = static_cast<uint32_t>(std::max((maxX - minX) * width, 0.0f));
++        out.viewport.height = static_cast<uint32_t>(std::max((maxY - minY) * height, 0.0f));
++        out.viewport.minZ = minZ;
++        out.viewport.maxZ = maxZ;
++
++        out.camPos[0] = camera->m_position.x;
++        out.camPos[1] = camera->m_position.y;
++        out.camPos[2] = camera->m_position.z;
++        out.camTarget[0] = info.m_lightRefPos.x;
++        out.camTarget[1] = info.m_lightRefPos.y;
++        out.camTarget[2] = info.m_lightRefPos.z;
++
++        out.dayFraction = info.m_dayProgression;
++
++        // Scattering: the direction of the light that lights the world (SetDirection), reversed: it points from the world to the light.
++        out.toLight[0] = -info.m_light1.m_dir.x;
++        out.toLight[1] = -info.m_light1.m_dir.y;
++        out.toLight[2] = -info.m_light1.m_dir.z;
++
++        if (!Normalize(out.toLight)) {
++            return false;
++        }
++
++        // Beams: the visual positions of the sun and the moon (SetPlanets: 12 yards from DNInfo::m_cameraPos). The light is the moon
++        // while the sun is below the horizon.
++        float toSun[3] = { DayNight::g_planets.m_sun.m_position.x - info.m_cameraPos.x, DayNight::g_planets.m_sun.m_position.y - info.m_cameraPos.y, DayNight::g_planets.m_sun.m_position.z - info.m_cameraPos.z };
++        float toMoon[3] = { DayNight::g_planets.m_moon.m_position.x - info.m_cameraPos.x, DayNight::g_planets.m_moon.m_position.y - info.m_cameraPos.y, DayNight::g_planets.m_moon.m_position.z - info.m_cameraPos.z };
++
++        if (!Normalize(toSun) || !Normalize(toMoon)) {
++            return false;
++        }
++
++        out.sunElevation = toSun[2];
++        out.lightIsMoon = toSun[2] < 0.0f;
++        std::memcpy(out.toRaySource, out.lightIsMoon ? toMoon : toSun, sizeof(out.toRaySource));
++
++        out.fogColor = Pack(info.m_fogInterior.m_color);
++        out.sunColor = Pack(info.m_bands.m_sunCloudColors[0]);
++        out.directColor = Pack(info.m_bands.m_diffuse);
++        out.ambientColor = Pack(info.m_bands.m_ambient);
++        out.fogStart = info.m_fogInterior.m_start;
++        out.fogEnd = info.m_fogInterior.m_end;
++        out.zoneFogDistance = info.m_bands.m_fogEnd;
++
++        out.farClip = info.m_farClip;
++
++        if (!(out.farClip > 10.0f && out.farClip < 100000.0f)) {
++            out.farClip = out.glProjection[14] / (1.0f - out.glProjection[10]);
++        }
++
++        if (!(out.farClip > 10.0f && out.farClip < 100000.0f)) {
++            out.farClip = 1000.0f;
++        }
++
++        float liquidDepth = 0.0f;
++        int32_t liquidType = World::SceneCamLiquidStatus(&liquidDepth);
++        out.inLiquid = liquidType != 0;
++        out.liquidTypeId = static_cast<uint32_t>(liquidType);
++        out.viewerLiquidDepth = liquidDepth;
++        out.mapId = World::QueryMapId();
++
++        // ffxGlow: only while the glow is the active screen effect (CGWorldFrame::UpdateScreenEffectParams returns early otherwise).
++        out.glowEffectActive = FFX::s_cvarFFX && FFX::s_cvarFFX->m_intValue && FFX::s_effect && FFX::s_effect == CGWorldFrame::ffxEffectGlow && FFX::s_effect->Valid();
++        out.clientGlowAmount = out.glowEffectActive && !out.inLiquid ? std::clamp(info.m_bands.m_glow, 0.0f, 1.0f) : 0.0f;
++
++        // Interior: the viewer is in a WMO group that is not an exterior group (flags 0x8 / 0x40), the test CMapEntity::QueryCameraFog uses.
++        CMapObjDef* viewer = CWorldScene::s_viewerMapObjDef;
++        bool interior = false;
++
++        if (viewer && viewer->m_owner) {
++            for (uint32_t i = 0; i < CWorldScene::s_viewerMapObjGroups.m_count; ++i) {
++                CMapObjGroup* group = viewer->m_owner->GetGroup(CWorldScene::s_viewerMapObjGroups.m_data[i], 0);
++
++                if (group && !(group->m_flags & 0x48)) {
++                    interior = true;
++                }
++            }
++        }
++
++        out.fullyInterior = viewer != nullptr && CWorldScene::frustumPortalView.m_maxViewDepth < 0.0f;
++        out.localLights.cameraInterior = interior;
++        float blend = std::isfinite(info.m_interiorFogBlend) ? std::clamp(info.m_interiorFogBlend, 0.0f, 1.0f) : 0.0f;
++        out.localLights.interiorBlend = interior && out.fullyInterior ? 1.0f : blend;
++
++        return true;
++    }
++
++    int32_t Command_Dump(const char* command, const char* arguments) {
++        VolFog::RequestDump();
++
++        return 1;
++    }
++}
++
++void VolFogWorld::Install() {
++    VolFog::s_inputsProvider = CollectFrameInputs;
++}
++
++void VolFogWorld::RegisterCommands() {
++    ConsoleCommandRegister("wolVolFogDump", Command_Dump, CATEGORY_GRAPHICS, "Prints the inputs and layers of the native volumetric fog to the console and Logs\\volfog.log");
++}
+diff --git a/WoW/Source/WorldClient/VolFogWorld.h b/WoW/Source/WorldClient/VolFogWorld.h
+new file mode 100644
+index 0000000..36968e3
+--- /dev/null
++++ b/WoW/Source/WorldClient/VolFogWorld.h
+@@ -0,0 +1,16 @@
++#ifndef WOW_SOURCE_WORLDCLIENT_VOLFOGWORLD_H
++#define WOW_SOURCE_WORLDCLIENT_VOLFOGWORLD_H
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B5.
++// Licensed under GPL-3.0-only (see Shaders/VolFog/NOTICE-modificaciones.txt).
++
++namespace VolFogWorld {
++    // Installs VolFog::s_inputsProvider (the reader of the frame inputs, design 1.3), so that Engine/Source/VolFog does not depend on
++    // WoW/. Called by CWorldParam::RegisterVolFogCVars.
++    void Install();
++
++    // Registers the console command wolVolFogDump. Called by CWorldParam::Initialize (the console command table exists by then).
++    void RegisterCommands();
++}
++
++#endif
+diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
+index edcf03e..0e9fa40 100644
+--- a/WoW/Source/WorldClient/WorldParam.h
++++ b/WoW/Source/WorldClient/WorldParam.h
+@@ -45,6 +45,10 @@ class CWorldParam {
+     // Not in the original client (World of Legends): native volumetric fog, see patches-cliente/niebla-volumetrica/README-niebla.md.
+     static CVar* cvar_wolVolFog;
+     static CVar* cvar_wolVolFogDebug;
++    // Brief B4: the other wolVolFog* CVars.
++    static CVar* cvar_wolVolFogDensity;
++    static CVar* cvar_wolVolFogGodRays;
++    static CVar* cvar_wolVolFogLocalLights;
+ 
+     static bool BaseMipCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool BspCacheCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+@@ -85,7 +89,11 @@ class CWorldParam {
+     static bool WolShadowMapSizeCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolVolFogCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+-    // Not in the original client (brief B3b): registers wolVolFog and wolVolFogDebug. RegisterGxCVars calls it before the Gx device exists.
++    // Not in the original client (brief B4): validated, applied at once (read every frame through VolFog::Settings()).
++    static bool WolVolFogDensityCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolVolFogGodRaysCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolVolFogLocalLightsCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    // Not in the original client (brief B3b): registers wolVolFog, wolVolFogDebug and (brief B4) wolVolFogDensity, wolVolFogGodRays and wolVolFogLocalLights. RegisterGxCVars calls it before the Gx device exists.
+     static void RegisterVolFogCVars();
+     static bool TextureFilteringCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WaterLodCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index 48a844e..c92cd05 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -1,5 +1,6 @@
+ #include "WorldParam.h"
+ #include <cstdio>
++#include <cstdlib>
+ #include <new>
+ #include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
+ #include "Engine/Source/Services/GfxSingletonManager.h"
+@@ -7,6 +8,7 @@
+ #include "Engine/Source/ShaderEffect/ShaderEffect.h"
+ #include "Engine/Source/ShaderEffect/ShadowCache.h"
+ #include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
++#include "WoW/Source/WorldClient/VolFogWorld.h" // Not in the original client (World of Legends)
+ #include "WoW/Common/AaBsp.h"
+ #include "WoW/Source/UIUtil/PortraitButton.h"
+ #include "WoW/Source/WorldClient/Map.h"
+@@ -119,6 +121,9 @@ CVar* CWorldParam::cvar_wolShadowMapSize;
+ // Not in the original client (World of Legends): wolVolFogDebug, see patches-cliente/niebla-volumetrica/README-niebla.md.
+ CVar* CWorldParam::cvar_wolVolFog;
+ CVar* CWorldParam::cvar_wolVolFogDebug;
++CVar* CWorldParam::cvar_wolVolFogDensity;
++CVar* CWorldParam::cvar_wolVolFogGodRays;
++CVar* CWorldParam::cvar_wolVolFogLocalLights;
+ 
+ #define WOL_FARCLIP_FACTOR_MAX 3.0f
+ 
+@@ -798,14 +803,102 @@ bool CWorldParam::WolVolFogDebugCallback(CVar* var, const char* oldValue, const
+     return true;
+ }
+ 
++// Not in the original client (brief B4). Whole-string number test for the wolVolFog* float CVars: a value such as "2x" or "" is
++// rejected instead of being read as 0 (SStrToFloat).
++static bool WolVolFogParseFloat(const char* value, float& result) {
++    if (!value || !*value) {
++        return false;
++    }
++
++    char* end = nullptr;
++    double parsed = strtod(value, &end);
++
++    if (end == value || *end != '\0' || parsed != parsed) {
++        return false;
++    }
++
++    result = static_cast<float>(parsed);
++
++    return true;
++}
++
++// Not in the original client (brief B4). wolVolFogDensity 0.0-4.0 (default 1.0): multiplies the haze, the low fog and the distance
++// fog of the model (VolFogModel.cpp). Read every frame, so it applies at once.
++bool CWorldParam::WolVolFogDensityCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float density = 0.0f;
++
++    if (!WolVolFogParseFloat(value, density) || density < 0.0f || density > 4.0f) {
++        ConsoleWrite("wolVolFogDensity must be in range 0.0 to 4.0.", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    VolFog::SetDensity(density);
++
++    // No message while the CVar is first registered (no previous value).
++    if (oldValue && *oldValue) {
++        char buffer[64];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFogDensity: %.2f", static_cast<double>(density));
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief B4). wolVolFogGodRays 0.0-1.0 (default 0.0): strength of the radial light shafts (0 = off).
++bool CWorldParam::WolVolFogGodRaysCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float strength = 0.0f;
++
++    if (!WolVolFogParseFloat(value, strength) || strength < 0.0f || strength > 1.0f) {
++        ConsoleWrite("wolVolFogGodRays must be in range 0.0 to 1.0.", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    VolFog::SetGodRays(strength);
++
++    if (oldValue && *oldValue) {
++        char buffer[64];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFogGodRays: %.2f", static_cast<double>(strength));
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief B4). wolVolFogLocalLights 0 or 1 (default 1): point lights scattered in the fog.
++bool CWorldParam::WolVolFogLocalLightsCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    if (!value || (value[0] != '0' && value[0] != '1') || value[1] != '\0') {
++        ConsoleWrite("wolVolFogLocalLights must be 0 (off) or 1 (on).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    VolFog::SetLocalLights(value[0] == '1');
++
++    if (oldValue && *oldValue) {
++        char buffer[64];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFogLocalLights: %s", value[0] == '1' ? "on" : "off");
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
+ // Not in the original client (brief B3b). Called from RegisterGxCVars, before the Gx device is created (it used to be in Initialize,
+ // after the device): with wolVolFog saved in Config.wtf the first device already drops MSAA and builds the INTZ depth, no gxRestart.
+ void CWorldParam::RegisterVolFogCVars() {
+-    // Native volumetric fog (brief B3); B4 adds the other wolVolFog* CVars. Needs gxRestart to go between 0 and above 0.
++    // Native volumetric fog (brief B3). Needs gxRestart to go between 0 and above 0.
+     VolFog::s_messageHook = WolVolFogMessage;
+     CWorldParam::cvar_wolVolFog = CVar::Register("wolVolFog", "Native volumetric fog (0 off, 1 low, 2 medium, 3 high); needs gxRestart to turn on or off", 1, "0", CWorldParam::WolVolFogCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+-    // Debug view of the native volumetric fog pass (brief B2); B4 adds the other wolVolFog* CVars.
++    // Debug view of the native volumetric fog pass (brief B2).
+     CWorldParam::cvar_wolVolFogDebug = CVar::Register("wolVolFogDebug", "Volumetric fog debug view (0 off, 1 depth, 2 tint, 3 grid)", 1, "0", CWorldParam::WolVolFogDebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Brief B4: density, light shafts and scattered point lights; saved, applied at once.
++    CWorldParam::cvar_wolVolFogDensity = CVar::Register("wolVolFogDensity", "Volumetric fog density multiplier (0.0 to 4.0)", 1, "1.0", CWorldParam::WolVolFogDensityCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolVolFogGodRays = CVar::Register("wolVolFogGodRays", "Volumetric fog light shaft strength (0.0 off to 1.0)", 1, "0.0", CWorldParam::WolVolFogGodRaysCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolVolFogLocalLights = CVar::Register("wolVolFogLocalLights", "Point lights scattered in the volumetric fog (0 off, 1 on)", 1, "1", CWorldParam::WolVolFogLocalLightsCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Brief B5: the reader of the frame inputs for the fog model (Engine/ does not depend on WoW/).
++    VolFogWorld::Install();
+ }
+ 
+ // VERIFY: 9acf82a1 auto
+@@ -816,7 +909,9 @@ void CWorldParam::Initialize() {
+     CWorldParam::cvar_wolFarClipFactor = CVar::Register("wolFarclipFactor", "Scales the view distance limits (1.0 original, up to 3.0)", 1, "1.0", CWorldParam::WolFarClipFactorCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Not in the original client: also before extShadowQuality, so the saved shadow map size is in place when the shadow cache starts.
+     CWorldParam::cvar_wolShadowMapSize = CVar::Register("wolShadowMapSize", "Exterior shadow map size (0 original, 1024, 2048 or 4096)", 1, "0", CWorldParam::WolShadowMapSizeCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+-    // Not in the original client: wolVolFog and wolVolFogDebug are registered earlier, in RegisterGxCVars (CWorldParam::RegisterVolFogCVars, brief B3b).
++    // Not in the original client: the wolVolFog* CVars are registered earlier, in RegisterGxCVars (CWorldParam::RegisterVolFogCVars, briefs B3b and B4).
++    // Brief B5: the console command wolVolFogDump (it only prints; it is not a CVar).
++    VolFogWorld::RegisterCommands();
+     CWorldParam::cvar_farClipOverride = CVar::Register("farClipOverride", "Override old world graphic settings", 1, "0", CWorldParam::FarClipOverrideCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_lod = CVar::Register("lod", "Video option: Toggle Lod", 1, "0", CWorldParam::LodCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_mapShadows = CVar::Register("mapShadows", "Video option: Toggle map shadows", 1, "1", CWorldParam::MapShadowsCallback, CATEGORY_GRAPHICS, false, nullptr, false);

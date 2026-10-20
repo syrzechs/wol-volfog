@@ -1,0 +1,291 @@
+diff --git a/WoW/Source/Client.h b/WoW/Source/Client.h
+index 90c956e..81462c2 100644
+--- a/WoW/Source/Client.h
++++ b/WoW/Source/Client.h
+@@ -57,6 +57,9 @@ extern CVar* g_readEULAVar;
+ extern CVar* g_readScanningVar;
+ extern CVar* g_readTerminationWithoutNoticeVar;
+ extern CVar* g_readTOSVar;
++// Not in the original client: remember-password support for the login screen.
++extern CVar* g_savePasswordVar;
++extern CVar* g_savedPasswordVar;
+ extern WowClientDB<Startup_StringsRec> g_startup_StringsDB;
+ extern CVar* s_cvarUIFaster;
+ extern CVar* s_cvExpansionMovie;
+diff --git a/WoW/Source/Client_CVar.cpp b/WoW/Source/Client_CVar.cpp
+index f7f0319..ee763b6 100644
+--- a/WoW/Source/Client_CVar.cpp
++++ b/WoW/Source/Client_CVar.cpp
+@@ -119,6 +119,10 @@ CVar* g_accountListVar;
+ // STATIC: 0x00B2F990
+ CVar* g_accountNameVar;
+ 
++// Not in the original client: remember-password support for the login screen.
++CVar* g_savePasswordVar;
++CVar* g_savedPasswordVar;
++
+ // STATIC: 0x00B2F9F8
+ CVar* s_cvarUIFaster;
+ 
+@@ -644,6 +648,10 @@ void ClientRegisterConsoleCommands() {
+     g_accountNameVar = CVar::Register("accountName", "Saved account name", 0x40, "", nullptr, CATEGORY_GAME, false, nullptr, false);
+     g_accountListVar = CVar::Register("accountList", "List of wow accounts for saved Blizzard account", 0, "", nullptr, CATEGORY_GAME, false, nullptr, false);
+     g_accountUsesTokenVar = CVar::Register("g_accountUsesToken", "Saved whether uses authenticator", 0, "0", nullptr, CATEGORY_GAME, false, nullptr, false);
++    // Not in the original client: remember-password support (see Script_SetSavedAccountPassword). Flag 0x40 hides
++    // savedPassword from GetCVar in the in-game UI, like accountName.
++    g_savePasswordVar = CVar::Register("savePassword", "Remember the account password on the login screen", 0, "0", nullptr, CATEGORY_GAME, false, nullptr, false);
++    g_savedPasswordVar = CVar::Register("savedPassword", "Saved account password (obfuscated, not encrypted)", 0x40, "", nullptr, CATEGORY_GAME, false, nullptr, false);
+     s_cvMovie = CVar::Register("movie", "Show movie on startup", 0, "1", nullptr, CATEGORY_GAME, false, nullptr, false);
+     s_cvExpansionMovie = CVar::Register("expansionMovie", "Show expansion movie on startup", 0, "1", nullptr, CATEGORY_GAME, false, nullptr, false);
+     s_cvMovieSubtitle = CVar::Register("movieSubtitle", "Show movie subtitles", 0, "0", nullptr, CATEGORY_GAME, false, nullptr, false);
+diff --git a/WoW/Source/Glue/GlueScriptEvents_Scripts.cpp b/WoW/Source/Glue/GlueScriptEvents_Scripts.cpp
+index f65851f..e04dd14 100644
+--- a/WoW/Source/Glue/GlueScriptEvents_Scripts.cpp
++++ b/WoW/Source/Glue/GlueScriptEvents_Scripts.cpp
+@@ -1,6 +1,7 @@
+ #include "GlueMgr.h"
+ #include <cstdint>
+ #include <cstdio>
++#include <cstring>
+ #include "Engine/Source/Base/Coordinate.h"
+ #include "Engine/Source/BlizzardCore/SFile2-Core.h"
+ #include "Engine/Source/BlizzardCore/Source/Packages/Streaming/Streaming.h"
+@@ -1596,6 +1597,228 @@ static int32_t Script_IsStreamingMode(lua_State* L) {
+     return SFile::IsStreamingMode();
+ }
+ 
++// Not in the original client: remember-password support for the login screen (GlueXML AccountLogin).
++//
++// The password is kept in the savedPassword CVar (WTF\Config.wtf), obfuscated, NOT encrypted: a checksum byte plus the
++// password bytes are XORed with a keystream seeded from a fixed salt and the saved account name, then base64 encoded
++// and prefixed with a version tag ("1:"). This only keeps the password from being readable at a glance or by search;
++// anyone who has Config.wtf and knows this scheme can recover it. savePassword says whether the feature is on.
++static const char s_savedPasswordTag[] = "1:";
++static const char s_savedPasswordBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++static const size_t SAVED_PASSWORD_MAX = 128;
++
++static void SavedPasswordWipe(void* data, size_t size) {
++    volatile uint8_t* bytes = static_cast<volatile uint8_t*>(data);
++
++    while (size--) {
++        *bytes++ = 0;
++    }
++}
++
++static uint32_t SavedPasswordSeed(const char* accountName) {
++    // FNV-1a over the salt and the upper-cased account name
++    uint32_t hash = 2166136261u;
++
++    for (const char* c = "wowdecomp.savedPassword"; *c; c++) {
++        hash = (hash ^ static_cast<uint8_t>(*c)) * 16777619u;
++    }
++
++    for (const char* c = accountName; c && *c; c++) {
++        uint8_t ch = static_cast<uint8_t>(*c);
++
++        if (ch >= 'a' && ch <= 'z') {
++            ch = static_cast<uint8_t>(ch - 'a' + 'A');
++        }
++
++        hash = (hash ^ ch) * 16777619u;
++    }
++
++    return hash ? hash : 0x9E3779B9u;
++}
++
++static void SavedPasswordXor(uint8_t* data, size_t length, const char* accountName) {
++    uint32_t state = SavedPasswordSeed(accountName);
++
++    for (size_t i = 0; i < length; i++) {
++        // xorshift32
++        state ^= state << 13;
++        state ^= state >> 17;
++        state ^= state << 5;
++        data[i] ^= static_cast<uint8_t>(state >> 24);
++    }
++}
++
++static uint8_t SavedPasswordChecksum(const uint8_t* data, size_t length) {
++    uint8_t sum = 0xA5;
++
++    for (size_t i = 0; i < length; i++) {
++        sum = static_cast<uint8_t>(((sum << 1) | (sum >> 7)) ^ data[i]);
++    }
++
++    return sum;
++}
++
++static int32_t SavedPasswordBase64Value(char c) {
++    if (c >= 'A' && c <= 'Z') {
++        return c - 'A';
++    }
++
++    if (c >= 'a' && c <= 'z') {
++        return c - 'a' + 26;
++    }
++
++    if (c >= '0' && c <= '9') {
++        return c - '0' + 52;
++    }
++
++    if (c == '+') {
++        return 62;
++    }
++
++    if (c == '/') {
++        return 63;
++    }
++
++    return -1;
++}
++
++static bool EncodeSavedPassword(const char* password, size_t length, const char* accountName, char* out, size_t outSize) {
++    // Embedded NULs are refused: DefaultServerLogin zeroes the password string it gets, so a zeroed string here means
++    // it was passed after the login call, not a real password.
++    if (!password || !length || length > SAVED_PASSWORD_MAX || memchr(password, 0, length)) {
++        return false;
++    }
++
++    uint8_t buffer[SAVED_PASSWORD_MAX + 1];
++    size_t total = length + 1;
++
++    if (sizeof(s_savedPasswordTag) - 1 + (total + 2) / 3 * 4 + 1 > outSize) {
++        return false;
++    }
++
++    buffer[0] = SavedPasswordChecksum(reinterpret_cast<const uint8_t*>(password), length);
++    memcpy(&buffer[1], password, length);
++    SavedPasswordXor(buffer, total, accountName);
++
++    char* dest = out;
++    memcpy(dest, s_savedPasswordTag, sizeof(s_savedPasswordTag) - 1);
++    dest += sizeof(s_savedPasswordTag) - 1;
++
++    for (size_t i = 0; i < total; i += 3) {
++        uint32_t chunk = static_cast<uint32_t>(buffer[i]) << 16;
++
++        if (i + 1 < total) {
++            chunk |= static_cast<uint32_t>(buffer[i + 1]) << 8;
++        }
++
++        if (i + 2 < total) {
++            chunk |= buffer[i + 2];
++        }
++
++        *dest++ = s_savedPasswordBase64[(chunk >> 18) & 0x3F];
++        *dest++ = s_savedPasswordBase64[(chunk >> 12) & 0x3F];
++        *dest++ = (i + 1 < total) ? s_savedPasswordBase64[(chunk >> 6) & 0x3F] : '=';
++        *dest++ = (i + 2 < total) ? s_savedPasswordBase64[chunk & 0x3F] : '=';
++    }
++
++    *dest = '\0';
++    SavedPasswordWipe(buffer, sizeof(buffer));
++
++    return true;
++}
++
++static bool DecodeSavedPassword(const char* encoded, const char* accountName, char* out, size_t outSize) {
++    size_t tagLength = sizeof(s_savedPasswordTag) - 1;
++
++    if (!encoded || strncmp(encoded, s_savedPasswordTag, tagLength)) {
++        return false;
++    }
++
++    uint8_t buffer[SAVED_PASSWORD_MAX + 1];
++    size_t total = 0;
++    uint32_t chunk = 0;
++    int32_t bits = 0;
++
++    for (const char* c = encoded + tagLength; *c && *c != '='; c++) {
++        int32_t value = SavedPasswordBase64Value(*c);
++
++        if (value < 0) {
++            SavedPasswordWipe(buffer, sizeof(buffer));
++            return false;
++        }
++
++        chunk = (chunk << 6) | static_cast<uint32_t>(value);
++        bits += 6;
++
++        if (bits >= 8) {
++            bits -= 8;
++
++            if (total >= sizeof(buffer)) {
++                SavedPasswordWipe(buffer, sizeof(buffer));
++                return false;
++            }
++
++            buffer[total++] = static_cast<uint8_t>(chunk >> bits);
++        }
++    }
++
++    bool valid = total >= 2 && total - 1 < outSize;
++
++    if (valid) {
++        SavedPasswordXor(buffer, total, accountName);
++        valid = buffer[0] == SavedPasswordChecksum(&buffer[1], total - 1) && !memchr(&buffer[1], 0, total - 1);
++    }
++
++    if (valid) {
++        memcpy(out, &buffer[1], total - 1);
++        out[total - 1] = '\0';
++    }
++
++    SavedPasswordWipe(buffer, sizeof(buffer));
++
++    return valid;
++}
++
++// Not in the original client. Returns the remembered password, or "" when savePassword is off, nothing is saved or
++// the saved value does not belong to the saved account name.
++static int32_t Script_GetSavedAccountPassword(lua_State* L) {
++    const char* accountName = g_accountNameVar->m_stringValue.m_str;
++    char password[SAVED_PASSWORD_MAX + 1];
++
++    if (g_savePasswordVar->m_intValue && accountName && *accountName && DecodeSavedPassword(g_savedPasswordVar->m_stringValue.m_str, accountName, password, sizeof(password))) {
++        lua_pushstring(L, password);
++        SavedPasswordWipe(password, sizeof(password));
++    } else {
++        lua_pushstring(L, "");
++    }
++
++    return 1;
++}
++
++// Not in the original client. Saves the password for the current saved account name (call SetSavedAccountName first)
++// and turns savePassword on; "" (or no saved account name) clears it and turns savePassword off.
++static int32_t Script_SetSavedAccountPassword(lua_State* L) {
++    if (!lua_isstring(L, 1)) {
++        luaL_error(L, "Usage: SetSavedAccountPassword(\"password\")");
++        return 0;
++    }
++
++    size_t length = 0;
++    const char* password = lua_tolstring(L, 1, &length);
++    const char* accountName = g_accountNameVar->m_stringValue.m_str;
++    char encoded[192];
++
++    if (accountName && *accountName && EncodeSavedPassword(password, length, accountName, encoded, sizeof(encoded))) {
++        g_savedPasswordVar->Set(encoded, true, false, false, true);
++        g_savePasswordVar->Set("1", true, false, false, true);
++    } else {
++        g_savedPasswordVar->Set("", true, false, false, true);
++        g_savePasswordVar->Set("0", true, false, false, true);
++    }
++
++    return 0;
++}
++
+ // STATIC: 0x00AC3E00
+ static FrameScript_Method s_scriptFunctions[] = {
+     { "IsShiftKeyDown", &Script_IsShiftKeyDown },
+@@ -1603,6 +1826,9 @@ static FrameScript_Method s_scriptFunctions[] = {
+     { "GetLocale", &Script_GetLocale },
+     { "GetSavedAccountName", &Script_GetSavedAccountName },
+     { "SetSavedAccountName", &Script_SetSavedAccountName },
++    // Not in the original client: remember-password support
++    { "GetSavedAccountPassword", &Script_GetSavedAccountPassword },
++    { "SetSavedAccountPassword", &Script_SetSavedAccountPassword },
+     { "GetUsesToken", &Script_GetUsesToken },
+     { "SetUsesToken", &Script_SetUsesToken },
+     { "GetSavedAccountList", &Script_GetSavedAccountList },

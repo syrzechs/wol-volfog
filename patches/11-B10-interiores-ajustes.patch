@@ -1,0 +1,349 @@
+diff --git a/Engine/Source/VolFog/VolFogDump.cpp b/Engine/Source/VolFog/VolFogDump.cpp
+index 225e8b6..b8828c7 100644
+--- a/Engine/Source/VolFog/VolFogDump.cpp
++++ b/Engine/Source/VolFog/VolFogDump.cpp
+@@ -72,7 +72,7 @@ namespace {
+         int hour = static_cast<int>(hours);
+         int minute = static_cast<int>((hours - static_cast<float>(hour)) * 60.0f);
+ 
+-        std::snprintf(line, sizeof(line), "  in: dayFraction=%.4f (game time %02d:%02d) mapId=%d lightIsMoon=%d inLiquid=%d (type %u, depth %.2f) glow=%.3f (ffxGlow %d)", in.dayFraction, hour, minute, in.mapId, in.lightIsMoon ? 1 : 0, in.inLiquid ? 1 : 0, in.liquidTypeId, in.viewerLiquidDepth, in.clientGlowAmount, in.glowEffectActive ? 1 : 0);
++        std::snprintf(line, sizeof(line), "  in: dayFraction=%.4f (game time %02d:%02d) mapId=%d fogMode=%d lightIsMoon=%d inLiquid=%d (type %u, depth %.2f) glow=%.3f (ffxGlow %d)", in.dayFraction, hour, minute, in.mapId, in.fogMode, in.lightIsMoon ? 1 : 0, in.inLiquid ? 1 : 0, in.liquidTypeId, in.viewerLiquidDepth, in.clientGlowAmount, in.glowEffectActive ? 1 : 0);
+         Emit(file, line);
+         std::snprintf(line, sizeof(line), "  in: toLight=(%.4f, %.4f, %.4f) |toLight|=%.4f  toRaySource=(%.4f, %.4f, %.4f) sunElevation=%.4f", in.toLight[0], in.toLight[1], in.toLight[2], Length3(in.toLight), in.toRaySource[0], in.toRaySource[1], in.toRaySource[2], in.sunElevation);
+         Emit(file, line);
+diff --git a/Engine/Source/VolFog/VolFogInputs.h b/Engine/Source/VolFog/VolFogInputs.h
+index 9e9b41b..b51c500 100644
+--- a/Engine/Source/VolFog/VolFogInputs.h
++++ b/Engine/Source/VolFog/VolFogInputs.h
+@@ -62,6 +62,7 @@ namespace VolFog {
+         uint32_t liquidTypeId;          // the same call, return value
+         bool fullyInterior;             // the viewer is in a WMO and no portal sees the outside (CPortalView::m_maxViewDepth < 0)
+         bool glowEffectActive;          // ffxGlow is the active screen effect
++        int32_t fogMode;                // Added in brief B10: DayNight's fogMode (0 = linear fog, 1 = exponential fog of Outland / Northrend maps)
+         // Added in brief B8: the scene whose CM2Scene::m_lightGrid holds the point lights of the world (World::s_m2Scene); VolFog::PrepareLights walks it.
+         CM2Scene* worldM2Scene;
+         // Added in brief B9: visibility of the body the shafts start from (the sun, or the moon when lightIsMoon). rayOcclusion is the fraction 0..1 of
+diff --git a/Engine/Source/VolFog/VolFogLights.cpp b/Engine/Source/VolFog/VolFogLights.cpp
+index ebce8a1..cfa5404 100644
+--- a/Engine/Source/VolFog/VolFogLights.cpp
++++ b/Engine/Source/VolFog/VolFogLights.cpp
+@@ -30,6 +30,7 @@
+ // no client signature check and no guarded read; the interior capture of coa-vfog is not needed (VolFogWorld.cpp fills cameraInterior); the
+ // activity log line is gone (the counters are printed by wolVolFogDump); the texture is made with the pure D3D9 device that CreateDepthTexture
+ // is given, as the INTZ depth is, instead of going through the Gx upload path (which has no blit for A32B32G32R32F, and no scratch texture on D3D9Ex).
++// Modified 2026-10-20 (brief B10): the cut-off is 1/32, not 1/256, and lights whose faded colour is under it are not uploaded.
+ 
+ namespace {
+     constexpr uint32_t kBucketCount = 64 * 64;
+@@ -740,6 +741,7 @@ namespace {
+     uint32_t s_candidatesInView;
+ 
+     CGxTex* s_wrapper;
++    uint32_t s_textureGeneration;   // brief B10: creations of the texture
+ #if defined(_WIN32)
+     IDirect3DDevice9* s_device;
+     IDirect3DTexture9* s_texture;
+@@ -777,6 +779,7 @@ namespace {
+ 
+             s_texture = texture;
+             s_dynamic = dynamic;
++            ++s_textureGeneration;
+             CGxDevice::Log("wolVolFog: local light texture 32x1 A32B32G32R32F made (pool 0 managed, 1 default + dynamic: %d)", dynamic ? 1 : 0);
+         }
+ 
+@@ -846,6 +849,26 @@ uint32_t VolFog::PrepareLights(const FrameInputs& in, uint32_t frame, double sec
+     CapturePointLights(in.worldM2Scene, camera, set);
+     s_candidatesInView = set.candidateCount;
+     s_stabiliser.Step(camera, in.mapId, frame, seconds, set);
++
++    // Brief B10 (REVISION-B7-B8, finding 1, "Detalle"): a light that is fading in or out below the cut-off colour reaches nothing (its radius was worked
++    // out for its full colour), so it is not uploaded, and the lit shader variants run only while some light is left. Compacted in place, so the dump
++    // lists exactly what the shader gets.
++    {
++        uint32_t kept = 0;
++
++        for (uint32_t i = 0; i < set.pointLightCount && i < kMaxLocalPointLights; ++i) {
++            if (PeakColor(set.pointLights[i].uploadedColor) >= VolFog::kLocalPointLightContributionCutoff) {
++                if (kept != i) {
++                    set.pointLights[kept] = set.pointLights[i];
++                }
++
++                ++kept;
++            }
++        }
++
++        set.pointLightCount = kept;
++    }
++
+     s_lights = set;
+ 
+ #if defined(_WIN32)
+@@ -928,6 +951,10 @@ uint32_t VolFog::LightCount() {
+     return s_uploaded;
+ }
+ 
++uint32_t VolFog::LightTextureGeneration() {
++    return s_textureGeneration;
++}
++
+ void VolFog::DescribeLights(const FrameInputs& in, LightLineSink sink, void* user) {
+     char line[640];
+     std::snprintf(line, sizeof(line), "  lights: wolVolFogLocalLights=%d worldScene=%d grid nodes=%u point lights in view=%u (pool %u) disabled=%u non-point=%u capture=%s; chosen=%u uploaded=%u shader=%s reach=%.1f yd; stabiliser: %u admitted, %u evicted, %u faded out, %u held",
+diff --git a/Engine/Source/VolFog/VolFogLights.h b/Engine/Source/VolFog/VolFogLights.h
+index ba412d7..576878e 100644
+--- a/Engine/Source/VolFog/VolFogLights.h
++++ b/Engine/Source/VolFog/VolFogLights.h
+@@ -17,7 +17,13 @@ struct IDirect3DDevice9;
+ namespace VolFog {
+     constexpr uint32_t kMaxLocalPointLights = 8;                    // slots uploaded to the shader (3 texels each: 24 of the 32 texels)
+     constexpr uint32_t kLocalLightCandidatePool = 24;               // lights in view the stabiliser chooses from
+-    constexpr float kLocalPointLightContributionCutoff = 1.0f / 256.0f;
++    // Brief B10 (REVISION-B7-B8, finding 1): the cut-off is 1/32 of the peak colour (it was 1/256). Every CM2Light has the same fixed attenuation
++    // (0; 0.7; 0.03), so the radius of a light of peak colour 1 goes from 81 yd to 23 yd (from 173 yd to 55 yd for a peak of 4): the camera of a camp
++    // is no longer inside the sphere of every light, and the march with local lights stops running the full step count for every pixel. The boundary
++    // fade of the shader keeps the edge of the sphere soft.
++    constexpr float kLocalPointLightContributionCutoff = 1.0f / 32.0f;
++    // Brief B10: the lights are scattered only from this wolVolFog quality on (1 = no lights; 2 and 3 = up to 8), until they are measured on a modest GPU.
++    constexpr int32_t kMinLocalLightQuality = 2;
+     constexpr float kMaxLocalPointLightRadius = 200.0f;             // yards
+     constexpr float kLocalLightGamma = 2.2f;
+     constexpr float kLocalLightIntensity = 1.0f;                    // `LocalLightIntensity` of coa-vfog (default 1.0)
+@@ -68,6 +74,9 @@ namespace VolFog {
+     CGxTex* LightTex();
+     float LightReachLimit();
+     uint32_t LightCount();
++    // Brief B10: how many times the 32 x 1 texture has been created (a Reset or a rebuild of the device makes a new one); the temporal filter drops its
++    // history when it changes, because the lit march of the old texture and the new one are not the same image.
++    uint32_t LightTextureGeneration();
+ 
+     // wolVolFogDump: one line for the capture and one per uploaded light (view position, screen pixel, colours, attenuation, cutoff).
+     typedef void (*LightLineSink)(void* user, const char* line);
+diff --git a/Engine/Source/VolFog/VolFogModel.cpp b/Engine/Source/VolFog/VolFogModel.cpp
+index c6f5a3d..0a9e6a1 100644
+--- a/Engine/Source/VolFog/VolFogModel.cpp
++++ b/Engine/Source/VolFog/VolFogModel.cpp
+@@ -11,6 +11,7 @@
+ // Modified 2026-10-20 (brief B5): in the namespace VolFog; only the derived mode is kept (DerivedLayers, DistanceLayer,
+ // ApplyInteriorFog and the matrix helpers; the authored/Classic layers, noise and direct-light matching are gone); Config is
+ // replaced by ModelTuning; FogParams gains `active` (false in liquid).
++// Modified 2026-10-20 (brief B10): the moon fades in as the sun sets (moonFade).
+ 
+ namespace {
+     constexpr float kHazeDensity = 0.00035f;
+@@ -191,7 +192,8 @@ VolFog::FogParams VolFog::BuildFogParams(const FrameInputs& in, const ModelTunin
+     Encode(p.lightColor, p.linear);
+ 
+     float elevation = SmoothStep(-0.03f, 0.10f, in.toLight[2]);
+-    p.lightVisibility = elevation * (in.lightIsMoon ? kMoonLightScale : 1.0f);
++    const float moonFade = in.lightIsMoon ? 1.0f - SmoothStep(kMoonFadeEnd, kSunLightFloor, in.sunElevation) : 1.0f; // brief B10
++    p.lightVisibility = elevation * (in.lightIsMoon ? kMoonLightScale * moonFade : 1.0f);
+     p.lightAboveHorizon = SmoothStep(-kLightSettingHalfWidth, kLightSettingHalfWidth, in.toLight[2]);
+     p.farClip = in.farClip;
+     p.maxDistance = std::max(cfg.maxDistance, in.farClip);
+diff --git a/Engine/Source/VolFog/VolFogModel.h b/Engine/Source/VolFog/VolFogModel.h
+index 2cbe24a..3697e7b 100644
+--- a/Engine/Source/VolFog/VolFogModel.h
++++ b/Engine/Source/VolFog/VolFogModel.h
+@@ -38,6 +38,12 @@ namespace VolFog {
+ 
+     constexpr float kMoonLightScale = 0.35f;
+ 
++    // Brief B10 (REVISION-B7-B8, finding 4): the sun lights the fog down to this elevation (z of the unit vector to it), where its visibility
++    // SmoothStep(-0.03, 0.10, z) reaches 0; below it the moon is the light, and its visibility is multiplied by 1 - SmoothStep(kMoonFadeEnd,
++    // kSunLightFloor, sun z), so it comes in over the next 0.12 of elevation of the sun and both sides of the change are 0.
++    constexpr float kSunLightFloor = -0.03f;
++    constexpr float kMoonFadeEnd = -0.15f;
++
+     constexpr int kFogLayers = 4;
+     constexpr int kSceneLayers = 3;
+     constexpr int kDistanceFogLayer = kSceneLayers;
+diff --git a/Engine/Source/VolFog/VolFogRender.cpp b/Engine/Source/VolFog/VolFogRender.cpp
+index 2e9ec28..5f8d811 100644
+--- a/Engine/Source/VolFog/VolFogRender.cpp
++++ b/Engine/Source/VolFog/VolFogRender.cpp
+@@ -384,6 +384,7 @@ namespace {
+             FogPass::SetTexture(3, scene);  // sSceneBeforeFog
+             FogPass::SetTexture(4, march);  // sCurrentMarch: the unfiltered march of this frame
+             FogPass::SetTexture(8, lights); // sLocalLights (B8): the lit composite checks which rays meet a light
++            FogPass::SetTexture(9, VolFog::DensityNoiseTex()); // sDensityNoise (B10): the full resolution integration (silhouettes, rays that meet a light) reads the density variation; RsPop gives s9 back as the client had it
+ 
+             this->DrawQuad();
+             this->End();
+@@ -421,6 +422,8 @@ namespace {
+         uint32_t historyIndex;
+         bool historyValid;      // the last frame drew with the temporal filter and everything below describes it
+         bool temporalOff;       // the history targets could not be made: the fog runs without the filter until the device or wolVolFog changes
++        bool prevLit;           // B10: the last drawn frame used the local light variants; a change drops the history
++        uint32_t prevLightGeneration; // B10: VolFog::LightTextureGeneration() of the last drawn frame
+         float prevWorldToView[16];
+         float prevProj[16];
+         float prevCam[3];
+@@ -730,7 +733,9 @@ namespace {
+         f.composite[1][0] = fog.rayColor[0];
+         f.composite[1][1] = fog.rayColor[1];
+         f.composite[1][2] = fog.rayColor[2];
+-        // cSun: no sun marker, no glow compensation (B9 / B10).
++        // cSun: no sun marker; cSun.w = the glow of the client to compensate (B10): FogSceneColour / BlendGodRays undo the screen glow on the fogged pixels.
++        // clientGlowAmount is 0 unless ffxGlow is on and the glow is the active screen effect (VolFogWorld.cpp), so with ffxGlow 0 nothing changes.
++        f.composite[2][3] = in.clientGlowAmount;
+ 
+         return true;
+     }
+@@ -773,6 +778,7 @@ namespace {
+         f.rayComposite[1][2] = fog.rayColor[2];
+         f.rayComposite[2][0] = r.sunPx[0];
+         f.rayComposite[2][1] = r.sunPx[1];
++        f.rayComposite[2][3] = in.clientGlowAmount; // B10: BlendGodRays compensates the glow of the client as the fog composition does
+     }
+ 
+     // Sub-pass 4 (B9): the world viewport of the back buffer as it is before the fog, reduced to rays[0] with a LINEAR stretch (StretchRect, as
+@@ -869,7 +875,8 @@ namespace {
+         // Brief B8: capture the point lights of the world scene, stabilise them and upload the chosen ones (s8); the lit permutations are used while
+         // there is at least one. If the lit shaders are not valid the frame goes on with the unlit ones.
+         const double lightSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_clockStart).count();
+-        uint32_t lightCount = VolFog::PrepareLights(in, s_fog.frame, lightSeconds, VolFog::Settings().localLights);
++        // Brief B10: the lights only run from quality kMinLocalLightQuality on (wolVolFog 1 is the cheap setting).
++        uint32_t lightCount = VolFog::PrepareLights(in, s_fog.frame, lightSeconds, VolFog::Settings().localLights && quality >= VolFog::kMinLocalLightQuality);
+         CGxTex* lightTex = lightCount > 0 ? VolFog::LightTex() : nullptr;
+         uint32_t permutation = basePermutation;
+ 
+@@ -893,6 +900,13 @@ namespace {
+             lightCount = 0;
+         }
+ 
++        // Brief B10 (REVISION-B7-B8, finding 3a): the history of the unlit march and the lit one are not the same image, and the old light texture is
++        // gone after a Reset: the filter starts again when the variant changes or the texture is made anew. wolVolFogGodRays needs nothing here: the
++        // shafts are blended in their own pass after the composition (cComposite.y = 0 in the fog composition), so the history never holds them.
++        const bool lit = lightCount > 0;
++        const uint32_t lightGeneration = VolFog::LightTextureGeneration();
++        const bool litChanged = lit != s_fog.prevLit || (lit && lightGeneration != s_fog.prevLightGeneration);
++
+         const uint32_t scale = quality == 1 ? 4u : 2u;
+         const uint32_t lowWidth = std::max((in.viewport.width + scale - 1) / scale, 8u);
+         const uint32_t lowHeight = std::max((in.viewport.height + scale - 1) / scale, 8u);
+@@ -952,7 +966,7 @@ namespace {
+         // debug view in the composite: 2 = transmittance of the fog it is given (debug 2: the march, debug 3: the filtered history)
+         const float debugView = (debugMode == 2 || debugMode == 3) ? 2.0f : 0.0f;
+ 
+-        if (!PackFrame(in, fog, scale, lowWidth, lowHeight, debugView, temporal, previousUsable && !historyReset, frame)) {
++        if (!PackFrame(in, fog, scale, lowWidth, lowHeight, debugView, temporal, previousUsable && !historyReset && !litChanged, frame)) {
+             return FogTransient;
+         }
+ 
+@@ -1060,6 +1074,8 @@ namespace {
+             s_fog.prevMap = in.mapId;
+             s_fog.prevSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_clockStart).count();
+             s_fog.historyValid = temporal;
++            s_fog.prevLit = lit;
++            s_fog.prevLightGeneration = lightGeneration;
+         }
+ 
+         return drawn ? FogOk : FogFailed;
+diff --git a/Shaders/VolFog/NOTICE-modificaciones.txt b/Shaders/VolFog/NOTICE-modificaciones.txt
+index a8be407..9937a6c 100644
+--- a/Shaders/VolFog/NOTICE-modificaciones.txt
++++ b/Shaders/VolFog/NOTICE-modificaciones.txt
+@@ -115,3 +115,16 @@ Modifications (GPLv3 section 5a), dated
+     GetPointOcclusion without a query, eased up 4 / s and down 1.5 / s). DNGlare::m_screenGlow is not used: the fade of the moon glare is 0 under a
+     clear sky (DNMoonGlare::GetCloudDensityFade), when the moon is most visible.
+   - wolVolFogDump (VolFogDump.cpp) prints two "rays:" lines; wolVolFogDebug 6 is accepted (WorldParam_CVar.cpp) and keeps the fog armed (VolFog.cpp).
++
++2026-10-20  Brief B10 (World of Legends, native volumetric fog, phase 3: interiors, water, glow and the corrections of the B7-B8 review).
++  - Engine/Source/VolFog/VolFogLights.h / VolFogLights.cpp (derived from src/engine_lights.* of 205ade5): the cut-off of PointLightCutoff is 1/32 of the
++    peak colour instead of 1/256 (coa-vfog's value), so the sphere of a light of the client (fixed attenuation 0; 0.7; 0.03) goes from 81 to 23 yards; lights
++    whose faded colour is below the cut-off are not uploaded. Not in coa-vfog: the lights are only scattered from wolVolFog 2 on.
++  - Engine/Source/VolFog/VolFogModel.h / VolFogModel.cpp (derived from src/fog_model.*): the moon fades in as the sun sets (visibility multiplied by
++    1 - SmoothStep(-0.15, -0.03, sun elevation)); the body is the moon only when the sun is below -0.03 (WoW/Source/WorldClient/VolFogWorld.cpp). coa-vfog
++    switches at the horizon and lets the light jump. No other change in the model: the interior weights (15 % of the scene layers, 100 % of the distance
++    layer, no sun) and the distance layer of fogMode 1 maps were measured and kept as they are.
++  - Engine/Source/VolFog/VolFogRender.cpp: s9 (the density noise atlas) is bound in the composition as coa-vfog does all frame; cSun.w / the glow
++    compensation constant of both composition shaders is the glow of the client (FrameInputs::clientGlowAmount, 0 unless ffxGlow is on and the glow is
++    the active screen effect), the GlowCompensation of coa-vfog (renderer.cpp:1374, 1496); the temporal history is dropped when the lit / unlit march
++    variant changes or the light texture is made anew. No shader source changed.
+diff --git a/WoW/Source/WorldClient/DayNight.cpp b/WoW/Source/WorldClient/DayNight.cpp
+index 02eaa4f..2709e05 100644
+--- a/WoW/Source/WorldClient/DayNight.cpp
++++ b/WoW/Source/WorldClient/DayNight.cpp
+@@ -2286,6 +2286,7 @@ void DayNight::UpdateFog() {
+     DayNight::s_volFogSourceFog.m_start = info.m_fogInterior.m_start;
+     DayNight::s_volFogSourceFog.m_end = info.m_fogInterior.m_end;
+     DayNight::s_volFogSourceFog.m_density = info.m_fogInterior.m_density;
++    DayNight::s_volFogSourceFog.m_mode = s_fogMode; // Not in the original client (World of Legends), brief B10
+ 
+     if (liquidStatus == 0 && VolFog::Armed()) {
+         float outOfRange = info.m_farClip * 4.0f;
+diff --git a/WoW/Source/WorldClient/DayNight.h b/WoW/Source/WorldClient/DayNight.h
+index adce6a1..5c7de7c 100644
+--- a/WoW/Source/WorldClient/DayNight.h
++++ b/WoW/Source/WorldClient/DayNight.h
+@@ -360,6 +360,7 @@ struct VolFogSourceFog {
+     float m_start;
+     float m_end;
+     float m_density;
++    int32_t m_mode;     // Not in the original client (World of Legends), brief B10: s_fogMode (1 = exponential fog, Outland / Northrend)
+ };
+ extern VolFogSourceFog s_volFogSourceFog;
+ 
+diff --git a/WoW/Source/WorldClient/VolFogWorld.cpp b/WoW/Source/WorldClient/VolFogWorld.cpp
+index e1ad49b..9bf0cdf 100644
+--- a/WoW/Source/WorldClient/VolFogWorld.cpp
++++ b/WoW/Source/WorldClient/VolFogWorld.cpp
+@@ -12,6 +12,7 @@
+ #include "Engine/Source/Tempest/CRect.h"
+ #include "Engine/Source/VolFog/VolFog.h"
+ #include "Engine/Source/VolFog/VolFogInputs.h"
++#include "Engine/Source/VolFog/VolFogModel.h"
+ #include "WoW/Source/UIUtil/Camera.h"
+ #include "WoW/Source/Ui/WorldFrame.h"
+ #include "WoW/Source/WorldClient/CPortalView.h"
+@@ -27,6 +28,7 @@
+ // Modified 2026-10-20 (brief B6b): toLight is the visible sun or moon (= toRaySource, as in coa-vfog), and the fog values come from the copy
+ // of DNInfo::m_fogInterior that DayNight::UpdateFog keeps before pushing the live groups out of range. Brief B8: FrameInputs::worldM2Scene.
+ // Brief B9: FrameInputs::rayOcclusion / rayVisibility (the occlusion of the sun or moon glare, eased), glareFade, glareScreenGlow (dump only).
++// Brief B10: lightIsMoon switches at kSunLightFloor instead of at the horizon; FrameInputs::fogMode.
+ // Licensed under GPL-3.0-only. This is the client side of FrameInputs (src/engine.h of coa-vfog 205ade5 reads the same values from
+ // fixed addresses of the 3.3.5 binary; see Shaders/VolFog/NOTICE-modificaciones.txt). Written 2026-10-20 (brief B5).
+ //
+@@ -121,8 +123,11 @@ namespace {
+             return false;
+         }
+ 
++        // Brief B10 (REVISION-B7-B8, finding 4): the body changes from the sun to the moon when the sun has no light left (z = kSunLightFloor, where its
++        // visibility SmoothStep(-0.03, 0.10, z) is 0), not at the horizon, and the moon fades in from there (VolFogModel.cpp), so neither the scattering
++        // nor the shafts jump at dusk or dawn.
+         out.sunElevation = toSun[2];
+-        out.lightIsMoon = toSun[2] < 0.0f;
++        out.lightIsMoon = toSun[2] < VolFog::kSunLightFloor;
+         std::memcpy(out.toRaySource, out.lightIsMoon ? toMoon : toSun, sizeof(out.toRaySource));
+         std::memcpy(out.toLight, out.toRaySource, sizeof(out.toLight));
+ 
+@@ -175,6 +180,7 @@ namespace {
+         out.liquidTypeId = static_cast<uint32_t>(liquidType);
+         out.viewerLiquidDepth = liquidDepth;
+         out.mapId = World::QueryMapId();
++        out.fogMode = sourceFog.m_mode; // brief B10
+         out.worldM2Scene = World::s_m2Scene; // brief B8: the point lights of the fog are read from its light grid
+ 
+         // ffxGlow: only while the glow is the active screen effect (CGWorldFrame::UpdateScreenEffectParams returns early otherwise).
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index 5fbefd5..51d3177 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -879,7 +879,7 @@ bool CWorldParam::WolVolFogLocalLightsCallback(CVar* var, const char* oldValue,
+ 
+     if (oldValue && *oldValue) {
+         char buffer[64];
+-        SStrPrintf(buffer, sizeof(buffer), "wolVolFogLocalLights: %s", value[0] == '1' ? "on" : "off");
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFogLocalLights: %s%s", value[0] == '1' ? "on" : "off", value[0] == '1' ? " (only with wolVolFog 2 or 3)" : ""); // brief B10
+         ConsoleWrite(buffer, DEFAULT_COLOR);
+     }
+ 
+@@ -897,7 +897,7 @@ void CWorldParam::RegisterVolFogCVars() {
+     // Brief B4: density, light shafts and scattered point lights; saved, applied at once.
+     CWorldParam::cvar_wolVolFogDensity = CVar::Register("wolVolFogDensity", "Volumetric fog density multiplier (0.0 to 4.0)", 1, "1.0", CWorldParam::WolVolFogDensityCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolVolFogGodRays = CVar::Register("wolVolFogGodRays", "Volumetric fog light shaft strength (0.0 off to 1.0)", 1, "0.0", CWorldParam::WolVolFogGodRaysCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+-    CWorldParam::cvar_wolVolFogLocalLights = CVar::Register("wolVolFogLocalLights", "Point lights scattered in the volumetric fog (0 off, 1 on)", 1, "1", CWorldParam::WolVolFogLocalLightsCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolVolFogLocalLights = CVar::Register("wolVolFogLocalLights", "Point lights scattered in the volumetric fog (0 off, 1 on); only with wolVolFog 2 or 3", 1, "1", CWorldParam::WolVolFogLocalLightsCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Brief B5: the reader of the frame inputs for the fog model (Engine/ does not depend on WoW/).
+     VolFogWorld::Install();
+ }

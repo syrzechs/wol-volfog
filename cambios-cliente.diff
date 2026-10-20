@@ -1,0 +1,848 @@
+# cambios-cliente.diff - wol-volfog (World of Legends), 2026-10-20
+# What the 11 patches of ./patches change in files OUTSIDE the module (Gx format tables, OnWorldRender in WorldFrame.cpp, the linear fog in
+# DayNight::UpdateFog, the CVars). One diff, 16 files, 46 hunks, made on wowdecomp 0e4e9fe plus our other local client patches.
+# Context lines come from that tree: on a clean wowdecomp 41 hunks apply and 5 (CVar registration, next to our other wol* CVars) need
+# placing by hand (git apply --reject). Lines before the first "diff --git" are ignored by git apply.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 468c8c4..c2421a6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -84,6 +84,8 @@ add_subdirectory(Engine/Source/SoundEngine)
+ add_subdirectory(Engine/Source/SteelseriesMouse)
+ add_subdirectory(Engine/Source/Storm)
+ add_subdirectory(Engine/Source/Tempest)
++# Not in the original client (World of Legends): native volumetric fog (wolVolFog).
++add_subdirectory(Engine/Source/VolFog)
+ add_subdirectory(WoW/Common)
+ add_subdirectory(WoW/Source/Battlenet)
+ add_subdirectory(WoW/Source/Console)
+@@ -105,6 +107,13 @@ add_subdirectory(WoW/Source/WorldClient)
+ add_subdirectory(WoW/Source/WowServices)
+ add_subdirectory(WoW/Source/WowSvcs)
+ add_subdirectory(WoW/Source)
++# Not in the original client (World of Legends): HLSL shaders of the native volumetric fog (wolVolFog), compiled with fxc
++# (Windows SDK) and packed with Python into bin/Win/Data/patch-Z.MPQ; WowClient depends on the VolFogShaders target.
++# OFF skips the whole chain (no fxc or Python needed); the client then has no volumetric fog shaders and wolVolFogDebug does nothing.
++option(WOWDECOMP_VOLFOG "Compile the volumetric fog shaders (fxc) into patch-Z.MPQ" ON)
++if (WOWDECOMP_VOLFOG)
++    add_subdirectory(Shaders/VolFog)
++endif ()
+ if (WIN32)
+     add_subdirectory(Tools/WowClient)
+ endif ()
+diff --git a/Engine/Source/Gx/CGxDevice/CGxDevice.cpp b/Engine/Source/Gx/CGxDevice/CGxDevice.cpp
+index f722a22..59e0ccb 100644
+--- a/Engine/Source/Gx/CGxDevice/CGxDevice.cpp
++++ b/Engine/Source/Gx/CGxDevice/CGxDevice.cpp
+@@ -17,13 +17,13 @@
+ #include "Engine/Source/Os/TimeManager.h"
+ 
+ // STATIC: 0x00A2DAF8
+-const uint32_t CGxDevice::s_texFormatBitDepth[GxTexFormats_Last] = { 0, 32, 32, 16, 16, 16, 4, 8, 8, 16, 32, 32, 32 };
++const uint32_t CGxDevice::s_texFormatBitDepth[GxTexFormats_Last] = { 0, 32, 32, 16, 16, 16, 4, 8, 8, 16, 32, 32, 32, 32, 64, 128 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2DB2C
+-const uint32_t CGxDevice::s_texFormatBlockSize[GxTexFormats_Last] = { 1, 1, 1, 1, 1, 1, 4, 4, 4, 1, 1, 1, 1 };
++const uint32_t CGxDevice::s_texFormatBlockSize[GxTexFormats_Last] = { 1, 1, 1, 1, 1, 1, 4, 4, 4, 1, 1, 1, 1, 1, 1, 1 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2DB60
+-const uint32_t CGxDevice::s_texFormatBytesPerBlock[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 8, 16, 16, 2, 4, 4, 4 };
++const uint32_t CGxDevice::s_texFormatBytesPerBlock[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 8, 16, 16, 2, 4, 4, 4, 4, 8, 16 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00AD8B4C
+ static uint32_t s_primVertsPerPrim[GxPrims_Last] = { 1, 2, 1, 3, 1, 1 };
+diff --git a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+index 1dcadfe..5f192d8 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+@@ -11,6 +11,7 @@
+ #include "Engine/Source/Os/Error.h"
+ #include "Engine/Source/Os/TimeManager.h"
+ #include "Engine/Source/Storm/H/storm.h"
++#include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
+ #include "ThirdParty/nvapi/nvapi.h"
+ 
+ typedef IDirect3D9* (WINAPI* Direct3DCreate9Proc)(UINT sdkVersion);
+@@ -25,13 +26,13 @@ const uint32_t CGxDeviceD3d::s_gxAttribToD3dAttribSize[7] = { 4, 4, 4, 8, 12, 4,
+ static const D3DQUERYTYPE s_d3dQueryTypes[1] = { D3DQUERYTYPE_OCCLUSION };
+ 
+ // STATIC: 0x00A2F7E8
+-const EGxTexFormat CGxDeviceD3d::s_tolerableTexFmtMapping[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8 };
++const EGxTexFormat CGxDeviceD3d::s_tolerableTexFmtMapping[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8, GxTex_IntZ, GxTex_Abgr16F, GxTex_Abgr32F }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2F850
+ const D3DCUBEMAP_FACES CGxDeviceD3d::s_faceTypes[6] = { D3DCUBEMAP_FACE_POSITIVE_X, D3DCUBEMAP_FACE_NEGATIVE_X, D3DCUBEMAP_FACE_POSITIVE_Y, D3DCUBEMAP_FACE_NEGATIVE_Y, D3DCUBEMAP_FACE_POSITIVE_Z, D3DCUBEMAP_FACE_NEGATIVE_Z };
+ 
+ // STATIC: 0x00A2F81C
+-const D3DFORMAT CGxDeviceD3d::s_GxTexFmtToD3dFmt[GxTexFormats_Last] = { D3DFMT_UNKNOWN, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A4R4G4B4, D3DFMT_A1R5G5B5, D3DFMT_R5G6B5, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_V8U8, D3DFMT_G16R16F, D3DFMT_R32F, D3DFMT_D24X8 };
++const D3DFORMAT CGxDeviceD3d::s_GxTexFmtToD3dFmt[GxTexFormats_Last] = { D3DFMT_UNKNOWN, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A4R4G4B4, D3DFMT_A1R5G5B5, D3DFMT_R5G6B5, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_V8U8, D3DFMT_G16R16F, D3DFMT_R32F, D3DFMT_D24X8, static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z')), D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2F8D4
+ const D3DPRIMITIVETYPE CGxDeviceD3d::s_primitiveConversion[GxPrims_Last] = { D3DPT_POINTLIST, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DPT_TRIANGLEFAN };
+@@ -64,7 +65,7 @@ const D3DCMPFUNC CGxDeviceD3d::s_cmpFunc[4] = { D3DCMP_LESSEQUAL, D3DCMP_EQUAL,
+ const D3DCULL CGxDeviceD3d::s_cullMode[3] = { D3DCULL_NONE, D3DCULL_CW, D3DCULL_CCW };
+ 
+ // STATIC: 0x00AD8EF0
+-EGxTexFormat CGxDeviceD3d::s_GxTexFormatToUse[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Abgr8888, GxTex_Argb8888, GxTex_Argb4444, GxTex_Argb1555, GxTex_Rgb565, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8 };
++EGxTexFormat CGxDeviceD3d::s_GxTexFormatToUse[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Abgr8888, GxTex_Argb8888, GxTex_Argb4444, GxTex_Argb1555, GxTex_Rgb565, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8, GxTex_IntZ, GxTex_Abgr16F, GxTex_Abgr32F }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00AD8F24
+ D3DDECLTYPE CGxDeviceD3d::s_gxAttribToD3dAttribType[7] = { D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_UBYTE4, D3DDECLTYPE_UBYTE4N, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_SHORT2, D3DDECLTYPE_FLOAT1 };
+@@ -2244,6 +2245,19 @@ void CGxDeviceD3d::ISetPresentParms(D3DPRESENT_PARAMETERS& d3dpp, const CGxForma
+             break;
+     }
+ 
++    // Not in the original client (World of Legends): the readable INTZ depth of wolVolFog does not admit MSAA, so gxMultisample is
++    // ignored while the depth is wanted (design 1.2). EnableAutoDepthStencil stays on: it is the fallback if the texture fails.
++    // Brief B3b: asks CheckDeviceFormat itself (the caps in VolFog::s_caps do not exist yet on the first device of a run).
++    if (format.m_multisampleCount > 1 && VolFog::WantsReadableDepthFor(this->m_d3d, d3dpp.BackBufferFormat)) {
++        static const char* const s_multisampleIgnored = "wolVolFog: gxMultisample ignorado (el depth legible no admite MSAA)";
++        CGxDevice::Log("%s", s_multisampleIgnored);
++        VolFog::Message(s_multisampleIgnored);
++        d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
++        d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
++        d3dpp.MultiSampleQuality = 0;
++        return;
++    }
++
+     if (format.m_multisampleCount <= 1) {
+         d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+         return;
+@@ -2461,7 +2475,7 @@ void CGxDeviceD3d::ISetCaps(const CGxFormat& format) {
+         this->m_caps.m_shaderConstants[GxSh_Vertex] = 192;
+     }
+ 
+-    for (uint32_t i = 0; i < GxTexFormats_Last; i++) {
++    for (uint32_t i = 0; i < GxTexFormats_CapsLast; i++) { // Not in the original client (World of Legends): was GxTexFormats_Last (m_texFmt keeps 13 entries)
+         if (i) {
+             this->m_caps.m_texFmt[i] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[i]) == D3D_OK;
+         } else {
+@@ -2482,6 +2496,14 @@ void CGxDeviceD3d::ISetCaps(const CGxFormat& format) {
+     this->m_caps.m_rttFormat[GxTex_R32F] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, D3DFMT_R32F) == D3D_OK;
+     this->m_caps.m_rttFormat[GxTex_D24X8] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, D3DFMT_D24X8) == D3D_OK;
+ 
++    // Not in the original client (World of Legends): texture formats for the native volumetric fog (wolVolFog). The results go to
++    // VolFog::s_caps and not to m_caps: CGxCaps::m_texFmt / m_rttFormat keep their 13 entries (layout checked against the original).
++    VolFog::s_caps.intz = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_IntZ]) == D3D_OK;
++    VolFog::s_caps.abgr16f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr16F]) == D3D_OK;
++    VolFog::s_caps.abgr32f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr32F]) == D3D_OK;
++    VolFog::s_caps.ps30Slots = this->m_d3dCaps.MaxPixelShader30InstructionSlots;
++    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots);
++
+     this->m_caps.m_colorWrite = (this->m_d3dCaps.PrimitiveMiscCaps & D3DPMISCCAPS_COLORWRITEENABLE) != 0;
+     this->m_caps.m_hwCursor = this->m_d3dCaps.CursorCaps & D3DCURSORCAPS_COLOR;
+     this->m_caps.m_maxClipPlanes = this->m_d3dCaps.MaxUserClipPlanes;
+@@ -2670,6 +2692,10 @@ void CGxDeviceD3d::IReleaseD3dResources(int32_t freeTextures) {
+         this->m_defDepthSurface = nullptr;
+     }
+ 
++    // Not in the original client (World of Legends): the INTZ depth texture of wolVolFog is a D3DPOOL_DEFAULT resource and has to go
++    // before a Reset; IStateSetD3DDefaults creates it again afterwards.
++    VolFog::ReleaseDepthTexture(this->m_d3dDevice); // Brief B3b: the device lets it unbind the INTZ (texture stages and depth-stencil) before the release.
++
+     if (this->m_defDepthStencilSurface) {
+         this->m_defDepthStencilSurface->Release();
+         this->m_defDepthStencilSurface = nullptr;
+@@ -3333,6 +3359,20 @@ void CGxDeviceD3d::IStateSetD3DDefaults() {
+ 
+     this->m_d3dDevice->GetRenderTarget(0, &this->m_defColorSurface);
+     this->m_d3dDevice->GetDepthStencilSurface(&this->m_defDepthSurface);
++
++    // Not in the original client (World of Legends): with wolVolFog > 0 the main depth becomes a readable INTZ texture of the size
++    // of the back buffer (design 1.2, brief B3). m_defDepthSurface now refers to it, so everything that restores the default depth
++    // keeps working. m_defDepthStencilSurface (the scratch depth of off-screen colour targets) is left alone on purpose: those passes
++    // must not draw into, or clear, the world depth.
++    if (VolFog::CreateDepthTexture(this->m_d3dDevice)) {
++        if (this->m_defDepthSurface) {
++            this->m_defDepthSurface->Release();
++            this->m_defDepthSurface = nullptr;
++        }
++
++        this->m_d3dDevice->GetDepthStencilSurface(&this->m_defDepthSurface);
++    }
++
+     this->InitLights();
+     this->m_ambientOnlyMode = 0;
+ 
+diff --git a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+index 953e1c4..42c90d8 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+@@ -12,6 +12,7 @@
+ #include "Engine/Source/Os/Error.h"
+ #include "Engine/Source/Os/TimeManager.h"
+ #include "Engine/Source/Storm/H/storm.h"
++#include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
+ #include "ThirdParty/nvapi/nvapi.h"
+ 
+ typedef IDirect3D9* (WINAPI* Direct3DCreate9Proc)(UINT sdkVersion);
+@@ -29,7 +30,7 @@ static const D3DQUERYTYPE s_d3dQueryTypes[1] = { D3DQUERYTYPE_OCCLUSION };
+ const D3DCUBEMAP_FACES CGxDeviceD3d9Ex::s_faceTypes[6] = { D3DCUBEMAP_FACE_POSITIVE_X, D3DCUBEMAP_FACE_NEGATIVE_X, D3DCUBEMAP_FACE_POSITIVE_Y, D3DCUBEMAP_FACE_NEGATIVE_Y, D3DCUBEMAP_FACE_POSITIVE_Z, D3DCUBEMAP_FACE_NEGATIVE_Z };
+ 
+ // STATIC: 0x00A2FA64
+-const D3DFORMAT CGxDeviceD3d9Ex::s_GxTexFmtToD3dFmt[GxTexFormats_Last] = { D3DFMT_UNKNOWN, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A4R4G4B4, D3DFMT_A1R5G5B5, D3DFMT_R5G6B5, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_V8U8, D3DFMT_G16R16F, D3DFMT_R32F, D3DFMT_D24X8 };
++const D3DFORMAT CGxDeviceD3d9Ex::s_GxTexFmtToD3dFmt[GxTexFormats_Last] = { D3DFMT_UNKNOWN, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A4R4G4B4, D3DFMT_A1R5G5B5, D3DFMT_R5G6B5, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_V8U8, D3DFMT_G16R16F, D3DFMT_R32F, D3DFMT_D24X8, static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z')), D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2FAD8
+ const D3DPRIMITIVETYPE CGxDeviceD3d9Ex::s_primitiveConversion[GxPrims_Last] = { D3DPT_POINTLIST, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DPT_TRIANGLEFAN };
+@@ -62,7 +63,7 @@ const D3DCMPFUNC CGxDeviceD3d9Ex::s_cmpFunc[4] = { D3DCMP_LESSEQUAL, D3DCMP_EQUA
+ const D3DCULL CGxDeviceD3d9Ex::s_cullMode[3] = { D3DCULL_NONE, D3DCULL_CW, D3DCULL_CCW };
+ 
+ // STATIC: 0x00AD8F8C
+-EGxTexFormat CGxDeviceD3d9Ex::s_GxTexFormatToUse[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Abgr8888, GxTex_Argb8888, GxTex_Argb4444, GxTex_Argb1555, GxTex_Rgb565, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8 };
++EGxTexFormat CGxDeviceD3d9Ex::s_GxTexFormatToUse[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Abgr8888, GxTex_Argb8888, GxTex_Argb4444, GxTex_Argb1555, GxTex_Rgb565, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8, GxTex_IntZ, GxTex_Abgr16F, GxTex_Abgr32F }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00AD8FC0
+ D3DDECLTYPE CGxDeviceD3d9Ex::s_gxAttribToD3dAttribType[7] = { D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_UBYTE4, D3DDECLTYPE_UBYTE4N, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_SHORT2, D3DDECLTYPE_FLOAT1 };
+@@ -2250,6 +2251,19 @@ void CGxDeviceD3d9Ex::ISetPresentParms(D3DPRESENT_PARAMETERS& d3dpp, const CGxFo
+             break;
+     }
+ 
++    // Not in the original client (World of Legends): the readable INTZ depth of wolVolFog does not admit MSAA, so gxMultisample is
++    // ignored while the depth is wanted (design 1.2). EnableAutoDepthStencil stays on: it is the fallback if the texture fails.
++    // Brief B3b: asks CheckDeviceFormat itself (the caps in VolFog::s_caps do not exist yet on the first device of a run).
++    if (format.m_multisampleCount > 1 && VolFog::WantsReadableDepthFor(this->m_d3d, d3dpp.BackBufferFormat)) {
++        static const char* const s_multisampleIgnored = "wolVolFog: gxMultisample ignorado (el depth legible no admite MSAA)";
++        CGxDevice::Log("%s", s_multisampleIgnored);
++        VolFog::Message(s_multisampleIgnored);
++        d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
++        d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
++        d3dpp.MultiSampleQuality = 0;
++        return;
++    }
++
+     if (format.m_multisampleCount <= 1) {
+         d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+         return;
+@@ -2467,7 +2481,7 @@ void CGxDeviceD3d9Ex::ISetCaps(const CGxFormat& format) {
+         this->m_caps.m_shaderConstants[GxSh_Vertex] = 192;
+     }
+ 
+-    for (uint32_t i = 0; i < GxTexFormats_Last; i++) {
++    for (uint32_t i = 0; i < GxTexFormats_CapsLast; i++) { // Not in the original client (World of Legends): was GxTexFormats_Last (m_texFmt keeps 13 entries)
+         if (i) {
+             this->m_caps.m_texFmt[i] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[i]) == D3D_OK;
+         } else {
+@@ -2488,6 +2502,14 @@ void CGxDeviceD3d9Ex::ISetCaps(const CGxFormat& format) {
+     this->m_caps.m_rttFormat[GxTex_R32F] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, D3DFMT_R32F) == D3D_OK;
+     this->m_caps.m_rttFormat[GxTex_D24X8] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, D3DFMT_D24X8) == D3D_OK;
+ 
++    // Not in the original client (World of Legends): texture formats for the native volumetric fog (wolVolFog). The results go to
++    // VolFog::s_caps and not to m_caps: CGxCaps::m_texFmt / m_rttFormat keep their 13 entries (layout checked against the original).
++    VolFog::s_caps.intz = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_IntZ]) == D3D_OK;
++    VolFog::s_caps.abgr16f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr16F]) == D3D_OK;
++    VolFog::s_caps.abgr32f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr32F]) == D3D_OK;
++    VolFog::s_caps.ps30Slots = this->m_d3dCaps.MaxPixelShader30InstructionSlots;
++    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots);
++
+     this->m_caps.m_colorWrite = (this->m_d3dCaps.PrimitiveMiscCaps & D3DPMISCCAPS_COLORWRITEENABLE) != 0;
+     this->m_caps.m_hwCursor = this->m_d3dCaps.CursorCaps & D3DCURSORCAPS_COLOR;
+     this->m_caps.m_maxClipPlanes = this->m_d3dCaps.MaxUserClipPlanes;
+@@ -2640,6 +2662,10 @@ void CGxDeviceD3d9Ex::IReleaseD3dResources(int32_t freeTextures) {
+         this->m_defDepthSurface = nullptr;
+     }
+ 
++    // Not in the original client (World of Legends): the INTZ depth texture of wolVolFog is a D3DPOOL_DEFAULT resource and has to go
++    // before a Reset; IStateSetD3DDefaults creates it again afterwards.
++    VolFog::ReleaseDepthTexture(this->m_d3dDevice); // Brief B3b: the device lets it unbind the INTZ (texture stages and depth-stencil) before the release.
++
+     if (this->m_defDepthStencilSurface) {
+         this->m_defDepthStencilSurface->Release();
+         this->m_defDepthStencilSurface = nullptr;
+@@ -3134,6 +3160,20 @@ void CGxDeviceD3d9Ex::IStateSetD3DDefaults() {
+ 
+     this->m_d3dDevice->GetRenderTarget(0, &this->m_defColorSurface);
+     this->m_d3dDevice->GetDepthStencilSurface(&this->m_defDepthSurface);
++
++    // Not in the original client (World of Legends): with wolVolFog > 0 the main depth becomes a readable INTZ texture of the size
++    // of the back buffer (design 1.2, brief B3). m_defDepthSurface now refers to it, so everything that restores the default depth
++    // keeps working. m_defDepthStencilSurface (the scratch depth of off-screen colour targets) is left alone on purpose: those passes
++    // must not draw into, or clear, the world depth.
++    if (VolFog::CreateDepthTexture(this->m_d3dDevice)) {
++        if (this->m_defDepthSurface) {
++            this->m_defDepthSurface->Release();
++            this->m_defDepthSurface = nullptr;
++        }
++
++        this->m_d3dDevice->GetDepthStencilSurface(&this->m_defDepthSurface);
++    }
++
+     this->InitLights();
+     this->m_ambientOnlyMode = 0;
+ 
+@@ -3939,7 +3979,7 @@ CGxDeviceD3d9Ex::CGxDeviceD3d9Ex() : m_desktopDisplayMode() {
+     this->m_hwCursorTexture = nullptr;
+     this->m_hwCursorBitmap = nullptr;
+ 
+-    for (uint32_t i = 0; i < GxTexFormats_Last; i++) {
++    for (uint32_t i = 0; i < GxTexFormats_CapsLast; i++) { // Not in the original client (World of Legends): was GxTexFormats_Last (m_scratchTextures keeps 13 entries)
+         this->m_scratchTextures[i].m_textures[0] = nullptr;
+         this->m_scratchTextures[i].m_index = 0;
+     }
+@@ -4006,6 +4046,13 @@ void CGxDeviceD3d9Ex::TexSetCacheSize(uint32_t size) {
+ // VERIFY: 28216b7e manual
+ // OFFSET: 0x006A60C0
+ LPDIRECT3DTEXTURE9 CGxDeviceD3d9Ex::ITexGetScratch(EGxTexFormat format) {
++    // Not in the original client (World of Legends): m_scratchTextures keeps its GxTexFormats_CapsLast entries (layout checked against the
++    // original), so IntZ, Abgr16F and Abgr32F (wolVolFog) have no scratch texture. nullptr makes ITexUploadRect skip the upload cleanly
++    // instead of writing past the array into the members that follow it.
++    if (static_cast<uint32_t>(format) >= GxTexFormats_CapsLast) {
++        return nullptr;
++    }
++
+     CGxDeviceD3d9Ex::ScratchTexture& scratch = this->m_scratchTextures[format];
+     LPDIRECT3DTEXTURE9 texture = scratch.m_textures[scratch.m_index];
+ 
+@@ -4266,7 +4313,7 @@ void CGxDeviceD3d9Ex::ITexReleaseD3dTexture(CGxTex* texId) {
+ // VERIFY: b9a5e5a7 manual
+ // OFFSET: 0x006A68F0
+ void CGxDeviceD3d9Ex::ITexForceRecreation(int32_t all) {
+-    for (uint32_t i = 0; i < GxTexFormats_Last; i++) {
++    for (uint32_t i = 0; i < GxTexFormats_CapsLast; i++) { // Not in the original client (World of Legends): was GxTexFormats_Last (m_scratchTextures keeps 13 entries)
+         if (this->m_scratchTextures[i].m_textures[0]) {
+             this->m_scratchTextures[i].m_textures[0]->Release();
+             this->m_scratchTextures[i].m_textures[0] = nullptr;
+diff --git a/Engine/Source/Gx/CGxDeviceOpenGL/CGxDeviceOpenGl.cpp b/Engine/Source/Gx/CGxDeviceOpenGL/CGxDeviceOpenGl.cpp
+index f8abfd1..cc31fd0 100644
+--- a/Engine/Source/Gx/CGxDeviceOpenGL/CGxDeviceOpenGl.cpp
++++ b/Engine/Source/Gx/CGxDeviceOpenGL/CGxDeviceOpenGl.cpp
+@@ -30,7 +30,7 @@ static const GLenum s_glTexTarget[4] = { GL_TEXTURE_2D, GL_TEXTURE_CUBE_MAP_ARB,
+ static const GLenum s_glQueryTarget[1] = { GL_SAMPLES_PASSED_ARB };
+ 
+ // STATIC: 0x00A2F210
+-static const GLint s_glInternalFormat[GxTexFormats_Last] = { 0, GL_RGBA8, GL_RGBA8, GL_RGBA4, GL_RGB5_A1, GL_RGB5, 0x83F1, 0x83F2, 0x83F3, 0x8709, 0x881B, 0, GL_DEPTH_COMPONENT24_ARB };
++static const GLint s_glInternalFormat[GxTexFormats_Last] = { 0, GL_RGBA8, GL_RGBA8, GL_RGBA4, GL_RGB5_A1, GL_RGB5, 0x83F1, 0x83F2, 0x83F3, 0x8709, 0x881B, 0, GL_DEPTH_COMPONENT24_ARB, 0, 0, 0 }; // Not in the original client (World of Legends): IntZ, Abgr16F, Abgr32F not supported
+ 
+ // STATIC: 0x00A2F1E0
+ static const GLint s_glMinFilter[GxTexFilters_Last] = { GL_NEAREST, GL_LINEAR, GL_NEAREST_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR_MIPMAP_LINEAR };
+@@ -39,16 +39,16 @@ static const GLint s_glMinFilter[GxTexFilters_Last] = { GL_NEAREST, GL_LINEAR, G
+ static const GLint s_glMagFilter[GxTexFilters_Last] = { GL_NEAREST, GL_LINEAR, GL_LINEAR, GL_LINEAR, GL_LINEAR, GL_LINEAR };
+ 
+ // STATIC: 0x00A2F244
+-static const uint32_t s_glBytesPerPixel[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0 };
++static const uint32_t s_glBytesPerPixel[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // Not in the original client (World of Legends): IntZ, Abgr16F, Abgr32F not supported
+ 
+ // STATIC: 0x00A2F2E0
+ static const GLenum s_glCubeFaces[6] = { 0x8515, 0x8516, 0x8517, 0x8518, 0x8519, 0x851A };
+ 
+ // STATIC: 0x00A2F278
+-static const GLenum s_glFormat[GxTexFormats_Last] = { 0, GL_RGBA, 0x80E1, 0x80E1, 0x80E1, GL_RGB, 0, 0, 0, 0x86F5, GL_RGB, GL_RGB, GL_DEPTH_COMPONENT };
++static const GLenum s_glFormat[GxTexFormats_Last] = { 0, GL_RGBA, 0x80E1, 0x80E1, 0x80E1, GL_RGB, 0, 0, 0, 0x86F5, GL_RGB, GL_RGB, GL_DEPTH_COMPONENT, 0, 0, 0 }; // Not in the original client (World of Legends): IntZ, Abgr16F, Abgr32F not supported
+ 
+ // STATIC: 0x00A2F2AC
+-static const GLenum s_glType[GxTexFormats_Last] = { 0, 0x8367, 0x8367, 0x8365, 0x8366, 0x8363, 0, 0, 0, GL_BYTE, 0x140B, 0, GL_FLOAT };
++static const GLenum s_glType[GxTexFormats_Last] = { 0, 0x8367, 0x8367, 0x8365, 0x8366, 0x8363, 0, 0, 0, GL_BYTE, 0x140B, 0, GL_FLOAT, 0, 0, 0 }; // Not in the original client (World of Legends): IntZ, Abgr16F, Abgr32F not supported
+ 
+ struct GlTexEnvOp {
+     GLenum m_mode;
+diff --git a/Engine/Source/Gx/CMakeLists.txt b/Engine/Source/Gx/CMakeLists.txt
+index fa1bc0f..383fbca 100644
+--- a/Engine/Source/Gx/CMakeLists.txt
++++ b/Engine/Source/Gx/CMakeLists.txt
+@@ -13,6 +13,12 @@ target_include_directories(Gx
+         ${CMAKE_SOURCE_DIR}
+ )
+ 
++# Not in the original client (World of Legends): the D3D9 backends record the wolVolFog format caps in VolFog::s_caps.
++target_link_libraries(Gx
++    PUBLIC
++        VolFog
++)
++
+ target_link_libraries(Gx
+     PRIVATE
+         d3d9.lib
+diff --git a/Engine/Source/Gx/Gx.cpp b/Engine/Source/Gx/Gx.cpp
+index 344ec92..92a2c81 100644
+--- a/Engine/Source/Gx/Gx.cpp
++++ b/Engine/Source/Gx/Gx.cpp
+@@ -11,7 +11,7 @@
+ #include "Engine/Source/Storm/H/storm.h"
+ 
+ // STATIC: 0x00A2D57C
+-static const uint32_t s_texelSize[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 2, 4, 4, 2, 4, 4, 4 };
++static const uint32_t s_texelSize[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 2, 4, 4, 2, 4, 4, 4, 4, 8, 16 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2D5B0
+ static const int32_t s_vertexAttribOffset[GxVertexBufferFormats_Last][GxVAs_Last] = {
+@@ -35,7 +35,8 @@ static const int32_t s_vertexAttribOffset[GxVertexBufferFormats_Last][GxVAs_Last
+ static BlitFormat s_blitFormats[GxTexFormats_Last] = {
+     BlitFormat_Unknown, BlitFormat_Abgr8888, BlitFormat_Argb8888, BlitFormat_Argb4444, BlitFormat_Argb1555,
+     BlitFormat_Rgb565, BlitFormat_Dxt1, BlitFormat_Dxt3, BlitFormat_Dxt5, BlitFormat_Uv88, BlitFormat_Gr1616F,
+-    BlitFormat_R32F, BlitFormat_D24X8
++    BlitFormat_R32F, BlitFormat_D24X8,
++    BlitFormat_Unknown, BlitFormat_Unknown, BlitFormat_Unknown // Not in the original client (World of Legends): IntZ, Abgr16F, Abgr32F are not blittable
+ };
+ 
+ // STATIC: 0x00AD87E4
+@@ -629,7 +630,7 @@ void GxTexUpdate(CGxTex* texId, CiRect& updateRect, int32_t immediate) {
+ int32_t GxTexCreate(uint32_t width, uint32_t height, EGxTexFormat format, CGxTexFlags flags, void* userArg, GxTexUserFunc userFunc, CGxTex*& texId) {
+     texId = nullptr;
+ 
+-    if (width > g_theGxDevicePtr->Caps().m_texMaxSize[GxTex_2d] || height > g_theGxDevicePtr->Caps().m_texMaxSize[GxTex_2d] || (width & (width - 1)) || (height & (height - 1)) || format > GxTexFormats_Last) {
++    if (width > g_theGxDevicePtr->Caps().m_texMaxSize[GxTex_2d] || height > g_theGxDevicePtr->Caps().m_texMaxSize[GxTex_2d] || (width & (width - 1)) || (height & (height - 1)) || format >= GxTexFormats_Last) { // Not in the original client (World of Legends): was `>`, which let one past the tables through
+         SErrSetLastError(STORM_ERROR_INVALID_PARAMETER);
+         return 0;
+     }
+@@ -669,7 +670,8 @@ int32_t GxTexCreate(EGxTexTarget target, uint32_t width, uint32_t height, uint32
+         }
+     }
+ 
+-    if (format > GxTexFormats_Last || (flags.m_generateMipMaps && (!g_theGxDevicePtr->Caps().m_generateMipMaps || (format >= GxTex_Dxt1 && format <= GxTex_Dxt5))) || (flags.m_filter == GxTex_Anisotropic && !g_theGxDevicePtr->Caps().m_texFilterAnisotropic) || dataFormat > GxTexFormats_Last || !userFunc) {
++    // Not in the original client (World of Legends): `>=` for format and dataFormat (was `>`, one past the 16-entry tables).
++    if (format >= GxTexFormats_Last || (flags.m_generateMipMaps && (!g_theGxDevicePtr->Caps().m_generateMipMaps || (format >= GxTex_Dxt1 && format <= GxTex_Dxt5))) || (flags.m_filter == GxTex_Anisotropic && !g_theGxDevicePtr->Caps().m_texFilterAnisotropic) || dataFormat >= GxTexFormats_Last || !userFunc) {
+         SErrSetLastError(STORM_ERROR_INVALID_PARAMETER);
+         return 0;
+     }
+diff --git a/Engine/Source/Gx/Types.h b/Engine/Source/Gx/Types.h
+index 01e0a17..4ef3b55 100644
+--- a/Engine/Source/Gx/Types.h
++++ b/Engine/Source/Gx/Types.h
+@@ -50,9 +50,18 @@ enum EGxTexFormat {
+     GxTex_Gr1616F = 10,
+     GxTex_R32F = 11,
+     GxTex_D24X8 = 12,
+-    GxTexFormats_Last = 13,
++    // Not in the original client (World of Legends): formats for the native volumetric fog (wolVolFog).
++    GxTex_IntZ = 13,
++    GxTex_Abgr16F = 14,
++    GxTex_Abgr32F = 15,
++    GxTexFormats_Last = 16,
+ };
+ 
++// Not in the original client (World of Legends): number of texture formats of the original client. CGxCaps::m_texFmt / m_rttFormat and
++// CGxDeviceD3d9Ex::m_scratchTextures (layouts checked against the original client) keep this size, so the three formats
++// added after GxTex_D24X8 are not stored in them; the wolVolFog support for those lives in VolFog::s_caps.
++constexpr uint32_t GxTexFormats_CapsLast = 13;
++
+ enum EGxVertexBufferFormat {
+     GxVBF_P = 0,
+     GxVBF_PN = 1,
+diff --git a/Engine/Source/Services/Texture.cpp b/Engine/Source/Services/Texture.cpp
+index 00115b9..2eca9fc 100644
+--- a/Engine/Source/Services/Texture.cpp
++++ b/Engine/Source/Services/Texture.cpp
+@@ -23,19 +23,19 @@
+ static const uint16_t s_pixelFormatBytesPerBlock[NUM_PIXEL_FORMATS] = { 8, 16, 0, 0, 0, 0, 0, 16, 0, 0 };
+ 
+ // STATIC: 0x009F103C
+-static const uint16_t s_texFormatBitDepth[GxTexFormats_Last] = { 0, 32, 32, 16, 16, 16, 4, 8, 8, 16, 32, 32, 32 };
++static const uint16_t s_texFormatBitDepth[GxTexFormats_Last] = { 0, 32, 32, 16, 16, 16, 4, 8, 8, 16, 32, 32, 32, 32, 64, 128 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x009F1058
+-static const uint16_t s_texFormatBytesPerBlock[GxTexFormats_Last] = { 0, 0, 0, 0, 0, 0, 8, 16, 16, 0, 0, 0, 0 };
++static const uint16_t s_texFormatBytesPerBlock[GxTexFormats_Last] = { 0, 0, 0, 0, 0, 0, 8, 16, 16, 0, 0, 0, 0, 0, 0, 0 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x009F1074
+ static const int32_t s_pixelFormatToMipBitsCache[NUM_PIXEL_FORMATS] = { -1, -1, -1, 0, 0, 0, -1, -1, -1, 1 };
+ 
+ // STATIC: 0x009F1120
+-static const uint32_t s_texFormatBytesPerTexel[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 8, 16, 16, 2, 4, 4, 4 };
++static const uint32_t s_texFormatBytesPerTexel[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 8, 16, 16, 2, 4, 4, 4, 4, 8, 16 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x009F1154
+-static const uint32_t s_texFormatTexelsPerBlock[GxTexFormats_Last] = { 1, 1, 1, 1, 1, 1, 4, 4, 4, 1, 1, 1, 1 };
++static const uint32_t s_texFormatTexelsPerBlock[GxTexFormats_Last] = { 1, 1, 1, 1, 1, 1, 4, 4, 4, 1, 1, 1, 1, 1, 1, 1 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00AC3234
+ static EGxTexFormat s_pixelFormatToGxTexFormat[NUM_PIXEL_FORMATS] = { GxTex_Dxt1, GxTex_Dxt3, GxTex_Argb8888, GxTex_Argb1555, GxTex_Argb4444, GxTex_Rgb565, GxTex_Unknown, GxTex_Dxt5, GxTex_Unknown, GxTex_Unknown };
+diff --git a/Tools/WowClient/CMakeLists.txt b/Tools/WowClient/CMakeLists.txt
+index 131001f..a4a020a 100644
+--- a/Tools/WowClient/CMakeLists.txt
++++ b/Tools/WowClient/CMakeLists.txt
+@@ -21,6 +21,11 @@ endif ()
+ 
+ add_executable(WowClient WIN32 ${CLIENT_SOURCES} ${CLIENT_PLATFORM_SOURCES} ${CLIENT_TOOL_SOURCES})
+ 
++# Not in the original client (World of Legends): patch-Z.MPQ with the volumetric fog shaders is built before the client.
++if (TARGET VolFogShaders)
++    add_dependencies(WowClient VolFogShaders)
++endif ()
++
+ set_target_properties(WowClient PROPERTIES
+     OUTPUT_NAME ${WOWCLIENT_OUTPUT_NAME}
+     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin/Win
+diff --git a/WoW/Source/ConsoleDevice/ConsoleDevice_CVar.cpp b/WoW/Source/ConsoleDevice/ConsoleDevice_CVar.cpp
+index e7eaa83..5d3a50d 100644
+--- a/WoW/Source/ConsoleDevice/ConsoleDevice_CVar.cpp
++++ b/WoW/Source/ConsoleDevice/ConsoleDevice_CVar.cpp
+@@ -12,6 +12,7 @@
+ #include "Engine/Source/Storm/H/storm.h"
+ #include "WoW/Source/Client.h"
+ #include "WoW/Source/Hardware.h"
++#include "WoW/Source/WorldClient/WorldParam.h" // Not in the original client (World of Legends): CWorldParam::RegisterVolFogCVars
+ 
+ // STATIC: 0x00CABA98
+ static CVar* s_cvGxStereoEnabled;
+@@ -568,6 +569,10 @@ void RegisterGxCVars() {
+     bool window = s_locale == 4;
+     char value[260];
+ 
++    // Not in the original client (brief B3b): wolVolFog / wolVolFogDebug before the Gx device exists, so the saved wolVolFog is already in
++    // force when the first device is built (ISetPresentParms drops MSAA, IStateSetD3DDefaults creates the INTZ depth).
++    CWorldParam::RegisterVolFogCVars();
++
+     // Not in the original client: first, so that it applies before the monitor modes are read and the window exists.
+     s_cvWolDpiAware = CVar::Register("wolDpiAware", "Real pixels with Windows display scaling above 100% (0 = original, restart)", 1, "0", CVWolDpiAwareCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+ 
+diff --git a/WoW/Source/Ui/WorldFrame.cpp b/WoW/Source/Ui/WorldFrame.cpp
+index 6957907..8872b51 100644
+--- a/WoW/Source/Ui/WorldFrame.cpp
++++ b/WoW/Source/Ui/WorldFrame.cpp
+@@ -10,6 +10,7 @@
+ #include "Engine/Source/Event/Event.h"
+ #include "Engine/Source/FFX/EffectGlow.h"
+ #include "Engine/Source/FFX/FFX.h"
++#include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
+ #include "Engine/Source/Frame/CRenderBatch.h"
+ #include "Engine/Source/Frame/CSimpleTop.h"
+ #include "Engine/Source/FrameScript/FrameScript.h"
+@@ -1779,6 +1780,8 @@ void CGWorldFrame::OnWorldRender() {
+     GxuSortDrawList(GxuCat_1, GxuSort_B2F, *World::GetCamPos());
+     GxuFlushDrawList(GxuCat_1, *World::GetCamPos());
+     DayNight::RenderGlares();
++    // Not in the original client (World of Legends): native volumetric fog, drawn before the 3D names so that the text stays sharp.
++    VolFog::Render();
+     PlayerNameUpdateLate();
+ 
+     if (CWorld::enables & 0x20000000) {
+diff --git a/WoW/Source/WorldClient/DayNight.cpp b/WoW/Source/WorldClient/DayNight.cpp
+index 552bacc..2709e05 100644
+--- a/WoW/Source/WorldClient/DayNight.cpp
++++ b/WoW/Source/WorldClient/DayNight.cpp
+@@ -32,6 +32,7 @@
+ #include "WoW/Source/WorldClient/WorldParam.h"
+ #include "Engine/Source/Gxu/Gxu.h"
+ #include "WoW/Source/Ui/WorldFrame.h"
++#include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
+ 
+ // STATIC: 0x00AF4C20
+ static C2Vector s_starFadeTable[4] = { C2Vector(0.125f, 1.0f), C2Vector(0.1875f, 0.0f), C2Vector(0.9375f, 0.0f), C2Vector(1.0f, 1.0f) };
+@@ -2114,6 +2115,9 @@ void DayNight::DoAreaLights(CurrentLight* light, int32_t underwater) {
+     }
+ }
+ 
++// Not in the original client (World of Legends), brief B6b: see DayNight.h.
++DayNight::VolFogSourceFog DayNight::s_volFogSourceFog;
++
+ // VERIFY: 729edd43 manual
+ // OFFSET: 0x007F16F0
+ void DayNight::UpdateFog() {
+@@ -2267,6 +2271,32 @@ void DayNight::UpdateFog() {
+             DayNight::s_lightFlags &= ~1;
+         }
+     }
++
++    // Not in the original client (World of Legends), brief B6 (design 1.3): while the native volumetric fog draws the fog of the world
++    // (wolVolFog > 0 and VolFog::Armed()), the client's own linear fog is pushed out of range, so the world is drawn without it: start at
++    // 4 x the far clip, density 0 (fogMode 1 maps), and the end a bit further so that SetFogParams does not divide by zero (the design
++    // said start == end). The colour (also the clear colour) is not touched.
++    // Armed() is false underwater, so the client keeps its own fog there, and from the frame after the pass fails.
++    // Brief B6b: both groups go out of range. m_fogInterior is the one the interior WMO groups, the doodads and M2 marked 0x8000 and the
++    // interior liquids read (MapObj.cpp SetShaderFogFromDayNight without bit 2, MapDoodadDef, MapEntity, MapObjDef, LiquidEnvironment): left
++    // alone it kept its linear fog on top of the volumetric one in every inn and dungeon. Before overwriting it, its final values (interior
++    // blend, eclipse, glow) are copied to s_volFogSourceFog, which is what VolFogWorld.cpp gives to the fog model (as coa-vfog reads them
++    // before hooking, src/hooks.cpp:266-276). The copy is taken every frame, armed or not, so it never goes stale.
++    DayNight::s_volFogSourceFog.m_color = info.m_fogInterior.m_color;
++    DayNight::s_volFogSourceFog.m_start = info.m_fogInterior.m_start;
++    DayNight::s_volFogSourceFog.m_end = info.m_fogInterior.m_end;
++    DayNight::s_volFogSourceFog.m_density = info.m_fogInterior.m_density;
++    DayNight::s_volFogSourceFog.m_mode = s_fogMode; // Not in the original client (World of Legends), brief B10
++
++    if (liquidStatus == 0 && VolFog::Armed()) {
++        float outOfRange = info.m_farClip * 4.0f;
++        info.m_fog.m_start = outOfRange;
++        info.m_fog.m_end = outOfRange + info.m_farClip;
++        info.m_fog.m_density = 0.0f;
++        info.m_fogInterior.m_start = outOfRange;
++        info.m_fogInterior.m_end = outOfRange + info.m_farClip;
++        info.m_fogInterior.m_density = 0.0f;
++    }
+ }
+ 
+ // VERIFY: cb3314a8 manual
+diff --git a/WoW/Source/WorldClient/DayNight.h b/WoW/Source/WorldClient/DayNight.h
+index ebbeae5..5c7de7c 100644
+--- a/WoW/Source/WorldClient/DayNight.h
++++ b/WoW/Source/WorldClient/DayNight.h
+@@ -353,6 +353,17 @@ extern TSHashTable<DNOverrideSky, HASHKEY_STRI> g_overrideSky;
+ }
+ 
+ namespace DayNight {
++// Not in the original client (World of Legends), brief B6b: a copy of DNInfo::m_fogInterior (same layout as DNFogInfo) taken by UpdateFog
++// before it pushes the linear fog out of range while the native volumetric fog is armed. VolFogWorld.cpp feeds the fog model from it.
++struct VolFogSourceFog {
++    CImVector m_color;
++    float m_start;
++    float m_end;
++    float m_density;
++    int32_t m_mode;     // Not in the original client (World of Legends), brief B10: s_fogMode (1 = exponential fog, Outland / Northrend)
++};
++extern VolFogSourceFog s_volFogSourceFog;
++
+ // INLINED
+ inline CImVector InterpColor(const CImVector& a, const CImVector& b, float t) {
+     CImVector color = a;
+diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
+index ff726a0..04c95f6 100644
+--- a/WoW/Source/WorldClient/WorldParam.h
++++ b/WoW/Source/WorldClient/WorldParam.h
+@@ -42,6 +42,13 @@ class CWorldParam {
+     static CVar* cvar_wolFarClipFactor;
+     // Not in the original client (World of Legends): see patches-cliente/sombras-4096/README-sombras.md.
+     static CVar* cvar_wolShadowMapSize;
++    // Not in the original client (World of Legends): native volumetric fog, see patches-cliente/niebla-volumetrica/README-niebla.md.
++    static CVar* cvar_wolVolFog;
++    static CVar* cvar_wolVolFogDebug;
++    // Brief B4: the other wolVolFog* CVars.
++    static CVar* cvar_wolVolFogDensity;
++    static CVar* cvar_wolVolFogGodRays;
++    static CVar* cvar_wolVolFogLocalLights;
+ 
+     static bool BaseMipCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool BspCacheCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+@@ -80,6 +87,14 @@ class CWorldParam {
+     // Not in the original client.
+     static bool WolFarClipFactorCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolShadowMapSizeCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolVolFogCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    // Not in the original client (brief B4): validated, applied at once (read every frame through VolFog::Settings()).
++    static bool WolVolFogDensityCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolVolFogGodRaysCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolVolFogLocalLightsCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    // Not in the original client (brief B3b): registers wolVolFog, wolVolFogDebug and (brief B4) wolVolFogDensity, wolVolFogGodRays and wolVolFogLocalLights. RegisterGxCVars calls it before the Gx device exists.
++    static void RegisterVolFogCVars();
+     static bool TextureFilteringCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WaterLodCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WorldPoolUsageCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index 999d6de..51d3177 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -1,11 +1,14 @@
+ #include "WorldParam.h"
+ #include <cstdio>
++#include <cstdlib>
+ #include <new>
+ #include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
+ #include "Engine/Source/Services/GfxSingletonManager.h"
+ #include "Engine/Source/Services/Texture.h"
+ #include "Engine/Source/ShaderEffect/ShaderEffect.h"
+ #include "Engine/Source/ShaderEffect/ShadowCache.h"
++#include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
++#include "WoW/Source/WorldClient/VolFogWorld.h" // Not in the original client (World of Legends)
+ #include "WoW/Common/AaBsp.h"
+ #include "WoW/Source/UIUtil/PortraitButton.h"
+ #include "WoW/Source/WorldClient/Map.h"
+@@ -115,6 +118,13 @@ CVar* CWorldParam::cvar_wolFarClipFactor;
+ // Not in the original client (World of Legends): wolShadowMapSize, see patches-cliente/sombras-4096/README-sombras.md.
+ CVar* CWorldParam::cvar_wolShadowMapSize;
+ 
++// Not in the original client (World of Legends): wolVolFogDebug, see patches-cliente/niebla-volumetrica/README-niebla.md.
++CVar* CWorldParam::cvar_wolVolFog;
++CVar* CWorldParam::cvar_wolVolFogDebug;
++CVar* CWorldParam::cvar_wolVolFogDensity;
++CVar* CWorldParam::cvar_wolVolFogGodRays;
++CVar* CWorldParam::cvar_wolVolFogLocalLights;
++
+ #define WOL_FARCLIP_FACTOR_MAX 3.0f
+ 
+ static float ClampEnvironmentDetail(float detail) {
+@@ -712,6 +722,186 @@ bool CWorldParam::GxTextureCacheSizeCallback(CVar* var, const char* oldValue, co
+     return true;
+ }
+ 
++// Not in the original client. The Gx library does not link the console: VolFog::Message goes through this hook.
++static void WolVolFogMessage(const char* line) {
++    ConsoleWrite(line, DEFAULT_COLOR);
++}
++
++// Not in the original client. Native volumetric fog (brief B3): 0 = original client, 1-3 = quality (B6 onwards). Going between 0
++// and above 0 swaps the main depth for an INTZ texture and drops MSAA, which only happens when the device is rebuilt (gxRestart).
++bool CWorldParam::WolVolFogCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    int32_t mode = -1;
++
++    if (value && value[0] >= '0' && value[0] <= '3' && value[1] == '\0') {
++        mode = value[0] - '0';
++    }
++
++    if (mode < 0) {
++        ConsoleWrite("wolVolFog must be 0 (off), 1 (low), 2 (medium) or 3 (high).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    VolFog::s_mode = mode;
++    VolFog::s_messageHook = WolVolFogMessage;
++
++    // No caps line while the CVar is first registered (no previous value): only when somebody changes it. Brief B3b: the CVar is now
++    // registered before the Gx device exists (RegisterGxCVars) and the saved value reaches this callback then, with the caps not read yet:
++    // nothing is said until the device exists, or a stale "does not report INTZ" would reach gx.log on every start.
++    bool changed = oldValue && *oldValue && g_theGxDevicePtr;
++
++    if (changed) {
++        char buffer[160];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFog: %d. Caps: INTZ=%s ABGR16F=%s ABGR32F=%s PS3.0 slots=%u", mode, VolFog::s_caps.intz ? "yes" : "no", VolFog::s_caps.abgr16f ? "yes" : "no", VolFog::s_caps.abgr32f ? "yes" : "no", VolFog::s_caps.ps30Slots);
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++        CGxDevice::Log("%s", static_cast<const char*>(buffer)); // const char*: a char* would pick the va_list overload
++    }
++
++    // The depth texture exists only if the device was built with the CVar above 0 (and INTZ): compare with what is wanted now.
++    bool wantsDepth = mode > 0 && VolFog::s_caps.intz;
++    bool hasDepth = VolFog::DepthTexture() != nullptr;
++
++    if (wantsDepth != hasDepth) {
++        static const char* const s_pending = "wolVolFog: pendiente de gxRestart";
++        ConsoleWrite(s_pending, DEFAULT_COLOR);
++        CGxDevice::Log("%s", s_pending);
++    } else if (changed && mode > 0 && !VolFog::s_caps.intz) {
++        static const char* const s_noIntz = "wolVolFog: this video card does not report INTZ, the fog stays off.";
++        ConsoleWrite(s_noIntz, DEFAULT_COLOR);
++        CGxDevice::Log("%s", s_noIntz);
++    }
++
++    return true;
++}
++
++// Not in the original client. Debug view of the native volumetric fog pass (VolFog::Render, brief B2): 0 draws nothing,
++// 1 depth in grey (needs the INTZ depth of brief B3), 2 the raw march buffer of the fog (brief B6; was a magenta tint in B2), 3 the filtered
++// history (brief B7; was the test grid), 4 the image without the temporal filter (B7), 5 test grid (moved from 3 in B7), 6 the light shaft texture (B9).
++// The value is read every frame, so no restart is needed.
++bool CWorldParam::WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    int32_t mode = -1;
++
++    if (value && value[0] >= '0' && value[0] <= '6' && value[1] == '\0') {
++        mode = value[0] - '0';
++    }
++
++    if (mode < 0) {
++        ConsoleWrite("wolVolFogDebug must be 0 (off), 1 (depth), 2 (march buffer), 3 (filtered history), 4 (no temporal filter), 5 (grid) or 6 (light shafts).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    VolFog::s_debugMode = mode;
++    VolFog::s_noDepthWarned = false;
++
++    // No message while the CVar is first registered (no previous value).
++    if (oldValue && *oldValue) {
++        char buffer[64];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFogDebug: %d", mode);
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief B4). Whole-string number test for the wolVolFog* float CVars: a value such as "2x" or "" is
++// rejected instead of being read as 0 (SStrToFloat).
++static bool WolVolFogParseFloat(const char* value, float& result) {
++    if (!value || !*value) {
++        return false;
++    }
++
++    char* end = nullptr;
++    double parsed = strtod(value, &end);
++
++    if (end == value || *end != '\0' || parsed != parsed) {
++        return false;
++    }
++
++    result = static_cast<float>(parsed);
++
++    return true;
++}
++
++// Not in the original client (brief B4). wolVolFogDensity 0.0-4.0 (default 1.0): multiplies the haze, the low fog and the distance
++// fog of the model (VolFogModel.cpp). Read every frame, so it applies at once.
++bool CWorldParam::WolVolFogDensityCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float density = 0.0f;
++
++    if (!WolVolFogParseFloat(value, density) || density < 0.0f || density > 4.0f) {
++        ConsoleWrite("wolVolFogDensity must be in range 0.0 to 4.0.", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    VolFog::SetDensity(density);
++
++    // No message while the CVar is first registered (no previous value).
++    if (oldValue && *oldValue) {
++        char buffer[64];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFogDensity: %.2f", static_cast<double>(density));
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief B4). wolVolFogGodRays 0.0-1.0 (default 0.0): strength of the radial light shafts (0 = off).
++bool CWorldParam::WolVolFogGodRaysCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float strength = 0.0f;
++
++    if (!WolVolFogParseFloat(value, strength) || strength < 0.0f || strength > 1.0f) {
++        ConsoleWrite("wolVolFogGodRays must be in range 0.0 to 1.0.", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    VolFog::SetGodRays(strength);
++
++    if (oldValue && *oldValue) {
++        char buffer[64];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFogGodRays: %.2f", static_cast<double>(strength));
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief B4). wolVolFogLocalLights 0 or 1 (default 1): point lights scattered in the fog.
++bool CWorldParam::WolVolFogLocalLightsCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    if (!value || (value[0] != '0' && value[0] != '1') || value[1] != '\0') {
++        ConsoleWrite("wolVolFogLocalLights must be 0 (off) or 1 (on).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    VolFog::SetLocalLights(value[0] == '1');
++
++    if (oldValue && *oldValue) {
++        char buffer[64];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFogLocalLights: %s%s", value[0] == '1' ? "on" : "off", value[0] == '1' ? " (only with wolVolFog 2 or 3)" : ""); // brief B10
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief B3b). Called from RegisterGxCVars, before the Gx device is created (it used to be in Initialize,
++// after the device): with wolVolFog saved in Config.wtf the first device already drops MSAA and builds the INTZ depth, no gxRestart.
++void CWorldParam::RegisterVolFogCVars() {
++    // Native volumetric fog (brief B3). Needs gxRestart to go between 0 and above 0.
++    VolFog::s_messageHook = WolVolFogMessage;
++    CWorldParam::cvar_wolVolFog = CVar::Register("wolVolFog", "Native volumetric fog (0 off, 1 low, 2 medium, 3 high); needs gxRestart to turn on or off", 1, "0", CWorldParam::WolVolFogCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Debug view of the native volumetric fog pass (brief B2).
++    CWorldParam::cvar_wolVolFogDebug = CVar::Register("wolVolFogDebug", "Volumetric fog debug view (0 off, 1 depth, 2 march buffer, 3 filtered history, 4 no temporal filter, 5 grid, 6 light shafts)", 1, "0", CWorldParam::WolVolFogDebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Brief B4: density, light shafts and scattered point lights; saved, applied at once.
++    CWorldParam::cvar_wolVolFogDensity = CVar::Register("wolVolFogDensity", "Volumetric fog density multiplier (0.0 to 4.0)", 1, "1.0", CWorldParam::WolVolFogDensityCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolVolFogGodRays = CVar::Register("wolVolFogGodRays", "Volumetric fog light shaft strength (0.0 off to 1.0)", 1, "0.0", CWorldParam::WolVolFogGodRaysCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolVolFogLocalLights = CVar::Register("wolVolFogLocalLights", "Point lights scattered in the volumetric fog (0 off, 1 on); only with wolVolFog 2 or 3", 1, "1", CWorldParam::WolVolFogLocalLightsCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Brief B5: the reader of the frame inputs for the fog model (Engine/ does not depend on WoW/).
++    VolFogWorld::Install();
++}
++
+ // VERIFY: 9acf82a1 auto
+ // OFFSET: 0x0078E400
+ void CWorldParam::Initialize() {
+@@ -720,6 +910,9 @@ void CWorldParam::Initialize() {
+     CWorldParam::cvar_wolFarClipFactor = CVar::Register("wolFarclipFactor", "Scales the view distance limits (1.0 original, up to 3.0)", 1, "1.0", CWorldParam::WolFarClipFactorCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Not in the original client: also before extShadowQuality, so the saved shadow map size is in place when the shadow cache starts.
+     CWorldParam::cvar_wolShadowMapSize = CVar::Register("wolShadowMapSize", "Exterior shadow map size (0 original, 1024, 2048 or 4096)", 1, "0", CWorldParam::WolShadowMapSizeCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Not in the original client: the wolVolFog* CVars are registered earlier, in RegisterGxCVars (CWorldParam::RegisterVolFogCVars, briefs B3b and B4).
++    // Brief B5: the console command wolVolFogDump (it only prints; it is not a CVar).
++    VolFogWorld::RegisterCommands();
+     CWorldParam::cvar_farClipOverride = CVar::Register("farClipOverride", "Override old world graphic settings", 1, "0", CWorldParam::FarClipOverrideCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_lod = CVar::Register("lod", "Video option: Toggle Lod", 1, "0", CWorldParam::LodCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_mapShadows = CVar::Register("mapShadows", "Video option: Toggle map shadows", 1, "1", CWorldParam::MapShadowsCallback, CATEGORY_GRAPHICS, false, nullptr, false);

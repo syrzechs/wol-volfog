@@ -1,0 +1,671 @@
+diff --git a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+index 4f0d13d..37f14e5 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+@@ -2245,6 +2245,18 @@ void CGxDeviceD3d::ISetPresentParms(D3DPRESENT_PARAMETERS& d3dpp, const CGxForma
+             break;
+     }
+ 
++    // Not in the original client (World of Legends): the readable INTZ depth of wolVolFog does not admit MSAA, so gxMultisample is
++    // ignored while the depth is wanted (design 1.2). EnableAutoDepthStencil stays on: it is the fallback if the texture fails.
++    if (format.m_multisampleCount > 1 && VolFog::WantsReadableDepth()) {
++        static const char* const s_multisampleIgnored = "wolVolFog: gxMultisample ignorado (el depth legible no admite MSAA)";
++        CGxDevice::Log("%s", s_multisampleIgnored);
++        VolFog::Message(s_multisampleIgnored);
++        d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
++        d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
++        d3dpp.MultiSampleQuality = 0;
++        return;
++    }
++
+     if (format.m_multisampleCount <= 1) {
+         d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+         return;
+@@ -2679,6 +2691,10 @@ void CGxDeviceD3d::IReleaseD3dResources(int32_t freeTextures) {
+         this->m_defDepthSurface = nullptr;
+     }
+ 
++    // Not in the original client (World of Legends): the INTZ depth texture of wolVolFog is a D3DPOOL_DEFAULT resource and has to go
++    // before a Reset; IStateSetD3DDefaults creates it again afterwards.
++    VolFog::ReleaseDepthTexture();
++
+     if (this->m_defDepthStencilSurface) {
+         this->m_defDepthStencilSurface->Release();
+         this->m_defDepthStencilSurface = nullptr;
+@@ -3342,6 +3358,20 @@ void CGxDeviceD3d::IStateSetD3DDefaults() {
+ 
+     this->m_d3dDevice->GetRenderTarget(0, &this->m_defColorSurface);
+     this->m_d3dDevice->GetDepthStencilSurface(&this->m_defDepthSurface);
++
++    // Not in the original client (World of Legends): with wolVolFog > 0 the main depth becomes a readable INTZ texture of the size
++    // of the back buffer (design 1.2, brief B3). m_defDepthSurface now refers to it, so everything that restores the default depth
++    // keeps working. m_defDepthStencilSurface (the scratch depth of off-screen colour targets) is left alone on purpose: those passes
++    // must not draw into, or clear, the world depth.
++    if (VolFog::CreateDepthTexture(this->m_d3dDevice)) {
++        if (this->m_defDepthSurface) {
++            this->m_defDepthSurface->Release();
++            this->m_defDepthSurface = nullptr;
++        }
++
++        this->m_d3dDevice->GetDepthStencilSurface(&this->m_defDepthSurface);
++    }
++
+     this->InitLights();
+     this->m_ambientOnlyMode = 0;
+ 
+diff --git a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+index 2bc966e..04efea9 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+@@ -2251,6 +2251,18 @@ void CGxDeviceD3d9Ex::ISetPresentParms(D3DPRESENT_PARAMETERS& d3dpp, const CGxFo
+             break;
+     }
+ 
++    // Not in the original client (World of Legends): the readable INTZ depth of wolVolFog does not admit MSAA, so gxMultisample is
++    // ignored while the depth is wanted (design 1.2). EnableAutoDepthStencil stays on: it is the fallback if the texture fails.
++    if (format.m_multisampleCount > 1 && VolFog::WantsReadableDepth()) {
++        static const char* const s_multisampleIgnored = "wolVolFog: gxMultisample ignorado (el depth legible no admite MSAA)";
++        CGxDevice::Log("%s", s_multisampleIgnored);
++        VolFog::Message(s_multisampleIgnored);
++        d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
++        d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
++        d3dpp.MultiSampleQuality = 0;
++        return;
++    }
++
+     if (format.m_multisampleCount <= 1) {
+         d3dpp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+         return;
+@@ -2649,6 +2661,10 @@ void CGxDeviceD3d9Ex::IReleaseD3dResources(int32_t freeTextures) {
+         this->m_defDepthSurface = nullptr;
+     }
+ 
++    // Not in the original client (World of Legends): the INTZ depth texture of wolVolFog is a D3DPOOL_DEFAULT resource and has to go
++    // before a Reset; IStateSetD3DDefaults creates it again afterwards.
++    VolFog::ReleaseDepthTexture();
++
+     if (this->m_defDepthStencilSurface) {
+         this->m_defDepthStencilSurface->Release();
+         this->m_defDepthStencilSurface = nullptr;
+@@ -3143,6 +3159,20 @@ void CGxDeviceD3d9Ex::IStateSetD3DDefaults() {
+ 
+     this->m_d3dDevice->GetRenderTarget(0, &this->m_defColorSurface);
+     this->m_d3dDevice->GetDepthStencilSurface(&this->m_defDepthSurface);
++
++    // Not in the original client (World of Legends): with wolVolFog > 0 the main depth becomes a readable INTZ texture of the size
++    // of the back buffer (design 1.2, brief B3). m_defDepthSurface now refers to it, so everything that restores the default depth
++    // keeps working. m_defDepthStencilSurface (the scratch depth of off-screen colour targets) is left alone on purpose: those passes
++    // must not draw into, or clear, the world depth.
++    if (VolFog::CreateDepthTexture(this->m_d3dDevice)) {
++        if (this->m_defDepthSurface) {
++            this->m_defDepthSurface->Release();
++            this->m_defDepthSurface = nullptr;
++        }
++
++        this->m_d3dDevice->GetDepthStencilSurface(&this->m_defDepthSurface);
++    }
++
+     this->InitLights();
+     this->m_ambientOnlyMode = 0;
+ 
+diff --git a/Engine/Source/VolFog/VolFog.h b/Engine/Source/VolFog/VolFog.h
+index 609269f..356789c 100644
+--- a/Engine/Source/VolFog/VolFog.h
++++ b/Engine/Source/VolFog/VolFog.h
+@@ -3,6 +3,10 @@
+ 
+ #include <cstdint>
+ 
++struct IDirect3DDevice9;
++struct IDirect3DTexture9;
++class CGxTex;
++
+ // Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B1.
+ 
+ namespace VolFog {
+@@ -22,6 +26,39 @@ namespace VolFog {
+     // WorldParam_CVar.cpp. B3 and later add the real wolVolFog CVar next to it.
+     extern int32_t s_debugMode;
+ 
++    // Brief B3: wolVolFog (0-3), set by the CVar in WorldParam_CVar.cpp. 0 = original client.
++    extern int32_t s_mode;
++
++    // True when the main depth should be the readable INTZ texture: wolVolFog > 0 and the device reports INTZ. The Gx
++    // backends ask it in ISetPresentParms (to drop MSAA) and in IStateSetD3DDefaults (to create the texture).
++    bool WantsReadableDepth();
++
++    // Brief B3, D3D9 backends only (the OpenGL stub never calls them). CreateDepthTexture makes an INTZ texture the size
++    // of the back buffer (rounded up when the device has POW2-only textures) and makes it the depth-stencil surface of
++    // the device; the backend then re-reads it with GetDepthStencilSurface into m_defDepthSurface. It returns false, and
++    // leaves the device untouched, when the depth is not wanted, the back buffer is multisampled or the texture fails.
++    // ReleaseDepthTexture must run before the device is reset or destroyed (IReleaseD3dResources).
++    bool CreateDepthTexture(IDirect3DDevice9* device);
++    void ReleaseDepthTexture();
++
++    // The INTZ texture, nullptr when there is none (wolVolFog 0, no INTZ, MSAA, lost device). DepthTex() wraps it in a
++    // CGxTex that is not registered in the device texture list (the backend ISetTexture only needs m_apiSpecificData
++    // and the flags), so the pass binds it with GxRsSet(GxRs_Texture0, ...), point filter and clamp; nullptr when
++    // DepthTexture() is. DepthWidth / DepthHeight are the texture size in texels (c1.zw = 1 / size).
++    IDirect3DTexture9* DepthTexture();
++    CGxTex* DepthTex();
++    uint32_t DepthWidth();
++    uint32_t DepthHeight();
++
++    // Lines for the player: the Gx backends write them to gx.log themselves; this one also sends them to the console
++    // through the hook that WorldParam_CVar.cpp installs (the Gx library does not link the console). No hook, no output.
++    typedef void (*MessageHook)(const char* line);
++    extern MessageHook s_messageHook;
++    void Message(const char* line);
++
++    // wolVolFogDebug 1 without a readable depth: the warning is written once per change of the CVar.
++    extern bool s_noDepthWarned;
++
+     // Draws the fog sub-passes over the world viewport of CGWorldFrame::OnWorldRender, between
+     // DayNight::RenderGlares and PlayerNameUpdateLate. With wolVolFogDebug 0 it draws nothing. If the shaders are
+     // not valid it writes one line to the console and does nothing else.
+diff --git a/Engine/Source/VolFog/VolFogDepth.cpp b/Engine/Source/VolFog/VolFogDepth.cpp
+new file mode 100644
+index 0000000..d756415
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFogDepth.cpp
+@@ -0,0 +1,196 @@
++#include "Engine/Source/VolFog/VolFog.h"
++#include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
++#include "Engine/Source/Gx/CGxTex.h"
++#include "Engine/Source/Gx/CGxTexFlags.h"
++
++#if defined(_WIN32)
++#include <d3d9.h>
++#endif
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B3: the main depth buffer as a
++// readable INTZ texture. Only the D3D9 backends call CreateDepthTexture / ReleaseDepthTexture; the OpenGL stub never does,
++// so there DepthTexture() stays nullptr and the pass reports "no depth".
++
++int32_t VolFog::s_mode;
++VolFog::MessageHook VolFog::s_messageHook;
++bool VolFog::s_noDepthWarned;
++
++namespace {
++#if defined(_WIN32)
++    IDirect3DTexture9* s_texture;
++    IDirect3DSurface9* s_surface;
++#endif
++    uint32_t s_width;
++    uint32_t s_height;
++    CGxTex* s_wrapper; // kept for the whole run: the pass binds it, the device never owns it
++}
++
++bool VolFog::WantsReadableDepth() {
++    return VolFog::s_mode > 0 && VolFog::s_caps.intz;
++}
++
++void VolFog::Message(const char* line) {
++    if (VolFog::s_messageHook) {
++        VolFog::s_messageHook(line);
++    }
++}
++
++#if defined(_WIN32)
++
++static uint32_t RoundUpToPow2(uint32_t value) {
++    uint32_t result = 1;
++
++    while (result < value) {
++        result <<= 1;
++    }
++
++    return result;
++}
++
++bool VolFog::CreateDepthTexture(IDirect3DDevice9* device) {
++    VolFog::ReleaseDepthTexture();
++
++    if (!device || !VolFog::WantsReadableDepth()) {
++        return false;
++    }
++
++    IDirect3DSurface9* colour = nullptr;
++
++    if (FAILED(device->GetRenderTarget(0, &colour)) || !colour) {
++        return false;
++    }
++
++    D3DSURFACE_DESC desc;
++    HRESULT result = colour->GetDesc(&desc);
++    colour->Release();
++
++    if (FAILED(result)) {
++        return false;
++    }
++
++    if (desc.MultiSampleType != D3DMULTISAMPLE_NONE) {
++        // A multisampled back buffer cannot share the depth of a plain texture. This happens on the very first device of a
++        // run (the caps are read after the present parameters) and is solved by gxRestart.
++        CGxDevice::Log("wolVolFog: the back buffer is multisampled (%d), the readable depth waits for gxRestart", static_cast<int>(desc.MultiSampleType));
++        VolFog::Message("wolVolFog: pendiente de gxRestart (el back buffer tiene MSAA)");
++        return false;
++    }
++
++    const D3DFORMAT intz = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'));
++    uint32_t width = desc.Width;
++    uint32_t height = desc.Height;
++    IDirect3DTexture9* texture = nullptr;
++
++    result = device->CreateTexture(width, height, 1, D3DUSAGE_DEPTHSTENCIL, intz, D3DPOOL_DEFAULT, &texture, nullptr);
++
++    if (FAILED(result)) {
++        // Devices with POW2-only textures: a depth bigger than the render target is legal in D3D9.
++        uint32_t roundedWidth = RoundUpToPow2(width);
++        uint32_t roundedHeight = RoundUpToPow2(height);
++
++        if (roundedWidth != width || roundedHeight != height) {
++            result = device->CreateTexture(roundedWidth, roundedHeight, 1, D3DUSAGE_DEPTHSTENCIL, intz, D3DPOOL_DEFAULT, &texture, nullptr);
++
++            if (SUCCEEDED(result)) {
++                width = roundedWidth;
++                height = roundedHeight;
++            }
++        }
++    }
++
++    if (FAILED(result) || !texture) {
++        CGxDevice::Log("wolVolFog: CreateTexture(%ux%u, INTZ) failed (0x%08X), the original depth buffer stays", width, height, static_cast<unsigned>(result));
++        return false;
++    }
++
++    IDirect3DSurface9* surface = nullptr;
++
++    if (FAILED(texture->GetSurfaceLevel(0, &surface)) || !surface) {
++        texture->Release();
++        return false;
++    }
++
++    if (FAILED(device->SetDepthStencilSurface(surface))) {
++        surface->Release();
++        texture->Release();
++        CGxDevice::Log("wolVolFog: SetDepthStencilSurface(INTZ) failed, the original depth buffer stays");
++        return false;
++    }
++
++    s_texture = texture;
++    s_surface = surface;
++    s_width = width;
++    s_height = height;
++    CGxDevice::Log("wolVolFog: INTZ depth texture %ux%u is now the main depth (back buffer %ux%u)", width, height, desc.Width, desc.Height);
++
++    return true;
++}
++
++void VolFog::ReleaseDepthTexture() {
++    if (s_surface) {
++        s_surface->Release();
++        s_surface = nullptr;
++    }
++
++    if (s_texture) {
++        s_texture->Release();
++        s_texture = nullptr;
++    }
++
++    if (s_wrapper) {
++        s_wrapper->m_apiSpecificData = nullptr;
++    }
++
++    s_width = 0;
++    s_height = 0;
++}
++
++IDirect3DTexture9* VolFog::DepthTexture() {
++    return s_texture;
++}
++
++#else
++
++bool VolFog::CreateDepthTexture(IDirect3DDevice9*) {
++    return false;
++}
++
++void VolFog::ReleaseDepthTexture() {
++}
++
++IDirect3DTexture9* VolFog::DepthTexture() {
++    return nullptr;
++}
++
++#endif
++
++CGxTex* VolFog::DepthTex() {
++    IDirect3DTexture9* texture = VolFog::DepthTexture();
++
++    if (!texture) {
++        return nullptr;
++    }
++
++    if (!s_wrapper) {
++        // Point filter, clamp: s0 of the shaders (sDepth). Not created through GxTexCreate, so the device does not list it, does
++        // not recreate it on reset and never calls a user function for it: ISetTexture only reads m_apiSpecificData and m_flags.
++        s_wrapper = new CGxTex(GxTex_2d, s_width, s_height, 1, GxTex_IntZ, GxTex_IntZ, CGxTexFlags(GxTex_Nearest, 0, 0), nullptr, nullptr, "wolVolFogDepth");
++    }
++
++    s_wrapper->m_width = s_width;
++    s_wrapper->m_height = s_height;
++    s_wrapper->m_apiSpecificData = texture;
++    s_wrapper->m_needsCreation = 0;
++    s_wrapper->m_needsUpdate = 0;
++    s_wrapper->m_needsFlagUpdate = 0;
++
++    return s_wrapper;
++}
++
++uint32_t VolFog::DepthWidth() {
++    return s_width;
++}
++
++uint32_t VolFog::DepthHeight() {
++    return s_height;
++}
+diff --git a/Engine/Source/VolFog/VolFogRender.cpp b/Engine/Source/VolFog/VolFogRender.cpp
+index ee3537b..ffc6613 100644
+--- a/Engine/Source/VolFog/VolFogRender.cpp
++++ b/Engine/Source/VolFog/VolFogRender.cpp
+@@ -2,6 +2,7 @@
+ #include "Engine/Source/ConsoleBase/IConsole.h"
+ #include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
+ #include "Engine/Source/Gx/Gx.h"
++#include "Engine/Source/Tempest/C44Matrix.h"
+ #include "Engine/Source/Tempest/CRect.h"
+ #include "Engine/Source/VolFog/VolFog.h"
+ #include "Engine/Source/VolFog/VolFogPass.h"
+@@ -23,23 +24,70 @@ namespace {
+             float saved[16];
+             memcpy(saved, CGxDevice::s_shadowConstants[0].constants, sizeof(saved));
+ 
++            // wolVolFogDebug 1 (permutation 0) reads the INTZ depth as s0; Render() has checked that it exists.
++            CGxTex* depth = this->m_pixelIndex == 0 ? VolFog::DepthTex() : nullptr;
++
++            float texelX = 1.0f / this->m_targetPx[0];
++            float texelY = 1.0f / this->m_targetPx[1];
++
++            if (depth && VolFog::DepthWidth() && VolFog::DepthHeight()) {
++                texelX = 1.0f / static_cast<float>(VolFog::DepthWidth());
++                texelY = 1.0f / static_cast<float>(VolFog::DepthHeight());
++            }
++
+             float c0[4] = { this->m_viewportPx[0], this->m_viewportPx[1], this->m_viewportPx[2], this->m_viewportPx[3] };
+-            float c1[4] = { 1.0f, 0.0f, 1.0f / this->m_targetPx[0], 1.0f / this->m_targetPx[1] };
+-            // Depth to view z: filled in by the brief that reads the depth (B3); max distance and deepest world depth as in the design.
++            float c1[4] = { 1.0f, 0.0f, texelX, texelY };
++            float c2[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+             float c3[4] = { 0.0f, 0.0f, 5000.0f, 0.94f };
+ 
++            // Contract of the design (section 3) from the projection the world was drawn with and its viewport depth range
++            // (World.cpp: z 0..0.94). The projection is the GL-style matrix of GxuXformCreateProjection_Exact: ndc z = c2 + d2 / z, and the
++            // depth buffer holds minZ + (maxZ - minZ) * (ndc z + 1) / 2, so  depth = x + y / viewZ  with x = c3.x and y = c3.y (y < 0).
++            C44Matrix projection;
++            GxXformProjection(projection);
++
++            float minX = 0.0f;
++            float maxX = 0.0f;
++            float minY = 0.0f;
++            float maxY = 0.0f;
++            float minZ = 0.0f;
++            float maxZ = 0.0f;
++            GxXformViewport(minX, maxX, minY, maxY, minZ, maxZ);
++
++            if (!(maxZ - minZ > 0.0001f) || minZ < 0.0f || maxZ > 1.0f) {
++                minZ = 0.0f;
++                maxZ = 1.0f;
++            }
++
++            float extent = maxZ - minZ;
++            c2[0] = projection.a0;
++            c2[1] = projection.b1;
++            c2[2] = projection.c0;
++            c2[3] = projection.c1;
++            c3[0] = minZ + extent * (1.0f + projection.c2) * 0.5f;
++            c3[1] = extent * projection.d2 * 0.5f;
++            c3[3] = maxZ;
++
++            if (projection.c2 > 1.0f && projection.d2 < 0.0f) {
++                // Far plane of the projection. The final fog uses max(5000, farclip) here; the debug view normalises by the far plane so that
++                // the gradient shows up (design brief B3).
++                c3[2] = projection.d2 / (1.0f - projection.c2);
++            }
++
+             this->Begin();
+ 
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, c0, 1);
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 1, c1, 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 2, c2, 1);
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 3, c3, 1);
+-            GxRsSet(GxRs_Texture0, 0); // sDepth: the INTZ depth texture is bound here from B3 on
++            GxRsSet(GxRs_Texture0, depth); // sDepth: POINT, CLAMP (flags of the wrapper); nullptr in the modes that do not read it
+ 
+             this->DrawQuad();
+             this->End();
+ 
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, &saved[0], 1);
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 1, &saved[4], 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 2, &saved[8], 1);
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 3, &saved[12], 1);
+         }
+     };
+@@ -55,6 +103,18 @@ void VolFog::Render() {
+         return;
+     }
+ 
++    if (mode == 1 && !VolFog::DepthTex()) {
++        // No readable depth (wolVolFog 0, no INTZ, or the device has not been rebuilt yet): say it once and draw nothing.
++        if (!VolFog::s_noDepthWarned) {
++            VolFog::s_noDepthWarned = true;
++            const char* message = "wolVolFogDebug 1: there is no readable INTZ depth (set wolVolFog 1-3 and run gxRestart; the video card must report INTZ); nothing is drawn.";
++            ConsoleWrite(message, DEFAULT_COLOR);
++            CGxDevice::Log("%s", message);
++        }
++
++        return;
++    }
++
+     if (!s_debugPass) {
+         // Created on first use and kept for the whole run; the shaders belong to the device and go with it.
+         s_debugPass = new DebugPass();
+diff --git a/Shaders/VolFog/WolVolFogDebug.hlsl b/Shaders/VolFog/WolVolFogDebug.hlsl
+index d3e1225..1ab0ab9 100644
+--- a/Shaders/VolFog/WolVolFogDebug.hlsl
++++ b/Shaders/VolFog/WolVolFogDebug.hlsl
+@@ -1,42 +1,45 @@
+-// Not in the original client (World of Legends): debug pixel shader of the native volumetric fog (wolVolFogDebug),
+-// brief B2. Written for this project, GPL-3.0-only like the rest of Shaders/VolFog (see LICENSE and
+-// NOTICE-modificaciones.txt). The register contract is the one of vf_common.hlsli (coa-vfog 205ade5).
+-// Compiled by fxc as ps_3_0, one permutation per mode: /D DEBUG_MODE=1|2|3 (WolVolFogDebug.bls permutation = mode - 1).
+-//   1: depth buffer linearised in grey, sky white (reads sDepth; stays black until the INTZ depth of brief B3)
+-//   2: semi-transparent magenta tint over the whole world view
+-//   3: test grid every 64 px (green) with a red border on the world viewport
+-#ifndef DEBUG_MODE
+-#error DEBUG_MODE must be 1, 2 or 3
+-#endif
+-
+-float4 cWorldViewportPx : register(c0); // xy origin, zw size of the world viewport, in pixels
+-float4 cPixelGrid : register(c1);       // zw = size of one texel of the depth texture
+-float4 cDepthToViewZ : register(c3);    // x depth at infinite z, y depth per 1/z, z max distance, w deepest world depth
+-sampler2D sDepth : register(s0);
+-
+-static const float kSkyMinDepth = 0.95;
+-
+-float4 main(float2 pixel : VPOS) : COLOR0
+-{
+-#if DEBUG_MODE == 1
+-    float depth = tex2Dlod(sDepth, float4((pixel + 0.5) * cPixelGrid.zw, 0, 0)).r;
+-    if (depth >= kSkyMinDepth)
+-    {
+-        return float4(1, 1, 1, 1);
+-    }
+-    float dist = min(cDepthToViewZ.y / max(depth - cDepthToViewZ.x, 1e-6), cDepthToViewZ.z);
+-    float grey = sqrt(saturate(dist / cDepthToViewZ.z));
+-    return float4(grey, grey, grey, 1);
+-#elif DEBUG_MODE == 2
+-    return float4(1, 0, 1, 0.35);
+-#elif DEBUG_MODE == 3
+-    float2 local = pixel - cWorldViewportPx.xy;
+-    float2 cell = fmod(local, 64.0);
+-    float grid = (cell.x < 1.0 || cell.y < 1.0) ? 1.0 : 0.0;
+-    float border = (any(local < 2.0) || any(local > cWorldViewportPx.zw - 3.0)) ? 1.0 : 0.0;
+-    float3 colour = lerp(float3(0, 1, 0), float3(1, 0, 0), border);
+-    return float4(colour, saturate(grid + border) * 0.85);
+-#else
+-#error DEBUG_MODE must be 1, 2 or 3
+-#endif
+-}
++// Not in the original client (World of Legends): debug pixel shader of the native volumetric fog (wolVolFogDebug),
++// brief B2. Written for this project, GPL-3.0-only like the rest of Shaders/VolFog (see LICENSE and
++// NOTICE-modificaciones.txt). The register contract is the one of vf_common.hlsli (coa-vfog 205ade5).
++// Compiled by fxc as ps_3_0, one permutation per mode: /D DEBUG_MODE=1|2|3 (WolVolFogDebug.bls permutation = mode - 1).
++//   1: depth buffer linearised in grey, sky white (reads sDepth, the INTZ depth of brief B3; c3.z = far plane here)
++//   2: semi-transparent magenta tint over the whole world view
++//   3: test grid every 64 px (green) with a red border on the world viewport
++#ifndef DEBUG_MODE
++#error DEBUG_MODE must be 1, 2 or 3
++#endif
++
++float4 cWorldViewportPx : register(c0); // xy origin, zw size of the world viewport, in pixels
++float4 cPixelGrid : register(c1);       // zw = size of one texel of the depth texture
++float4 cDepthToViewZ : register(c3);    // x depth at infinite z, y depth per 1/z, z max distance, w deepest world depth
++sampler2D sDepth : register(s0);
++
++static const float kSkyMinDepth = 0.95;
++
++float4 main(float2 pixel : VPOS) : COLOR0
++{
++#if DEBUG_MODE == 1
++    float depth = tex2Dlod(sDepth, float4((pixel + 0.5) * cPixelGrid.zw, 0, 0)).r;
++    if (depth >= kSkyMinDepth)
++    {
++        return float4(1, 1, 1, 1);
++    }
++    // depth = x + y / viewZ with y < 0, so depth - x is negative for everything in front of infinity (LinearDepth of
++    // vf_common.hlsli divides the same way); the beyond-far-clip test is the one of BeyondFarClip().
++    float denominator = depth - cDepthToViewZ.x;
++    float dist = (depth > cDepthToViewZ.w || denominator > -1e-6) ? cDepthToViewZ.z : min(cDepthToViewZ.y / denominator, cDepthToViewZ.z);
++    float grey = sqrt(saturate(dist / cDepthToViewZ.z));
++    return float4(grey, grey, grey, 1);
++#elif DEBUG_MODE == 2
++    return float4(1, 0, 1, 0.35);
++#elif DEBUG_MODE == 3
++    float2 local = pixel - cWorldViewportPx.xy;
++    float2 cell = fmod(local, 64.0);
++    float grid = (cell.x < 1.0 || cell.y < 1.0) ? 1.0 : 0.0;
++    float border = (any(local < 2.0) || any(local > cWorldViewportPx.zw - 3.0)) ? 1.0 : 0.0;
++    float3 colour = lerp(float3(0, 1, 0), float3(1, 0, 0), border);
++    return float4(colour, saturate(grid + border) * 0.85);
++#else
++#error DEBUG_MODE must be 1, 2 or 3
++#endif
++}
+diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
+index 89b4a4f..db62306 100644
+--- a/WoW/Source/WorldClient/WorldParam.h
++++ b/WoW/Source/WorldClient/WorldParam.h
+@@ -43,6 +43,7 @@ class CWorldParam {
+     // Not in the original client (World of Legends): see patches-cliente/sombras-4096/README-sombras.md.
+     static CVar* cvar_wolShadowMapSize;
+     // Not in the original client (World of Legends): native volumetric fog, see patches-cliente/niebla-volumetrica/README-niebla.md.
++    static CVar* cvar_wolVolFog;
+     static CVar* cvar_wolVolFogDebug;
+ 
+     static bool BaseMipCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+@@ -82,6 +83,7 @@ class CWorldParam {
+     // Not in the original client.
+     static bool WolFarClipFactorCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolShadowMapSizeCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolVolFogCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool TextureFilteringCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WaterLodCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index b054433..d275f8f 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -117,6 +117,7 @@ CVar* CWorldParam::cvar_wolFarClipFactor;
+ CVar* CWorldParam::cvar_wolShadowMapSize;
+ 
+ // Not in the original client (World of Legends): wolVolFogDebug, see patches-cliente/niebla-volumetrica/README-niebla.md.
++CVar* CWorldParam::cvar_wolVolFog;
+ CVar* CWorldParam::cvar_wolVolFogDebug;
+ 
+ #define WOL_FARCLIP_FACTOR_MAX 3.0f
+@@ -716,6 +717,56 @@ bool CWorldParam::GxTextureCacheSizeCallback(CVar* var, const char* oldValue, co
+     return true;
+ }
+ 
++// Not in the original client. The Gx library does not link the console: VolFog::Message goes through this hook.
++static void WolVolFogMessage(const char* line) {
++    ConsoleWrite(line, DEFAULT_COLOR);
++}
++
++// Not in the original client. Native volumetric fog (brief B3): 0 = original client, 1-3 = quality (B6 onwards). Going between 0
++// and above 0 swaps the main depth for an INTZ texture and drops MSAA, which only happens when the device is rebuilt (gxRestart).
++bool CWorldParam::WolVolFogCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    int32_t mode = -1;
++
++    if (value && value[0] >= '0' && value[0] <= '3' && value[1] == '\0') {
++        mode = value[0] - '0';
++    }
++
++    if (mode < 0) {
++        ConsoleWrite("wolVolFog must be 0 (off), 1 (low), 2 (medium) or 3 (high).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    VolFog::s_mode = mode;
++    VolFog::s_messageHook = WolVolFogMessage;
++
++    // No caps line while the CVar is first registered (no previous value): only when somebody changes it.
++    bool changed = oldValue && *oldValue;
++
++    if (changed) {
++        char buffer[160];
++        SStrPrintf(buffer, sizeof(buffer), "wolVolFog: %d. Caps: INTZ=%s ABGR16F=%s ABGR32F=%s PS3.0 slots=%u", mode, VolFog::s_caps.intz ? "yes" : "no", VolFog::s_caps.abgr16f ? "yes" : "no", VolFog::s_caps.abgr32f ? "yes" : "no", VolFog::s_caps.ps30Slots);
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++        CGxDevice::Log("%s", static_cast<const char*>(buffer)); // const char*: a char* would pick the va_list overload
++    }
++
++    // The depth texture exists only if the device was built with the CVar above 0 (and INTZ): compare with what is wanted now.
++    bool wantsDepth = mode > 0 && VolFog::s_caps.intz;
++    bool hasDepth = VolFog::DepthTexture() != nullptr;
++
++    if (wantsDepth != hasDepth) {
++        static const char* const s_pending = "wolVolFog: pendiente de gxRestart";
++        ConsoleWrite(s_pending, DEFAULT_COLOR);
++        CGxDevice::Log("%s", s_pending);
++    } else if (changed && mode > 0 && !VolFog::s_caps.intz) {
++        static const char* const s_noIntz = "wolVolFog: this video card does not report INTZ, the fog stays off.";
++        ConsoleWrite(s_noIntz, DEFAULT_COLOR);
++        CGxDevice::Log("%s", s_noIntz);
++    }
++
++    return true;
++}
++
+ // Not in the original client. Debug view of the native volumetric fog pass (VolFog::Render, brief B2): 0 draws nothing,
+ // 1 depth in grey (needs the INTZ depth of brief B3), 2 magenta tint over the world view, 3 test grid. The value is
+ // read every frame, so no restart is needed.
+@@ -733,6 +784,7 @@ bool CWorldParam::WolVolFogDebugCallback(CVar* var, const char* oldValue, const
+     }
+ 
+     VolFog::s_debugMode = mode;
++    VolFog::s_noDepthWarned = false;
+ 
+     // No message while the CVar is first registered (no previous value).
+     if (oldValue && *oldValue) {
+@@ -752,6 +804,9 @@ void CWorldParam::Initialize() {
+     CWorldParam::cvar_wolFarClipFactor = CVar::Register("wolFarclipFactor", "Scales the view distance limits (1.0 original, up to 3.0)", 1, "1.0", CWorldParam::WolFarClipFactorCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Not in the original client: also before extShadowQuality, so the saved shadow map size is in place when the shadow cache starts.
+     CWorldParam::cvar_wolShadowMapSize = CVar::Register("wolShadowMapSize", "Exterior shadow map size (0 original, 1024, 2048 or 4096)", 1, "0", CWorldParam::WolShadowMapSizeCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Not in the original client: native volumetric fog (brief B3); B4 adds the other wolVolFog* CVars. Needs gxRestart to go between 0 and above 0.
++    VolFog::s_messageHook = WolVolFogMessage;
++    CWorldParam::cvar_wolVolFog = CVar::Register("wolVolFog", "Native volumetric fog (0 off, 1 low, 2 medium, 3 high); needs gxRestart to turn on or off", 1, "0", CWorldParam::WolVolFogCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Not in the original client: debug view of the native volumetric fog pass (brief B2); B4 adds the other wolVolFog* CVars.
+     CWorldParam::cvar_wolVolFogDebug = CVar::Register("wolVolFogDebug", "Volumetric fog debug view (0 off, 1 depth, 2 tint, 3 grid)", 1, "0", CWorldParam::WolVolFogDebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_farClipOverride = CVar::Register("farClipOverride", "Override old world graphic settings", 1, "0", CWorldParam::FarClipOverrideCallback, CATEGORY_GRAPHICS, false, nullptr, false);

@@ -1,0 +1,254 @@
+diff --git a/Engine/Source/Frame/CSimpleRender.cpp b/Engine/Source/Frame/CSimpleRender.cpp
+index 95d7645..aade8b8 100644
+--- a/Engine/Source/Frame/CSimpleRender.cpp
++++ b/Engine/Source/Frame/CSimpleRender.cpp
+@@ -653,6 +653,11 @@ int32_t CSimpleRender::CalcBatchCounts(CRenderBatch* batch, uint32_t* vertCounts
+ // VERIFY: 9b5bcef4 manual
+ // OFFSET: 0x00484B00
+ void CSimpleRender::DrawBatch(CRenderBatch* batch) {
++    // Not in the original client (World of Legends): with wolUiDepth the textures and the text of this batch write
++    // depth 0.0; the render callbacks at the end (world, models, minimap...) run outside of it.
++    WOLUIDEPTH uiDepth;
++    uiDepth.Enter();
++
+     uint32_t meshCount = batch->m_texturelist.Count();
+ 
+     if (meshCount) {
+@@ -676,6 +681,7 @@ void CSimpleRender::DrawBatch(CRenderBatch* batch) {
+         GxRsSet(GxRs_Fog, 0);
+         GxRsSet(GxRs_DepthTest, 0);
+         GxRsSet(GxRs_DepthWrite, 0);
++        GxWolUiDepthStates(); // Not in the original client (World of Legends)
+ 
+         uint32_t* vertCounts = static_cast<uint32_t*>(alloca(sizeof(uint32_t) * meshCount));
+         uint32_t* idxCounts = static_cast<uint32_t*>(alloca(sizeof(uint32_t) * meshCount));
+@@ -725,7 +731,9 @@ void CSimpleRender::DrawBatch(CRenderBatch* batch) {
+                     gxBatch.m_count = idxCounts[batchIndex];
+                     gxBatch.m_minIndex = 0;
+                     gxBatch.m_maxIndex = vertCounts[batchIndex] - 1;
++                    uiDepth.ZBegin(); // Not in the original client (World of Legends)
+                     GxDraw(&gxBatch, 1);
++                    uiDepth.ZEnd(); // Not in the original client (World of Legends)
+                 }
+ 
+                 batchIndex++;
+@@ -735,6 +743,7 @@ void CSimpleRender::DrawBatch(CRenderBatch* batch) {
+                 GxRsSet(GxRs_Texture0, TextureGetGxTex(mesh->m_texture, 1, nullptr));
+                 GxRsSet(GxRs_BlendingMode, alphaMode);
+                 GxUpdateAlphaRef(GxRs_AlphaRef);
++                GxWolUiDepthStates(); // Not in the original client (World of Legends)
+                 GxRsSet(GxRs_PixelShader, shader);
+             }
+ 
+@@ -796,16 +805,22 @@ void CSimpleRender::DrawBatch(CRenderBatch* batch) {
+             gxBatch.m_count = idxCounts[batchIndex];
+             gxBatch.m_minIndex = 0;
+             gxBatch.m_maxIndex = vertCounts[batchIndex] - 1;
++            uiDepth.ZBegin(); // Not in the original client (World of Legends)
+             GxDraw(&gxBatch, 1);
++            uiDepth.ZEnd(); // Not in the original client (World of Legends)
+         }
+ 
+         g_theGxDevicePtr->RsPop();
+     }
+ 
+     if (batch->m_stringbatch) {
++        uiDepth.ZBegin(); // Not in the original client (World of Legends)
+         GxuFontRenderBatch(batch->m_stringbatch);
++        uiDepth.ZEnd(); // Not in the original client (World of Legends)
+     }
+ 
++    uiDepth.Leave(); // Not in the original client (World of Legends)
++
+     for (RENDERCALLBACKNODE* node = batch->m_callbacks.Head(); !TSList<RENDERCALLBACKNODE, TSGetLink<RENDERCALLBACKNODE> >::IsEnd(node); node = node->RawNext()) {
+         node->m_callback(node->m_param);
+     }
+diff --git a/Engine/Source/Gx/Gx.cpp b/Engine/Source/Gx/Gx.cpp
+index cb5e880..030d795 100644
+--- a/Engine/Source/Gx/Gx.cpp
++++ b/Engine/Source/Gx/Gx.cpp
+@@ -854,6 +854,95 @@ void GxUpdateAlphaRef(EGxRenderState which) {
+     }
+ }
+ 
++// Not in the original client (World of Legends): wolUiDepth (0 = original). ReShade runs after the interface is drawn
++// and reads the depth buffer; the interface never wrote to it, so the depth of the world stayed under every UI pixel.
++// With wolUiDepth 1 every visible texel of the 2D interface writes depth 0.0 (the near plane) and nothing else changes.
++int32_t g_wolUiDepth;
++
++// Nonzero while CSimpleRender::DrawBatch draws textures and text (between WOLUIDEPTH::Enter and Leave). The text batches
++// of the world, the models and the render callbacks are drawn outside of it.
++static int32_t s_wolUiDepthScope;
++
++// Texels below this alpha do not write depth (the original alpha test of the Alpha and Add blends is 1 of 255).
++#define WOL_UI_DEPTH_ALPHA_REF 16
++
++WOLUIDEPTH::~WOLUIDEPTH() {
++    this->ZEnd();
++    this->Leave();
++}
++
++void WOLUIDEPTH::Enter() {
++    if (g_wolUiDepth && !this->m_scoped) {
++        this->m_scoped = 1;
++        s_wolUiDepthScope++;
++    }
++}
++
++void WOLUIDEPTH::Leave() {
++    if (this->m_scoped) {
++        this->m_scoped = 0;
++        s_wolUiDepthScope--;
++    }
++}
++
++// The depth range of the viewport becomes 0 - 0, so whatever the orthographic z of the interface is, it is written as 0.0.
++void WOLUIDEPTH::ZBegin() {
++    if (!this->m_scoped || this->m_zChanged) {
++        return;
++    }
++
++    float minX;
++    float maxX;
++    float minY;
++    float maxY;
++    float minZ;
++    float maxZ;
++    GxXformViewport(minX, maxX, minY, maxY, minZ, maxZ);
++
++    if (minZ != 0.0f || maxZ != 0.0f) {
++        this->m_minZ = minZ;
++        this->m_maxZ = maxZ;
++        this->m_zChanged = 1;
++        GxXformSetViewport(minX, maxX, minY, maxY, 0.0f, 0.0f);
++    }
++}
++
++// Puts the previous depth range back, keeping the x/y of the viewport as they are now.
++void WOLUIDEPTH::ZEnd() {
++    if (!this->m_zChanged) {
++        return;
++    }
++
++    float minX;
++    float maxX;
++    float minY;
++    float maxY;
++    float minZ;
++    float maxZ;
++    GxXformViewport(minX, maxX, minY, maxY, minZ, maxZ);
++    GxXformSetViewport(minX, maxX, minY, maxY, this->m_minZ, this->m_maxZ);
++    this->m_zChanged = 0;
++}
++
++// Render states of an interface draw: depth test off (D3D9 ZFUNC ALWAYS, ZENABLE stays on) with depth write on, and
++// the alpha test of the Alpha and Add blends raised so that the transparent texels of glyphs and icons write nothing.
++// Call it after the blend mode and GxUpdateAlphaRef; it does nothing outside WOLUIDEPTH::Enter / Leave.
++void GxWolUiDepthStates() {
++    if (!s_wolUiDepthScope) {
++        return;
++    }
++
++    GxRsSet(GxRs_DepthTest, 0);
++    GxRsSet(GxRs_DepthWrite, 1);
++
++    int32_t blendMode = g_theGxDevicePtr->m_appRenderStates[GxRs_BlendingMode].m_value.m_data.i[0];
++    int32_t alphaRef = g_theGxDevicePtr->m_appRenderStates[GxRs_AlphaRef].m_value.m_data.i[0];
++
++    if ((blendMode == GxBlend_Alpha || blendMode == GxBlend_Add) && alphaRef > 0 && alphaRef < WOL_UI_DEPTH_ALPHA_REF) {
++        GxRsSet(GxRs_AlphaRef, WOL_UI_DEPTH_ALPHA_REF);
++    }
++}
++
+ // VERIFY: 3f036f15 auto
+ // OFFSET: 0x00763C70
+ void GxRsSet(EGxRenderState which, float value) {
+diff --git a/Engine/Source/Gx/Gx.h b/Engine/Source/Gx/Gx.h
+index 5e4a58e..fa6ac93 100644
+--- a/Engine/Source/Gx/Gx.h
++++ b/Engine/Source/Gx/Gx.h
+@@ -113,6 +113,24 @@ void GxRsSet(EGxRenderState which, void* value);
+ void GxRsSet(EGxRenderState which, int32_t value);
+ void GxRsSet(EGxRenderState which, float value);
+ void GxUpdateAlphaRef(EGxRenderState which);
++// Not in the original client (World of Legends): wolUiDepth, see patches-cliente/ui-depth/README-uidepth.md. With the
++// CVar on, the 2D interface (CSimpleRender::DrawBatch: textures and text) writes depth 0.0 (the near plane).
++extern int32_t g_wolUiDepth;
++void GxWolUiDepthStates();
++
++struct WOLUIDEPTH {
++    float m_minZ;
++    float m_maxZ;
++    int32_t m_scoped;
++    int32_t m_zChanged;
++
++    WOLUIDEPTH() : m_minZ(0.0f), m_maxZ(0.0f), m_scoped(0), m_zChanged(0) {}
++    ~WOLUIDEPTH();
++    void Enter();
++    void Leave();
++    void ZBegin();
++    void ZEnd();
++};
+ void GxSceneClear(uint32_t mask, CImVector color);
+ void GxScenePresent();
+ void GxuClearDrawList(EGxuDrawListCategory category);
+diff --git a/Engine/Source/Gxu/GxuFontMiscClasses.cpp b/Engine/Source/Gxu/GxuFontMiscClasses.cpp
+index dfdc82f..5a249c1 100644
+--- a/Engine/Source/Gxu/GxuFontMiscClasses.cpp
++++ b/Engine/Source/Gxu/GxuFontMiscClasses.cpp
+@@ -532,6 +532,7 @@ void CGxStringBatch::RenderBatch() {
+ 
+         GxRsSet(GxRs_DepthTest, 0);
+         GxRsSet(GxRs_DepthWrite, 0);
++        GxWolUiDepthStates(); // Not in the original client (World of Legends): only inside CSimpleRender::DrawBatch
+ 
+         vertexShader = g_theGxDevicePtr->StereoEnabled() ? g_fontVertexShader[1] : g_fontVertexShader[0];
+ 
+diff --git a/WoW/Source/Ui/GameUI_CVar.cpp b/WoW/Source/Ui/GameUI_CVar.cpp
+index f5d3ee9..4f8c3a6 100644
+--- a/WoW/Source/Ui/GameUI_CVar.cpp
++++ b/WoW/Source/Ui/GameUI_CVar.cpp
+@@ -3,6 +3,7 @@
+ #include "Engine/Source/ConsoleBase/IConsole.h"
+ #include "Engine/Source/ConsoleBase/Types.h"
+ #include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
++#include "Engine/Source/Gx/Gx.h"
+ #include "Engine/Source/Storm/H/storm.h"
+ #include "Engine/Source/Tempest/CRect.h"
+ #include "Engine/Source/FrameScript/FrameScript.h"
+@@ -228,6 +229,27 @@ static bool CVarHandler_wolUiScaleMax(CVar* var, const char* oldValue, const cha
+     return true;
+ }
+ 
++// Not in the original client (World of Legends): wolUiDepth, see patches-cliente/ui-depth/README-uidepth.md. 0 (default)
++// is the original; 1 makes the 2D interface write depth 0.0 so that post-processing (ReShade) leaves it alone. Read
++// every frame by CSimpleRender::DrawBatch through g_wolUiDepth, so it applies at once.
++CVar* g_wolUiDepthCVar;
++
++static bool CVarHandler_wolUiDepth(CVar* var, const char* oldValue, const char* value, void* arg) {
++    if (!value || (value[0] != '0' && value[0] != '1') || value[1]) {
++        ConsoleWriteA("wolUiDepth must be 0 (original) or 1.\n", DEFAULT_COLOR);
++        return false;
++    }
++
++    g_wolUiDepth = value[0] == '1';
++
++    // No message while the CVar is first registered (no previous value).
++    if (oldValue && *oldValue) {
++        ConsoleWriteA("wolUiDepth: %s\n", DEFAULT_COLOR, g_wolUiDepth ? "on (the interface writes depth 0.0)" : "off (original)");
++    }
++
++    return true;
++}
++
+ // STATIC: 0x00BD09B8
+ CVar* g_nameplateShowEnemiesCVar;
+ 
+@@ -717,6 +739,7 @@ void CGGameUI::Initialize() {
+     // registered just below.
+     g_wolUiScaleMinCVar = CVar::Register("wolUiScaleMin", "Smallest UI scale (original 0.64, down to 0.2)", 0, "0.64", CVarHandler_wolUiScaleMin, 4, false, nullptr, false);
+     g_wolUiScaleMaxCVar = CVar::Register("wolUiScaleMax", "Top of the UI scale slider (original 1.0, up to 2.0)", 0, "1.0", CVarHandler_wolUiScaleMax, 4, false, nullptr, false);
++    g_wolUiDepthCVar = CVar::Register("wolUiDepth", "The 2D interface writes depth 0.0 for post-processing (0 original, 1 on)", 1, "0", CVarHandler_wolUiDepth, CATEGORY_GRAPHICS, false, nullptr, false);
+     g_uiScaleCVar = CVar::Register("uiScale", "The current UI scale", 0, "1.0", CVarHandler_uiScale, 4, false, nullptr, false);
+     g_useUiScaleCVar = CVar::Register("useUiScale", "Whether or not the UI scale should be used", 0, "0", CVarHandler_useUiScale, 4, false, nullptr, false);
+ }

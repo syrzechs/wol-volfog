@@ -1,0 +1,57 @@
+wol-volfog: notice of origin and modifications
+==============================================
+
+Origin
+------
+The shaders, the fog model, the local light stabiliser and the pass order of this module are taken from CoAVolFog (coa-vfog):
+
+  fork   https://github.com/Raz0r1337/coa-vfog   (branch st0ny-main; based on https://github.com/jealous-sound/coa-vfog)
+  commit 205ade5abe54524ccd2f449fb628903bc0b66be0  (2026-10-19 13:38 UTC)
+
+Copyright belongs to the authors of CoAVolFog (jealous-sound and the contributors of the Raz0r1337 fork, st0ny).
+CoAVolFog is licensed under the GNU General Public License version 3 only (GPL-3.0-only); the text is in the file LICENSE.
+Its README adds a permission under GPLv3 section 7, kept here unchanged:
+
+  As an additional permission under GPLv3 section 7, you may link or combine CoAVolFog, including modified versions,
+  with the World of Warcraft client, and distribute the resulting combination without providing the client's source
+  code. GPLv3 continues to apply to CoAVolFog.
+
+Everything in this repository (the files derived from CoAVolFog and the files written for the World of Legends project) is
+distributed under GPL-3.0-only. Nothing of the World of Warcraft client or of the wowdecomp tree is included: only our files and
+diffs (the diffs carry the usual context lines around each change).
+
+Files derived from CoAVolFog 205ade5
+------------------------------------
+Shaders/VolFog/vf_*.hlsl, vf_*.hlsli (16 files)     copied; changes: vf_common.hlsli (kSkyMinDepth), vf_density_variation.hlsli (3D noise -> 2D atlas),
+                                                    vf_temporal.hlsl and vf_composite.hlsli (NaN guards), see Shaders/VolFog/NOTICE-modificaciones.txt
+Engine/Source/VolFog/VolFogModel.{h,cpp}            from src/fog_model.{h,cpp}
+Engine/Source/VolFog/VolFogInputs.{h,cpp}           from src/engine.h (FrameInputs)
+Engine/Source/VolFog/VolFogNoise.cpp                from CreateDensityNoise of src/noise_volume.cpp
+Engine/Source/VolFog/VolFogLights.{h,cpp}           from src/engine_lights.* and src/local_light_stabiliser.*
+Engine/Source/VolFog/VolFogRender.cpp, VolFogRays.cpp   rewritten over the client's Gx layer following src/renderer.cpp
+
+Written for this project (not derived from CoAVolFog code)
+----------------------------------------------------------
+Engine/Source/VolFog/VolFog.{h,cpp}, VolFogPass.{h,cpp}, VolFogDepth.cpp, VolFogDump.cpp, Shaders/VolFog/WolVolFogDebug.hlsl,
+Shaders/VolFog/CMakeLists.txt, Tools/VolFog/mkbls.py, Tools/VolFog/mkmpq.py, WoW/Source/WorldClient/VolFogWorld.{h,cpp},
+patches/ and cambios-cliente.diff.
+
+Modifications (GPLv3 section 5a), dated
+----------------------------------------
+Each brief below is one patch in patches/. The per-file detail of the derived files is in Shaders/VolFog/NOTICE-modificaciones.txt and in
+the "Modified <date> (brief ...)" comments at the top of each derived source file.
+
+2026-10-19  B1   Gx texture formats INTZ, A16B16G16R16F, A32B32G32R32F; module skeleton (VolFog.h, VolFog.cpp).
+2026-10-19  B2   Shader chain (fxc -> mkbls.py -> MPQ), the 15 shaders copied byte for byte, WolVolFogDebug.hlsl, base pass VolFog::Render().
+2026-10-19  B3   Readable main depth (INTZ) with wolVolFog > 0.
+2026-10-19  B3b  Corrections from the review of B1-B3.
+2026-10-20  B4   CVars wolVolFogDensity, wolVolFogGodRays, wolVolFogLocalLights.
+2026-10-20  B5   Frame inputs (VolFogInputs, VolFogWorld) and the derived fog model (VolFogModel); wolVolFogDump.
+2026-10-20  B6   Ray march and composition (the first visible fog); kSkyMinDepth 0.99903 -> 0.95; 3D noise -> 2D atlas; linear fog pushed out of range.
+2026-10-20  B7   Temporal filter, history depth, step jitter.
+2026-10-20  B6b  Corrections from the review of B4-B6 (direction to the light source, fog values read before the client's own fog).
+2026-10-20  B8   Local lights scattered in the fog (VolFogLights).
+2026-10-20  B9   Light shafts of the sun or the moon (VolFogRays); NaN guards in vf_temporal.hlsl and vf_composite.hlsli.
+2026-10-20  B10  Interiors, water, glow, light cut-off 1/32, sun-moon fade.
+2026-10-20  B11  No code change (backend parity review and tests).
+2026-10-20  B12  Packaging: this repository (patches in order, consolidated diff, aplicar.ps1, README, NOTICE).

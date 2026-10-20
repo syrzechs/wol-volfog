@@ -1,0 +1,347 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 09ec2ef..d0866ac 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -84,6 +84,8 @@ add_subdirectory(Engine/Source/SoundEngine)
+ add_subdirectory(Engine/Source/SteelseriesMouse)
+ add_subdirectory(Engine/Source/Storm)
+ add_subdirectory(Engine/Source/Tempest)
++# Not in the original client (World of Legends): native volumetric fog (wolVolFog).
++add_subdirectory(Engine/Source/VolFog)
+ add_subdirectory(WoW/Common)
+ add_subdirectory(WoW/Source/Battlenet)
+ add_subdirectory(WoW/Source/Console)
+diff --git a/Engine/Source/Gx/CGxDevice/CGxDevice.cpp b/Engine/Source/Gx/CGxDevice/CGxDevice.cpp
+index 706c146..aef6e6c 100644
+--- a/Engine/Source/Gx/CGxDevice/CGxDevice.cpp
++++ b/Engine/Source/Gx/CGxDevice/CGxDevice.cpp
+@@ -17,13 +17,13 @@
+ #include "Engine/Source/Os/TimeManager.h"
+ 
+ // STATIC: 0x00A2DAF8
+-const uint32_t CGxDevice::s_texFormatBitDepth[GxTexFormats_Last] = { 0, 32, 32, 16, 16, 16, 4, 8, 8, 16, 32, 32, 32 };
++const uint32_t CGxDevice::s_texFormatBitDepth[GxTexFormats_Last] = { 0, 32, 32, 16, 16, 16, 4, 8, 8, 16, 32, 32, 32, 32, 64, 128 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2DB2C
+-const uint32_t CGxDevice::s_texFormatBlockSize[GxTexFormats_Last] = { 1, 1, 1, 1, 1, 1, 4, 4, 4, 1, 1, 1, 1 };
++const uint32_t CGxDevice::s_texFormatBlockSize[GxTexFormats_Last] = { 1, 1, 1, 1, 1, 1, 4, 4, 4, 1, 1, 1, 1, 1, 1, 1 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2DB60
+-const uint32_t CGxDevice::s_texFormatBytesPerBlock[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 8, 16, 16, 2, 4, 4, 4 };
++const uint32_t CGxDevice::s_texFormatBytesPerBlock[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 8, 16, 16, 2, 4, 4, 4, 4, 8, 16 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00AD8B4C
+ static uint32_t s_primVertsPerPrim[GxPrims_Last] = { 1, 2, 1, 3, 1, 1 };
+diff --git a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+index 68d6e4a..4f0d13d 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+@@ -11,6 +11,7 @@
+ #include "Engine/Source/Os/Error.h"
+ #include "Engine/Source/Os/TimeManager.h"
+ #include "Engine/Source/Storm/H/storm.h"
++#include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
+ #include "ThirdParty/nvapi/nvapi.h"
+ 
+ typedef IDirect3D9* (WINAPI* Direct3DCreate9Proc)(UINT sdkVersion);
+@@ -25,13 +26,13 @@ const uint32_t CGxDeviceD3d::s_gxAttribToD3dAttribSize[7] = { 4, 4, 4, 8, 12, 4,
+ static const D3DQUERYTYPE s_d3dQueryTypes[1] = { D3DQUERYTYPE_OCCLUSION };
+ 
+ // STATIC: 0x00A2F7E8
+-const EGxTexFormat CGxDeviceD3d::s_tolerableTexFmtMapping[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8 };
++const EGxTexFormat CGxDeviceD3d::s_tolerableTexFmtMapping[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Argb4444, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8, GxTex_IntZ, GxTex_Abgr16F, GxTex_Abgr32F }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2F850
+ const D3DCUBEMAP_FACES CGxDeviceD3d::s_faceTypes[6] = { D3DCUBEMAP_FACE_POSITIVE_X, D3DCUBEMAP_FACE_NEGATIVE_X, D3DCUBEMAP_FACE_POSITIVE_Y, D3DCUBEMAP_FACE_NEGATIVE_Y, D3DCUBEMAP_FACE_POSITIVE_Z, D3DCUBEMAP_FACE_NEGATIVE_Z };
+ 
+ // STATIC: 0x00A2F81C
+-const D3DFORMAT CGxDeviceD3d::s_GxTexFmtToD3dFmt[GxTexFormats_Last] = { D3DFMT_UNKNOWN, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A4R4G4B4, D3DFMT_A1R5G5B5, D3DFMT_R5G6B5, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_V8U8, D3DFMT_G16R16F, D3DFMT_R32F, D3DFMT_D24X8 };
++const D3DFORMAT CGxDeviceD3d::s_GxTexFmtToD3dFmt[GxTexFormats_Last] = { D3DFMT_UNKNOWN, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A4R4G4B4, D3DFMT_A1R5G5B5, D3DFMT_R5G6B5, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_V8U8, D3DFMT_G16R16F, D3DFMT_R32F, D3DFMT_D24X8, static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z')), D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2F8D4
+ const D3DPRIMITIVETYPE CGxDeviceD3d::s_primitiveConversion[GxPrims_Last] = { D3DPT_POINTLIST, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DPT_TRIANGLEFAN };
+@@ -64,7 +65,7 @@ const D3DCMPFUNC CGxDeviceD3d::s_cmpFunc[4] = { D3DCMP_LESSEQUAL, D3DCMP_EQUAL,
+ const D3DCULL CGxDeviceD3d::s_cullMode[3] = { D3DCULL_NONE, D3DCULL_CW, D3DCULL_CCW };
+ 
+ // STATIC: 0x00AD8EF0
+-EGxTexFormat CGxDeviceD3d::s_GxTexFormatToUse[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Abgr8888, GxTex_Argb8888, GxTex_Argb4444, GxTex_Argb1555, GxTex_Rgb565, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8 };
++EGxTexFormat CGxDeviceD3d::s_GxTexFormatToUse[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Abgr8888, GxTex_Argb8888, GxTex_Argb4444, GxTex_Argb1555, GxTex_Rgb565, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8, GxTex_IntZ, GxTex_Abgr16F, GxTex_Abgr32F }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00AD8F24
+ D3DDECLTYPE CGxDeviceD3d::s_gxAttribToD3dAttribType[7] = { D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_UBYTE4, D3DDECLTYPE_UBYTE4N, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_SHORT2, D3DDECLTYPE_FLOAT1 };
+@@ -2461,7 +2462,7 @@ void CGxDeviceD3d::ISetCaps(const CGxFormat& format) {
+         this->m_caps.m_shaderConstants[GxSh_Vertex] = 192;
+     }
+ 
+-    for (uint32_t i = 0; i < GxTexFormats_Last; i++) {
++    for (uint32_t i = 0; i < GxTexFormats_CapsLast; i++) { // Not in the original client (World of Legends): was GxTexFormats_Last (m_texFmt keeps 13 entries)
+         if (i) {
+             this->m_caps.m_texFmt[i] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[i]) == D3D_OK;
+         } else {
+@@ -2482,6 +2483,14 @@ void CGxDeviceD3d::ISetCaps(const CGxFormat& format) {
+     this->m_caps.m_rttFormat[GxTex_R32F] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, D3DFMT_R32F) == D3D_OK;
+     this->m_caps.m_rttFormat[GxTex_D24X8] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, D3DFMT_D24X8) == D3D_OK;
+ 
++    // Not in the original client (World of Legends): texture formats for the native volumetric fog (wolVolFog). The results go to
++    // VolFog::s_caps and not to m_caps: CGxCaps::m_texFmt / m_rttFormat keep their 13 entries (layout checked against the original).
++    VolFog::s_caps.intz = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_IntZ]) == D3D_OK;
++    VolFog::s_caps.abgr16f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr16F]) == D3D_OK;
++    VolFog::s_caps.abgr32f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr32F]) == D3D_OK;
++    VolFog::s_caps.ps30Slots = this->m_d3dCaps.MaxPixelShader30InstructionSlots;
++    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots);
++
+     this->m_caps.m_colorWrite = (this->m_d3dCaps.PrimitiveMiscCaps & D3DPMISCCAPS_COLORWRITEENABLE) != 0;
+     this->m_caps.m_hwCursor = this->m_d3dCaps.CursorCaps & D3DCURSORCAPS_COLOR;
+     this->m_caps.m_maxClipPlanes = this->m_d3dCaps.MaxUserClipPlanes;
+diff --git a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+index e7bffd3..2bc966e 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+@@ -12,6 +12,7 @@
+ #include "Engine/Source/Os/Error.h"
+ #include "Engine/Source/Os/TimeManager.h"
+ #include "Engine/Source/Storm/H/storm.h"
++#include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
+ #include "ThirdParty/nvapi/nvapi.h"
+ 
+ typedef IDirect3D9* (WINAPI* Direct3DCreate9Proc)(UINT sdkVersion);
+@@ -29,7 +30,7 @@ static const D3DQUERYTYPE s_d3dQueryTypes[1] = { D3DQUERYTYPE_OCCLUSION };
+ const D3DCUBEMAP_FACES CGxDeviceD3d9Ex::s_faceTypes[6] = { D3DCUBEMAP_FACE_POSITIVE_X, D3DCUBEMAP_FACE_NEGATIVE_X, D3DCUBEMAP_FACE_POSITIVE_Y, D3DCUBEMAP_FACE_NEGATIVE_Y, D3DCUBEMAP_FACE_POSITIVE_Z, D3DCUBEMAP_FACE_NEGATIVE_Z };
+ 
+ // STATIC: 0x00A2FA64
+-const D3DFORMAT CGxDeviceD3d9Ex::s_GxTexFmtToD3dFmt[GxTexFormats_Last] = { D3DFMT_UNKNOWN, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A4R4G4B4, D3DFMT_A1R5G5B5, D3DFMT_R5G6B5, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_V8U8, D3DFMT_G16R16F, D3DFMT_R32F, D3DFMT_D24X8 };
++const D3DFORMAT CGxDeviceD3d9Ex::s_GxTexFmtToD3dFmt[GxTexFormats_Last] = { D3DFMT_UNKNOWN, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A4R4G4B4, D3DFMT_A1R5G5B5, D3DFMT_R5G6B5, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_V8U8, D3DFMT_G16R16F, D3DFMT_R32F, D3DFMT_D24X8, static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z')), D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2FAD8
+ const D3DPRIMITIVETYPE CGxDeviceD3d9Ex::s_primitiveConversion[GxPrims_Last] = { D3DPT_POINTLIST, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DPT_TRIANGLEFAN };
+@@ -62,7 +63,7 @@ const D3DCMPFUNC CGxDeviceD3d9Ex::s_cmpFunc[4] = { D3DCMP_LESSEQUAL, D3DCMP_EQUA
+ const D3DCULL CGxDeviceD3d9Ex::s_cullMode[3] = { D3DCULL_NONE, D3DCULL_CW, D3DCULL_CCW };
+ 
+ // STATIC: 0x00AD8F8C
+-EGxTexFormat CGxDeviceD3d9Ex::s_GxTexFormatToUse[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Abgr8888, GxTex_Argb8888, GxTex_Argb4444, GxTex_Argb1555, GxTex_Rgb565, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8 };
++EGxTexFormat CGxDeviceD3d9Ex::s_GxTexFormatToUse[GxTexFormats_Last] = { GxTex_Unknown, GxTex_Abgr8888, GxTex_Argb8888, GxTex_Argb4444, GxTex_Argb1555, GxTex_Rgb565, GxTex_Dxt1, GxTex_Dxt3, GxTex_Dxt5, GxTex_Uv88, GxTex_Gr1616F, GxTex_R32F, GxTex_D24X8, GxTex_IntZ, GxTex_Abgr16F, GxTex_Abgr32F }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00AD8FC0
+ D3DDECLTYPE CGxDeviceD3d9Ex::s_gxAttribToD3dAttribType[7] = { D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_UBYTE4, D3DDECLTYPE_UBYTE4N, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_SHORT2, D3DDECLTYPE_FLOAT1 };
+@@ -2467,7 +2468,7 @@ void CGxDeviceD3d9Ex::ISetCaps(const CGxFormat& format) {
+         this->m_caps.m_shaderConstants[GxSh_Vertex] = 192;
+     }
+ 
+-    for (uint32_t i = 0; i < GxTexFormats_Last; i++) {
++    for (uint32_t i = 0; i < GxTexFormats_CapsLast; i++) { // Not in the original client (World of Legends): was GxTexFormats_Last (m_texFmt keeps 13 entries)
+         if (i) {
+             this->m_caps.m_texFmt[i] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[i]) == D3D_OK;
+         } else {
+@@ -2488,6 +2489,14 @@ void CGxDeviceD3d9Ex::ISetCaps(const CGxFormat& format) {
+     this->m_caps.m_rttFormat[GxTex_R32F] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, D3DFMT_R32F) == D3D_OK;
+     this->m_caps.m_rttFormat[GxTex_D24X8] = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, D3DFMT_D24X8) == D3D_OK;
+ 
++    // Not in the original client (World of Legends): texture formats for the native volumetric fog (wolVolFog). The results go to
++    // VolFog::s_caps and not to m_caps: CGxCaps::m_texFmt / m_rttFormat keep their 13 entries (layout checked against the original).
++    VolFog::s_caps.intz = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_IntZ]) == D3D_OK;
++    VolFog::s_caps.abgr16f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr16F]) == D3D_OK;
++    VolFog::s_caps.abgr32f = this->m_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, this->m_devAdapterFormat, 0, D3DRTYPE_TEXTURE, s_GxTexFmtToD3dFmt[GxTex_Abgr32F]) == D3D_OK;
++    VolFog::s_caps.ps30Slots = this->m_d3dCaps.MaxPixelShader30InstructionSlots;
++    CGxDevice::Log("wolVolFog caps: INTZ=%d ABGR16F=%d ABGR32F=%d ps30slots=%u", VolFog::s_caps.intz ? 1 : 0, VolFog::s_caps.abgr16f ? 1 : 0, VolFog::s_caps.abgr32f ? 1 : 0, VolFog::s_caps.ps30Slots);
++
+     this->m_caps.m_colorWrite = (this->m_d3dCaps.PrimitiveMiscCaps & D3DPMISCCAPS_COLORWRITEENABLE) != 0;
+     this->m_caps.m_hwCursor = this->m_d3dCaps.CursorCaps & D3DCURSORCAPS_COLOR;
+     this->m_caps.m_maxClipPlanes = this->m_d3dCaps.MaxUserClipPlanes;
+@@ -3939,7 +3948,7 @@ CGxDeviceD3d9Ex::CGxDeviceD3d9Ex() : m_desktopDisplayMode() {
+     this->m_hwCursorTexture = nullptr;
+     this->m_hwCursorBitmap = nullptr;
+ 
+-    for (uint32_t i = 0; i < GxTexFormats_Last; i++) {
++    for (uint32_t i = 0; i < GxTexFormats_CapsLast; i++) { // Not in the original client (World of Legends): was GxTexFormats_Last (m_scratchTextures keeps 13 entries)
+         this->m_scratchTextures[i].m_textures[0] = nullptr;
+         this->m_scratchTextures[i].m_index = 0;
+     }
+@@ -4266,7 +4275,7 @@ void CGxDeviceD3d9Ex::ITexReleaseD3dTexture(CGxTex* texId) {
+ // VERIFY: b9a5e5a7 manual
+ // OFFSET: 0x006A68F0
+ void CGxDeviceD3d9Ex::ITexForceRecreation(int32_t all) {
+-    for (uint32_t i = 0; i < GxTexFormats_Last; i++) {
++    for (uint32_t i = 0; i < GxTexFormats_CapsLast; i++) { // Not in the original client (World of Legends): was GxTexFormats_Last (m_scratchTextures keeps 13 entries)
+         if (this->m_scratchTextures[i].m_textures[0]) {
+             this->m_scratchTextures[i].m_textures[0]->Release();
+             this->m_scratchTextures[i].m_textures[0] = nullptr;
+diff --git a/Engine/Source/Gx/CGxDeviceOpenGL/CGxDeviceOpenGl.cpp b/Engine/Source/Gx/CGxDeviceOpenGL/CGxDeviceOpenGl.cpp
+index 862325c..5af2ed6 100644
+--- a/Engine/Source/Gx/CGxDeviceOpenGL/CGxDeviceOpenGl.cpp
++++ b/Engine/Source/Gx/CGxDeviceOpenGL/CGxDeviceOpenGl.cpp
+@@ -30,7 +30,7 @@ static const GLenum s_glTexTarget[4] = { GL_TEXTURE_2D, GL_TEXTURE_CUBE_MAP_ARB,
+ static const GLenum s_glQueryTarget[1] = { GL_SAMPLES_PASSED_ARB };
+ 
+ // STATIC: 0x00A2F210
+-static const GLint s_glInternalFormat[GxTexFormats_Last] = { 0, GL_RGBA8, GL_RGBA8, GL_RGBA4, GL_RGB5_A1, GL_RGB5, 0x83F1, 0x83F2, 0x83F3, 0x8709, 0x881B, 0, GL_DEPTH_COMPONENT24_ARB };
++static const GLint s_glInternalFormat[GxTexFormats_Last] = { 0, GL_RGBA8, GL_RGBA8, GL_RGBA4, GL_RGB5_A1, GL_RGB5, 0x83F1, 0x83F2, 0x83F3, 0x8709, 0x881B, 0, GL_DEPTH_COMPONENT24_ARB, 0, 0, 0 }; // Not in the original client (World of Legends): IntZ, Abgr16F, Abgr32F not supported
+ 
+ // STATIC: 0x00A2F1E0
+ static const GLint s_glMinFilter[GxTexFilters_Last] = { GL_NEAREST, GL_LINEAR, GL_NEAREST_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR_MIPMAP_LINEAR };
+@@ -39,16 +39,16 @@ static const GLint s_glMinFilter[GxTexFilters_Last] = { GL_NEAREST, GL_LINEAR, G
+ static const GLint s_glMagFilter[GxTexFilters_Last] = { GL_NEAREST, GL_LINEAR, GL_LINEAR, GL_LINEAR, GL_LINEAR, GL_LINEAR };
+ 
+ // STATIC: 0x00A2F244
+-static const uint32_t s_glBytesPerPixel[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0 };
++static const uint32_t s_glBytesPerPixel[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // Not in the original client (World of Legends): IntZ, Abgr16F, Abgr32F not supported
+ 
+ // STATIC: 0x00A2F2E0
+ static const GLenum s_glCubeFaces[6] = { 0x8515, 0x8516, 0x8517, 0x8518, 0x8519, 0x851A };
+ 
+ // STATIC: 0x00A2F278
+-static const GLenum s_glFormat[GxTexFormats_Last] = { 0, GL_RGBA, 0x80E1, 0x80E1, 0x80E1, GL_RGB, 0, 0, 0, 0x86F5, GL_RGB, GL_RGB, GL_DEPTH_COMPONENT };
++static const GLenum s_glFormat[GxTexFormats_Last] = { 0, GL_RGBA, 0x80E1, 0x80E1, 0x80E1, GL_RGB, 0, 0, 0, 0x86F5, GL_RGB, GL_RGB, GL_DEPTH_COMPONENT, 0, 0, 0 }; // Not in the original client (World of Legends): IntZ, Abgr16F, Abgr32F not supported
+ 
+ // STATIC: 0x00A2F2AC
+-static const GLenum s_glType[GxTexFormats_Last] = { 0, 0x8367, 0x8367, 0x8365, 0x8366, 0x8363, 0, 0, 0, GL_BYTE, 0x140B, 0, GL_FLOAT };
++static const GLenum s_glType[GxTexFormats_Last] = { 0, 0x8367, 0x8367, 0x8365, 0x8366, 0x8363, 0, 0, 0, GL_BYTE, 0x140B, 0, GL_FLOAT, 0, 0, 0 }; // Not in the original client (World of Legends): IntZ, Abgr16F, Abgr32F not supported
+ 
+ struct GlTexEnvOp {
+     GLenum m_mode;
+diff --git a/Engine/Source/Gx/CMakeLists.txt b/Engine/Source/Gx/CMakeLists.txt
+index 4cd6f94..c359030 100644
+--- a/Engine/Source/Gx/CMakeLists.txt
++++ b/Engine/Source/Gx/CMakeLists.txt
+@@ -13,6 +13,12 @@ target_include_directories(Gx
+         ${CMAKE_SOURCE_DIR}
+ )
+ 
++# Not in the original client (World of Legends): the D3D9 backends record the wolVolFog format caps in VolFog::s_caps.
++target_link_libraries(Gx
++    PUBLIC
++        VolFog
++)
++
+ target_link_libraries(Gx
+     PRIVATE
+         d3d9.lib
+diff --git a/Engine/Source/Gx/Gx.cpp b/Engine/Source/Gx/Gx.cpp
+index 030d795..8fa2512 100644
+--- a/Engine/Source/Gx/Gx.cpp
++++ b/Engine/Source/Gx/Gx.cpp
+@@ -11,7 +11,7 @@
+ #include "Engine/Source/Storm/H/storm.h"
+ 
+ // STATIC: 0x00A2D57C
+-static const uint32_t s_texelSize[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 2, 4, 4, 2, 4, 4, 4 };
++static const uint32_t s_texelSize[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 2, 4, 4, 2, 4, 4, 4, 4, 8, 16 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00A2D5B0
+ static const int32_t s_vertexAttribOffset[GxVertexBufferFormats_Last][GxVAs_Last] = {
+@@ -35,7 +35,8 @@ static const int32_t s_vertexAttribOffset[GxVertexBufferFormats_Last][GxVAs_Last
+ static BlitFormat s_blitFormats[GxTexFormats_Last] = {
+     BlitFormat_Unknown, BlitFormat_Abgr8888, BlitFormat_Argb8888, BlitFormat_Argb4444, BlitFormat_Argb1555,
+     BlitFormat_Rgb565, BlitFormat_Dxt1, BlitFormat_Dxt3, BlitFormat_Dxt5, BlitFormat_Uv88, BlitFormat_Gr1616F,
+-    BlitFormat_R32F, BlitFormat_D24X8
++    BlitFormat_R32F, BlitFormat_D24X8,
++    BlitFormat_Unknown, BlitFormat_Unknown, BlitFormat_Unknown // Not in the original client (World of Legends): IntZ, Abgr16F, Abgr32F are not blittable
+ };
+ 
+ // STATIC: 0x00AD87E4
+diff --git a/Engine/Source/Gx/Types.h b/Engine/Source/Gx/Types.h
+index d8ca32b..f52b459 100644
+--- a/Engine/Source/Gx/Types.h
++++ b/Engine/Source/Gx/Types.h
+@@ -50,9 +50,18 @@ enum EGxTexFormat {
+     GxTex_Gr1616F = 10,
+     GxTex_R32F = 11,
+     GxTex_D24X8 = 12,
+-    GxTexFormats_Last = 13,
++    // Not in the original client (World of Legends): formats for the native volumetric fog (wolVolFog).
++    GxTex_IntZ = 13,
++    GxTex_Abgr16F = 14,
++    GxTex_Abgr32F = 15,
++    GxTexFormats_Last = 16,
+ };
+ 
++// Not in the original client (World of Legends): number of texture formats of the original client. CGxCaps::m_texFmt / m_rttFormat and
++// CGxDeviceD3d9Ex::m_scratchTextures (layouts checked against the original client) keep this size, so the three formats
++// added after GxTex_D24X8 are not stored in them; the wolVolFog support for those lives in VolFog::s_caps.
++constexpr uint32_t GxTexFormats_CapsLast = 13;
++
+ enum EGxVertexBufferFormat {
+     GxVBF_P = 0,
+     GxVBF_PN = 1,
+diff --git a/Engine/Source/Services/Texture.cpp b/Engine/Source/Services/Texture.cpp
+index 92aac81..b6b8930 100644
+--- a/Engine/Source/Services/Texture.cpp
++++ b/Engine/Source/Services/Texture.cpp
+@@ -23,19 +23,19 @@
+ static const uint16_t s_pixelFormatBytesPerBlock[NUM_PIXEL_FORMATS] = { 8, 16, 0, 0, 0, 0, 0, 16, 0, 0 };
+ 
+ // STATIC: 0x009F103C
+-static const uint16_t s_texFormatBitDepth[GxTexFormats_Last] = { 0, 32, 32, 16, 16, 16, 4, 8, 8, 16, 32, 32, 32 };
++static const uint16_t s_texFormatBitDepth[GxTexFormats_Last] = { 0, 32, 32, 16, 16, 16, 4, 8, 8, 16, 32, 32, 32, 32, 64, 128 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x009F1058
+-static const uint16_t s_texFormatBytesPerBlock[GxTexFormats_Last] = { 0, 0, 0, 0, 0, 0, 8, 16, 16, 0, 0, 0, 0 };
++static const uint16_t s_texFormatBytesPerBlock[GxTexFormats_Last] = { 0, 0, 0, 0, 0, 0, 8, 16, 16, 0, 0, 0, 0, 0, 0, 0 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x009F1074
+ static const int32_t s_pixelFormatToMipBitsCache[NUM_PIXEL_FORMATS] = { -1, -1, -1, 0, 0, 0, -1, -1, -1, 1 };
+ 
+ // STATIC: 0x009F1120
+-static const uint32_t s_texFormatBytesPerTexel[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 8, 16, 16, 2, 4, 4, 4 };
++static const uint32_t s_texFormatBytesPerTexel[GxTexFormats_Last] = { 0, 4, 4, 2, 2, 2, 8, 16, 16, 2, 4, 4, 4, 4, 8, 16 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x009F1154
+-static const uint32_t s_texFormatTexelsPerBlock[GxTexFormats_Last] = { 1, 1, 1, 1, 1, 1, 4, 4, 4, 1, 1, 1, 1 };
++static const uint32_t s_texFormatTexelsPerBlock[GxTexFormats_Last] = { 1, 1, 1, 1, 1, 1, 4, 4, 4, 1, 1, 1, 1, 1, 1, 1 }; // Not in the original client (World of Legends): + IntZ, Abgr16F, Abgr32F
+ 
+ // STATIC: 0x00AC3234
+ static EGxTexFormat s_pixelFormatToGxTexFormat[NUM_PIXEL_FORMATS] = { GxTex_Dxt1, GxTex_Dxt3, GxTex_Argb8888, GxTex_Argb1555, GxTex_Argb4444, GxTex_Rgb565, GxTex_Unknown, GxTex_Dxt5, GxTex_Unknown, GxTex_Unknown };
+diff --git b/Engine/Source/VolFog/CMakeLists.txt b/Engine/Source/VolFog/CMakeLists.txt
+new file mode 100644
+index 0000000..da43888
+--- /dev/null
++++ b/Engine/Source/VolFog/CMakeLists.txt
+@@ -0,0 +1,10 @@
++file(GLOB_RECURSE PRIVATE_SOURCES CONFIGURE_DEPENDS "*.cpp")
++
++add_library(VolFog STATIC
++    ${PRIVATE_SOURCES}
++)
++
++target_include_directories(VolFog
++    PUBLIC
++        ${CMAKE_SOURCE_DIR}
++)
+diff --git b/Engine/Source/VolFog/VolFog.cpp b/Engine/Source/VolFog/VolFog.cpp
+new file mode 100644
+index 0000000..7cdcf5c
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFog.cpp
+@@ -0,0 +1,5 @@
++#include "Engine/Source/VolFog/VolFog.h"
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B1.
++
++VolFog::Caps VolFog::s_caps;
+diff --git b/Engine/Source/VolFog/VolFog.h b/Engine/Source/VolFog/VolFog.h
+new file mode 100644
+index 0000000..534ee29
+--- /dev/null
++++ b/Engine/Source/VolFog/VolFog.h
+@@ -0,0 +1,22 @@
++#ifndef ENGINE_SOURCE_VOLFOG_VOLFOG_H
++#define ENGINE_SOURCE_VOLFOG_VOLFOG_H
++
++#include <cstdint>
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B1.
++
++namespace VolFog {
++    // Support for the texture formats the fog needs, filled in by the Gx backends when the device caps are read
++    // (CGxDeviceD3d::ISetCaps / CGxDeviceD3d9Ex::ISetCaps). They are not part of CGxCaps: its layout is checked
++    // against the original client. The OpenGL backend never sets them, so on OpenGL everything stays false.
++    struct Caps {
++        bool intz = false;          // INTZ readable depth texture (D3DUSAGE_DEPTHSTENCIL + D3DRTYPE_TEXTURE)
++        bool abgr16f = false;       // A16B16G16R16F render target texture
++        bool abgr32f = false;       // A32B32G32R32F plain texture
++        uint32_t ps30Slots = 0;     // D3DCAPS9::MaxPixelShader30InstructionSlots
++    };
++
++    extern Caps s_caps;
++}
++
++#endif

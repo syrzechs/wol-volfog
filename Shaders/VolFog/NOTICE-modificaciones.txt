@@ -1,0 +1,130 @@
+Shaders/VolFog: notice of origin and modifications
+===================================================
+
+Origin
+------
+The vf_*.hlsl / vf_*.hlsli files in this directory are copies of the shaders of CoAVolFog (coa-vfog):
+
+  fork   https://github.com/Raz0r1337/coa-vfog   (branch st0ny-main; based on https://github.com/jealous-sound/coa-vfog)
+  commit 205ade5abe54524ccd2f449fb628903bc0b66be0  (2026-10-19 13:38 UTC)
+  copy   ThirdParty/coa-vfog-205ade5/ (shaders/, src/, LICENSE, README.md; frozen, nothing in it is built or executed)
+
+Copyright belongs to the authors of CoAVolFog (jealous-sound and the contributors of the Raz0r1337 fork). CoAVolFog is
+licensed under the GNU General Public License version 3 only (GPL-3.0-only); the text is in the LICENSE file next to this
+notice. Its README adds a permission under GPLv3 section 7: CoAVolFog, including modified versions, may be linked or
+combined with the World of Warcraft client and the combination distributed without the client source code; GPLv3 keeps
+applying to CoAVolFog. Everything in this directory, and the code under Engine/Source/VolFog and Tools/VolFog derived from
+it, is distributed under the same terms.
+
+Modifications (GPLv3 section 5a), dated
+----------------------------------------
+2026-10-19  Brief B2 (World of Legends, native volumetric fog, phase 3).
+  - vf_common.hlsli, vf_integrate.hlsli, vf_local_lights.hlsli, vf_composite.hlsli, vf_sample_split.hlsli,
+    vf_march.hlsl, vf_temporal.hlsl, vf_history_depth.hlsl, vf_composite.hlsl, vf_silhouette_mask.hlsl,
+    vf_ray_mask.hlsl, vf_ray_blur.hlsl, vf_ray_composite.hlsl, vf_density_variation.hlsli:
+    copied byte for byte, unchanged. They are not compiled yet (briefs B6 and later). Planned changes, not applied
+    here: kSkyMinDepth 0.99903 -> 0.95 in vf_common.hlsli and tex3D -> 2D atlas in vf_density_variation.hlsli.
+  - vf_fullscreen_vs.hlsl: copied byte for byte and compiled as it is (vs_3_0, WolVolFogQuad.bls). It returns its POSITION
+    input untouched, so the adaptation to the client is on the CPU side: VolFog::Render draws the FFX quad
+    (FFX::SetupVB_PCT, vertex format position + colour + texcoord) with its positions already in clip space (-1..1).
+    The colour and texcoord attributes are present in the vertex buffer and ignored by the shader.
+  - WolVolFogDebug.hlsl: new file written for this project (not derived from CoAVolFog code), same licence.
+  - Build: the shaders are compiled with fxc (Windows SDK) from CMake, packed in the GXSH ".bls" container by
+    Tools/VolFog/mkbls.py and stored in bin/Win/Data/patch-Z.MPQ by Tools/VolFog/mkmpq.py.
+
+2026-10-20  Brief B5 (World of Legends, native volumetric fog, phase 3).
+  - Engine/Source/VolFog/VolFogModel.{h,cpp}: derived from src/fog_model.{h,cpp}. Kept: FogLayer, FogParams (without the noise
+    and authored members), DerivedLayers, DistanceLayer, ApplyInteriorFog, the phase constants, Mul4x4, Invert4x4 and
+    TransformDirection. Removed: AuthoredLayers, AuthoredLayerNoise, ClassicFogThinness, HaloHue, ClientToClassicDirectLight,
+    AuthoredNoiseScroll, WithMeanNoise, MeanNoise*, NoiseDensityCurve, AnyLayerNoise, EnergyNormalisedPhaseScale, LocalLightUpload.
+    Config is replaced by ModelTuning (the values of the Config defaults of 205ade5; only the density follows a CVar,
+    wolVolFogDensity, through VolFog::Settings()). FogParams gains `active` (false while the camera is in liquid). Code moved into
+    the namespace VolFog and reformatted to the client's style; the formulas are unchanged.
+  - Engine/Source/VolFog/VolFogInputs.{h,cpp}: FrameInputs derived from src/engine.h. D3DVIEWPORT9 -> VolFog::Viewport; lightParams
+    and the point light table removed (brief B8 adds the lights); added toRaySource, sunElevation, viewerLiquidDepth,
+    liquidTypeId, fullyInterior and glowEffectActive. The values are read from the client by WoW/Source/WorldClient/VolFogWorld.cpp
+    (written for this project; coa-vfog reads the same values from fixed addresses of the 3.3.5 binary).
+  - Engine/Source/VolFog/VolFogDump.cpp, VolFog::Settings(): new, not derived from CoAVolFog code, same licence.
+
+2026-10-20  Brief B6 (World of Legends, native volumetric fog, phase 3: march and composite).
+  - vf_common.hlsli: kSkyMinDepth 0.99903 -> 0.95 (the only change; the client draws the world in the viewport depth range 0..0.94 and the sky
+    in 0.999..1.0 without writing depth, so depth >= 0.95 is always sky). This was one of the two planned changes of B2.
+  - vf_density_variation.hlsli: tex3D -> 2D atlas (the other planned change). The Gx layer has no volume textures, so the 32^3 density noise is a
+    2D atlas of 32 slices of 32x32 texels stacked along v (32 x 1024, A8R8G8B8 grey, LINEAR, WRAP in u); sampler3D sDensityNoise (s9) becomes
+    sampler2D, each tex3Dlod becomes SampleNoiseVolume(): two tex2Dlod of the slices that bracket z plus a lerp. v stays inside its slice, so
+    the y wrap of the volume is a hard step instead of a blend, once every 32 texels. DensityVariation() keeps its signature and its constants.
+  - vf_authored_noise.hlsli: copied byte for byte from 205ade5 (vf_integrate.hlsli includes it). It is compiled with SAMPLES_AUTHORED_NOISE = 0
+    (its default), so none of its code or registers (c36.., s10) reaches the pixel shaders; the authored noise of the Classic layers is not used.
+  - vf_march.hlsl and vf_composite.hlsl are compiled (CMakeLists.txt, six permutations each: STEPS 16 / 24 / 32 x LOCAL_LIGHTS 0 / 1, the macros of
+    vf_integrate.hlsli); the sources are unchanged.
+  - Engine/Source/VolFog/VolFogNoise.cpp: new, DensityNoiseValue derived from CreateDensityNoise of src/noise_volume.cpp (same hash; the volume is
+    uploaded as the atlas above through GxTexCreate).
+  - Engine/Source/VolFog/VolFogRender.cpp: the packing of the constants (c0-c13 common block, layers at c12, c53, c78, c96-c98) and the order of the
+    passes follow Renderer::Draw of src/renderer.cpp, rewritten over Gx (render targets, texture units, shader constants). Left out for now: the
+    temporal filter (B7), the local lights (B8) and the light shafts (B9).
+
+2026-10-20  Brief B7 (World of Legends, native volumetric fog, phase 3: temporal filter).
+  - vf_temporal.hlsl and vf_history_depth.hlsl are compiled as they are (CMakeLists.txt, one permutation each); no shader file was changed in this brief.
+    vf_history_depth.hlsl writes RGB = (high byte, low byte, depth class) of the linear depth, so its target is ARGB8 and not R32F.
+  - Engine/Source/VolFog/VolFogRender.cpp: the history ping-pong, the previous-frame matrix (viewToWorld * previousWorldToView * previousProjection),
+    the validity test (same projection, viewport, scale, quality, density and map; less than 0.25 s; less than 30 yards and 45 degrees in one frame;
+    the constants kHistoryMaxSeconds, kHistoryMaxMove and kHistoryMinForwardDot of src/renderer.cpp), the history weight 0.85, cMarch.x = 1 (step jitter,
+    frame index in cPixelGrid.y modulo 1024) and the order of the two sub-passes follow Renderer::FilterWithHistory and Renderer::Draw of
+    src/renderer.cpp, rewritten over Gx. Added here: wolVolFogDebug 3 (filtered history), 4 (image without the temporal filter), 5 (the B2 grid, moved from 3).
+
+2026-10-20  Brief B6b (World of Legends, native volumetric fog, phase 3: corrections of the B4-B6 review).
+  - WoW/Source/WorldClient/VolFogWorld.cpp: toLight = toRaySource, the direction to the visible sun or moon, as src/engine.cpp:417-425 of coa-vfog does
+    (it was the client's lighting direction). The fog values are read from a copy of DNInfo::m_fogInterior taken by DayNight::UpdateFog before it
+    pushes both fog groups out of range (coa-vfog reads them before its hooks, src/hooks.cpp:266-276). No shader changed.
+
+2026-10-20  Brief B8 (World of Legends, native volumetric fog, phase 3: local lights).
+  - Engine/Source/VolFog/VolFogLights.h and VolFogLights.cpp: derived from src/engine_lights.h/.cpp (PointLightCutoff with the 1/256 threshold and the
+    200 yard cap, UploadedPointLightColor, LocalLightPriority, the ranking and the view test PointLightMeetsView) and src/local_light_stabiliser.h/.cpp
+    (8 slots, pool of 24, 1.5x swap margin held for 3 captures, 1 second fades) of 205ade5; the layout of the 32 x 1 A32B32G32R32F texture (three
+    texels per light: view position + cutoff, uploaded colour, attenuation) and the constants c53 = {lights, reach limit, phase 0.3} follow
+    Renderer::Draw of src/renderer.cpp. Changes: the lights are read from CM2Scene::m_lightGrid of the world scene (no client signature check, no
+    guarded memory reads, no interior capture), the activity log line is gone, and the texture is made with the pure D3D9 device (MANAGED, or
+    DEFAULT + DYNAMIC if the device refuses it) like the INTZ depth of B3.
+  - vf_march.hlsl, vf_composite.hlsl/.hlsli, vf_integrate.hlsli and vf_local_lights.hlsli are unchanged: the LOCAL_LIGHTS = 1 permutations were already
+    compiled in B6 and are chosen here when at least one light is uploaded.
+  - Engine/Source/VolFog/VolFogRender.cpp: lit permutation (index (quality - 1) * 2 + 1), c53, s8 for the march and the composite.
+
+2026-10-20  Brief B9 (World of Legends, native volumetric fog, phase 3: light shafts and NaN guard).
+  - vf_ray_mask.hlsl, vf_ray_blur.hlsl and vf_ray_composite.hlsl are compiled as they are (CMakeLists.txt, one permutation each: WolVolFogRayMask,
+    WolVolFogRayBlur, WolVolFogRayComposite); no change in the three sources. Registers as in coa-vfog: mask c9 cRayMask (view direction to the body
+    + falloff exponent 8), c10 cRaySource (0, luminance threshold 0.12, 1 / ray width, 1 / ray height), s0 depth, s1 reduced scene; blur c9
+    cRadialBlur (body uv, step fraction, 1 / sum of the tap weights), c10 cRayTarget (ray size, texel); blend c96-c98 cComposite (y = strength),
+    cGodRayColour, cSun (xy = body in pixels), s2 shafts, s3 the image to blend over.
+  - NaN guard. vf_temporal.hlsl: main() is now a wrapper that sends the filter result (TemporalResult(), the old main) through SanitiseHistory():
+    radiance clamped to 0..1024 with a comparison (a NaN fails "x >= 0" and becomes 0, because max(NaN, 0) is not defined the same way on every
+    driver) and the fourth channel saturated; the 16 bit history is read back by the next frame, so a NaN or an infinity written once would stay for
+    good (the B8 report mentions one unexplained dark band; this closes the way for non finite values to persist). vf_composite.hlsli: SanitiseFog()
+    on the fog read back from the march / history right after the exposure (radiance 0..1024, opacity saturated), and SanitiseGodRays() (0..16) in
+    BlendGodRays() in place of max(godRays, 0). Before this brief neither shader bounded its output: BlendGodRays only had max(godRays, 0), and the
+    temporal filter had no guard at all (its clamp() against the neighbourhood range lets a NaN through). Both lines are the only changes in the two files.
+  - WolVolFogDebug.hlsl (new in B2, ours): permutation 4 (DEBUG_MODE=4, wolVolFogDebug 6) shows the shaft texture (s1) over the world viewport, scaled
+    by c4.x (0 = black, used when the frame draws no shafts).
+  - Engine/Source/VolFog/VolFogRender.cpp: the targets (rays[0], rays[1], ARGB8, LINEAR, a quarter of the world viewport), the reduced scene copy
+    (GxTexStretch = StretchRect with a linear filter, CopySceneForGodRays), the mask, the two radial blurs (step 0.075 and 0.075 / 8, 8 taps, decay 0.9,
+    DrawGodRayMask) and the blend (DrawGodRaysOverScene, over a second copy of the fogged image: the late path of coa-vfog, not inside the composition
+    shader) follow renderer.cpp, rewritten over Gx. The silhouette mask (vf_silhouette_mask.hlsl, MarkSilhouetteSamples) is not part of the shafts in coa-vfog:
+    it only serves the sample-split composite of multisampled depth (DrawCompositeBySampleDepth), so it stays unused here (the fog forces MSAA off).
+  - Engine/Source/VolFog/VolFogRays.cpp (new): ComputeRayFrame(), the sun block of Renderer::RenderPasses (position of the body on the screen from the
+    view and projection of the frame, screen fade clamp(1.6 - max(|ndc|), 0, 1), strength). Added: the strength is also multiplied by the occlusion
+    visibility of the sun or moon (FrameInputs::rayVisibility, filled in WoW/Source/WorldClient/VolFogWorld.cpp from DNGlare::GetQueryOcclusion, or
+    GetPointOcclusion without a query, eased up 4 / s and down 1.5 / s). DNGlare::m_screenGlow is not used: the fade of the moon glare is 0 under a
+    clear sky (DNMoonGlare::GetCloudDensityFade), when the moon is most visible.
+  - wolVolFogDump (VolFogDump.cpp) prints two "rays:" lines; wolVolFogDebug 6 is accepted (WorldParam_CVar.cpp) and keeps the fog armed (VolFog.cpp).
+
+2026-10-20  Brief B10 (World of Legends, native volumetric fog, phase 3: interiors, water, glow and the corrections of the B7-B8 review).
+  - Engine/Source/VolFog/VolFogLights.h / VolFogLights.cpp (derived from src/engine_lights.* of 205ade5): the cut-off of PointLightCutoff is 1/32 of the
+    peak colour instead of 1/256 (coa-vfog's value), so the sphere of a light of the client (fixed attenuation 0; 0.7; 0.03) goes from 81 to 23 yards; lights
+    whose faded colour is below the cut-off are not uploaded. Not in coa-vfog: the lights are only scattered from wolVolFog 2 on.
+  - Engine/Source/VolFog/VolFogModel.h / VolFogModel.cpp (derived from src/fog_model.*): the moon fades in as the sun sets (visibility multiplied by
+    1 - SmoothStep(-0.15, -0.03, sun elevation)); the body is the moon only when the sun is below -0.03 (WoW/Source/WorldClient/VolFogWorld.cpp). coa-vfog
+    switches at the horizon and lets the light jump. No other change in the model: the interior weights (15 % of the scene layers, 100 % of the distance
+    layer, no sun) and the distance layer of fogMode 1 maps were measured and kept as they are.
+  - Engine/Source/VolFog/VolFogRender.cpp: s9 (the density noise atlas) is bound in the composition as coa-vfog does all frame; cSun.w / the glow
+    compensation constant of both composition shaders is the glow of the client (FrameInputs::clientGlowAmount, 0 unless ffxGlow is on and the glow is
+    the active screen effect), the GlowCompensation of coa-vfog (renderer.cpp:1374, 1496); the temporal history is dropped when the lit / unlit march
+    variant changes or the light texture is made anew. No shader source changed.
