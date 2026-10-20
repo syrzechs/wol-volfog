@@ -140,3 +140,9 @@ Modifications (GPLv3 section 5a), dated
   - Engine/Source/VolFog/VolFogDepth.cpp: the "MSAA + copy" mode (INTZ is a copy of the multisampled AutoDepthStencil, refreshed by ResolveDepth() at the
     start of VolFog::Render()); a D24X8 request becomes D24S8 for the multisampled depth, as coa-vfog does. Not in coa-vfog: the copy mode is refused when
     d3d9.dll is the system (native) copy, because the RESZ trigger hangs the GPU of the AMD RX 9070 XT there (see the comment in the file).
+
+2026-10-20  Brief B13b (World of Legends, corrections to B13 after REVISION-B13.md).
+  - Engine/Source/VolFog/VolFogDepth.cpp: not in coa-vfog. The copy mode (RESZ) is offered only when the d3d9.dll that implements the client's
+    IDirect3D9 is recognised as DXVK by its content (unnamed export ordinals 28257 / 28258 and ProductName DXVK in its version resource); the folder it
+    lives in no longer decides, so a proxy (ReShade...) in front of the driver's d3d9.dll is refused too. A resolve that kept failing is reported again.
+  - Engine/Source/VolFog/VolFogResz.cpp: ReszSelfTest tells a depth read back wrong (RESZ does not work) from a failed D3D call (nothing is known).

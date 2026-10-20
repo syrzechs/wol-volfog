@@ -1,10 +1,11 @@
 # cambios-cliente.diff - wol-volfog (World of Legends), 2026-10-20
 # What the 11 patches of ./patches change in files OUTSIDE the module (Gx format tables, OnWorldRender in WorldFrame.cpp, the linear fog in
-# DayNight::UpdateFog, the CVars). One diff, 16 files, 46 hunks, made on wowdecomp 0e4e9fe plus our other local client patches.
-# Context lines come from that tree: on a clean wowdecomp 41 hunks apply and 5 (CVar registration, next to our other wol* CVars) need
+# DayNight::UpdateFog, the CVars). One diff, 16 files, 48 hunks, made on wowdecomp 0e4e9fe plus our other local client patches.
+# Context lines come from that tree: on a clean wowdecomp 43 hunks apply and 5 (CVar registration, next to our other wol* CVars) need
 # placing by hand (git apply --reject). Lines before the first "diff --git" are ignored by git apply.
 # Brief B13 (patch 12): the last sections of this file (CGxDeviceD3d.cpp, CGxDeviceD3d9Ex.cpp, WorldParam_CVar.cpp, again) are the B13 hunks; git apply takes them after the
 # sections above, in file order, so apply the whole file or none of it.
+# Brief B13b (patch 13): the very last two sections (CGxDeviceD3d.cpp, CGxDeviceD3d9Ex.cpp, once more) are the B13b hunks (VolFog::NoteDeviceCreate in ICreateD3dDevice).
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 468c8c4..c2421a6 100644
 --- a/CMakeLists.txt
@@ -997,3 +998,27 @@ index daab4f2..a37cd5f 100644
          ConsoleWrite(buffer, DEFAULT_COLOR);
          CGxDevice::Log("%s", static_cast<const char*>(buffer)); // const char*: a char* would pick the va_list overload
      }
+diff --git a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+index 2e27e2a..8faedc3 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp
+@@ -2671,6 +2671,7 @@ int32_t CGxDeviceD3d::ICreateD3dDevice(const CGxFormat& format) {
+     CGxDevice::Log("\tNVAPI: %d", this->m_d3dNVAPI);
+     CGxDevice::Log("\tstereoHandle: %x", this->m_d3dStereoHandle);
+ 
++    VolFog::NoteDeviceCreate(); // Not in the original client (brief B13b): the next CreateDepthTexture is on a brand-new device, not on one that went through a Reset
+     this->IStateSetD3DDefaults();
+     this->DeviceSetGamma(this->m_gammaRamp);
+     this->ICursorCreate(format);
+diff --git a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+index d0430e1..87715be 100644
+--- a/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
++++ b/Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp
+@@ -2650,6 +2650,7 @@ int32_t CGxDeviceD3d9Ex::ICreateD3dDevice(const CGxFormat& format) {
+     CGxDevice::Log("\tNVAPI: %d", this->m_d3dNVAPI);
+     CGxDevice::Log("\tstereoHandle: %x", this->m_d3dStereoHandle);
+ 
++    VolFog::NoteDeviceCreate(); // Not in the original client (brief B13b): the next CreateDepthTexture is on a brand-new device, not on one that went through a Reset
+     this->IStateSetD3DDefaults();
+     this->DeviceSetGamma(this->m_gammaRamp);
+     this->ICursorCreate(format);

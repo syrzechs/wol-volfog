@@ -34,7 +34,7 @@ defecto; con 0 la imagen es la del cliente sin el módulo). Licencia: **GPL-3.0-
 
 ```
 LICENSE, NOTICE, README.md, aplicar.ps1, .gitattributes
-patches/                      17 parches en el orden de aplicación (00a-00e prerrequisitos WoL, 01-B1 ... 12-B13)
+patches/                      18 parches en el orden de aplicación (00a-00e prerrequisitos WoL, 01-B1 ... 12-B13, 13-B13b)
 cambios-cliente.diff          lo que los parches cambian FUERA del módulo (16 ficheros), en un solo diff
 Engine/Source/VolFog/         el módulo C++ (pase de niebla, modelo, luces, haces, entradas, volcado, textura INTZ)
 Shaders/VolFog/               los HLSL, el CMake de la cadena fxc -> .bls -> MPQ, LICENSE y NOTICE-modificaciones.txt
@@ -53,7 +53,7 @@ Requisitos: Windows, Visual Studio 2022 (x64), CMake, Git, **Windows SDK** (para
 
 1. Clona wowdecomp. Los parches se hicieron sobre el commit `0e4e9fe0a4a9fa08027c5eed4b2c5e873739cfd3` (2026-10-15) **más otros
    parches locales nuestros** del cliente (CVars `wolFarclipFactor`, `wolShadowMapSize`, `wolDpiAware`...). Consecuencia: los 11
-   parches aplican limpios sobre ese árbol, pero sobre un wowdecomp sin tocar **41 de los 46 hunks de `cambios-cliente.diff` aplican**
+   parches aplican limpios sobre ese árbol, pero sobre un wowdecomp sin tocar **43 de los 48 hunks de `cambios-cliente.diff` aplican**
    y 5 hay que colocarlos a mano (los de registro de CVars, que se apoyan en esas líneas: `WorldParam.h` 2, `WorldParam_CVar.cpp` 2,
    `ConsoleDevice_CVar.cpp` 1). Ponlos junto a las líneas equivalentes de tu árbol. La secuencia de los 11 parches, en cambio, se detiene en
    `02-B2` sobre un wowdecomp sin tocar (y se deshace sola): en ese caso usa `-Consolidado`.
@@ -64,7 +64,7 @@ Requisitos: Windows, Visual Studio 2022 (x64), CMake, Git, **Windows SDK** (para
    .\aplicar.ps1 -Destino C:\ruta\wowdecomp -Revertir       # deshace los 11 en orden inverso (git apply -R)
    ```
    Orden de los parches: `B1` formatos Gx, `B2` shaders y pase base, `B3` depth INTZ, `B3b` correcciones, `B4B5` CVars y modelo, `B6`
-   marcha y composición, `B7` filtro temporal, `B6b` correcciones, `B8` luces, `B9` haces, `B10` interiores y ajustes, `B13` MSAA con la niebla (el depth legible pasa a ser una copia RESZ del depth multimuestra; solo con DXVK, en D3D9 nativo de AMD el RESZ bloquea la GPU y se vuelve a MSAA 1 con aviso). Los parches están
+   marcha y composición, `B7` filtro temporal, `B6b` correcciones, `B8` luces, `B9` haces, `B10` interiores y ajustes, `B13` MSAA con la niebla (el depth legible pasa a ser una copia RESZ del depth multimuestra; solo con DXVK, en D3D9 nativo de AMD el RESZ bloquea la GPU y se vuelve a MSAA 1 con aviso), `B13b` correcciones de B13 (el RESZ solo se ofrece si el `d3d9.dll` que usa el cliente es DXVK, reconocido por su contenido y no por su carpeta: un proxy como ReShade delante del driver nativo también se rechaza; el self-test distingue un depth erróneo de una llamada fallida). Los parches están
    en LF (lo que da `git diff` con `core.autocrlf=true`); el script reintenta con `--ignore-whitespace` si tu árbol está en CRLF sin `autocrlf`.
 3. Compila:
    ```powershell
@@ -122,7 +122,7 @@ GPLv3 section 7 quoted above: CoAVolFog, including modified versions, may be lin
 combination distributed without the client's source code; GPLv3 keeps applying to CoAVolFog. Nothing from the Blizzard client or the whole
 wowdecomp tree is copied here: only our files and diffs.
 
-Build: wowdecomp (patches made on `0e4e9fe` plus our other local client patches) + `aplicar.ps1` (11 patches in order, `-Consolidado` for the
+Build: wowdecomp (patches made on `0e4e9fe` plus our other local client patches) + `aplicar.ps1` (the patches in order, `-Consolidado` for the
 module plus `cambios-cliente.diff`, `-Revertir`) + CMake option `WOWDECOMP_VOLFOG` (needs `fxc.exe` from the Windows SDK and Python 3;
 it writes `bin\Win\Data\patch-Z.MPQ`). Use: `SET wolVolFog "2"` (0 off, 1-3 quality) and `gxRestart` when switching between 0 and >0;
 `wolVolFogDensity`, `wolVolFogGodRays`, `wolVolFogLocalLights`, `wolVolFogDebug`, console command `wolVolFogDump`. Tested on an AMD RX 9070 XT

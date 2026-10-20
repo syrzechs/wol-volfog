@@ -6,6 +6,7 @@
 
 #if defined(_WIN32)
 #include <d3d9.h>
+#include <cstring>
 #include <wchar.h>
 #endif
 
@@ -32,6 +33,7 @@ namespace {
     bool s_copyMode;           // brief B13
     bool s_reszBroken;         // brief B13: the RESZ self-test failed once in this run; the MSAA is not kept again
     bool s_restartRequested;   // brief B13: see TakeDeviceRestart
+    bool s_newDevice;          // brief B13b: NoteDeviceCreate, taken (and cleared) by the next CreateDepthTexture
     uint32_t s_resolveFailures;
 }
 
@@ -67,50 +69,120 @@ bool VolFog::WantsReadableDepthFor(IDirect3D9* d3d, uint32_t backBufferFormat) {
     return d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, static_cast<D3DFORMAT>(backBufferFormat), D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, intz) == D3D_OK;
 }
 
-// Brief B13: the system d3d9.dll (AMD's native driver) must not be asked for RESZ. Measured on the RX 9070 XT (Adrenalin, 2026-10-20) with
-// prueba-b13\resz_test.cpp: CheckDeviceFormat reports RESZ, but the AMD sample sequence (dummy point with the INTZ in stage 0, then
-// SetRenderState(D3DRS_POINTSIZE, 0x7FA05000)) leaves the GPU unable to finish: the next event query or Release never returns, with 2x, 4x and
-// 8x, D24S8 / D24X8 / D16, pure device or not. DXVK implements the same trigger itself (D3D9DeviceEx::ResolveZ) and works. A hang cannot be
-// caught by a self-test, so the copy mode is only offered when d3d9.dll is not the one in the system folder; the environment variable
-// WOL_RESZ_NATIVE=1 lifts the block (for testing other drivers: it can hang the machine's GPU).
-static bool InFolder(const wchar_t* file, const wchar_t* folder) {
-    const wchar_t* slash = wcsrchr(file, L'\\');
+// Brief B13b (REVISION-B13, finding 1): the RESZ trigger is only sent to a d3d9.dll recognised as DXVK by its content. Measured on the RX 9070 XT
+// (Adrenalin, 2026-10-20) with prueba-b13\resz_test.cpp: the native AMD driver reports RESZ, but the AMD sample sequence (dummy point with the
+// INTZ in stage 0, then SetRenderState(D3DRS_POINTSIZE, 0x7FA05000)) leaves the GPU unable to finish: the next event query or Release never
+// returns, with 2x, 4x and 8x, D24S8 / D24X8 / D16, pure device or not. DXVK implements the same trigger itself (D3D9DeviceEx::ResolveZ) and
+// works. A hang cannot be caught by a self-test. B13 only refused the d3d9.dll of System32 / SysWOW64 (a block list), but ReShade, GShade, SpecialK
+// and other proxies are installed as d3d9.dll next to the exe, load the System32 one by full path and pass the trigger on to the driver; with two
+// modules called d3d9.dll, GetModuleHandle cannot say which one it returns. So this is an allow list and it looks at what the module is, not at
+// where it lives: the module that implements the IDirect3D9 object the client got from Direct3DCreate9 (the address of its vtable and the address
+// of its first method must both be in the image of one and the same module) has to export Direct3DCreate9 and the unnamed ordinals 28257 / 28258
+// (DXVK_RegisterAnnotation / DXVK_UnRegisterAnnotation: not in the d3d9.dll of Windows, nor in a proxy) and its version resource must say
+// ProductName DXVK. Anything else, or any doubt, counts as "not DXVK": the MSAA is dropped as in B3b. A future DXVK that changes any of this fails
+// to the safe side. The environment variable WOL_RESZ_NATIVE=1 lifts the block, for tests only: it can hang the GPU of the machine.
+namespace {
+    // -1: no IDirect3D9 has been looked at in this run (CreateDepthTexture then refuses the copy mode), 0: not DXVK or in doubt, 1: DXVK.
+    int s_dxvk = -1;
+}
 
-    if (!slash) {
+static HMODULE ModuleOfAddress(const void* address) {
+    HMODULE module = nullptr;
+
+    if (!address || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(address), &module)) {
+        return nullptr;
+    }
+
+    return module;
+}
+
+// True when the version resource of `module` (read from memory) has ProductName = "DXVK". It is a tree of structures with UTF-16 text: for each
+// string, a 6 byte header (all of them start on a multiple of 4 from the start of the resource), the key and a NUL, padding to a multiple of 4 and the
+// value and a NUL.
+static bool ProductNameIsDxvk(HMODULE module) {
+    static const wchar_t s_key[] = L"ProductName";
+    static const wchar_t s_value[] = L"DXVK";
+
+    HRSRC found = FindResourceW(module, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16)) /* 16 = RT_VERSION */;
+    HGLOBAL loaded = found ? LoadResource(module, found) : nullptr;
+    const BYTE* data = loaded ? static_cast<const BYTE*>(LockResource(loaded)) : nullptr;
+    const size_t size = found ? SizeofResource(module, found) : 0;
+
+    if (!data) {
         return false;
     }
 
-    size_t length = static_cast<size_t>(slash - file);
+    for (size_t at = 2; at + sizeof(s_key) <= size; at += 4) { // a key starts 6 bytes into a structure: 2 more than a multiple of 4
+        if (std::memcmp(data + at, s_key, sizeof(s_key)) == 0) {
+            const size_t value = (at + sizeof(s_key) + 3) & ~static_cast<size_t>(3);
 
-    return wcslen(folder) == length && _wcsnicmp(file, folder, length) == 0;
-}
-
-static bool NativeD3d9() {
-    static int s_native = -1;
-
-    if (s_native < 0) {
-        wchar_t path[MAX_PATH] = {};
-        wchar_t system[MAX_PATH] = {};
-        wchar_t wow64[MAX_PATH] = {};
-        HMODULE module = GetModuleHandleW(L"d3d9.dll");
-
-        s_native = module && GetModuleFileNameW(module, path, MAX_PATH) && ((GetSystemDirectoryW(system, MAX_PATH) && InFolder(path, system)) || (GetSystemWow64DirectoryW(wow64, MAX_PATH) && InFolder(path, wow64))) ? 1 : 0;
-        // const char*: MSVC lets a string literal (and a ?: of two) convert to char*, which picks the va_list overload of Log (the first run of B13 crashed here)
-        const char* const which = s_native ? "the system (native) driver copy" : "not the system copy (DXVK or another wrapper)";
-        CGxDevice::Log("wolVolFog: d3d9.dll is %s", which);
+            return value + sizeof(s_value) <= size && std::memcmp(data + value, s_value, sizeof(s_value)) == 0;
+        }
     }
 
-    return s_native == 1;
+    return false;
 }
 
-static bool ReszAllowed() {
-    if (!NativeD3d9()) {
-        return true;
+static bool IsDxvk(IDirect3D9* d3d) {
+    static HMODULE s_loggedModule;
+    static int s_loggedVerdict = -1;
+
+    const void* const* table = d3d ? *reinterpret_cast<const void* const* const*>(d3d) : nullptr;
+    HMODULE viaTable = table ? ModuleOfAddress(table) : nullptr;
+    HMODULE viaMethod = table ? ModuleOfAddress(table[0]) : nullptr;
+    HMODULE module = viaTable == viaMethod ? viaTable : nullptr; // two different modules (or none) is a doubt: not DXVK
+    const bool create = module && GetProcAddress(module, "Direct3DCreate9") != nullptr;
+    const bool ordinals = module && GetProcAddress(module, MAKEINTRESOURCEA(28257)) != nullptr && GetProcAddress(module, MAKEINTRESOURCEA(28258)) != nullptr;
+    const bool product = module && ProductNameIsDxvk(module);
+    const bool dxvk = create && ordinals && product;
+
+    s_dxvk = dxvk ? 1 : 0;
+
+    if (module != s_loggedModule || s_loggedVerdict != s_dxvk) {
+        s_loggedModule = module;
+        s_loggedVerdict = s_dxvk;
+
+        char path[MAX_PATH * 3] = "(the IDirect3D9 is not in a single module)";
+        wchar_t wide[MAX_PATH] = {};
+
+        if (module && GetModuleFileNameW(module, wide, MAX_PATH)) {
+            WideCharToMultiByte(CP_UTF8, 0, wide, -1, path, sizeof(path), nullptr, nullptr);
+        }
+
+        // const char* variables with several arguments: a lone literal (or a ?: of two) would pick the va_list overload of Log
+        const char* const verdict = dxvk ? "DXVK" : "not DXVK";
+        const char* const yes = "yes";
+        const char* const no = "no";
+        CGxDevice::Log("wolVolFog: d3d9.dll is %s (the IDirect3D9 comes from %s; Direct3DCreate9: %s, ordinals 28257/28258: %s, ProductName DXVK: %s)", verdict, path, create ? yes : no, ordinals ? yes : no, product ? yes : no);
     }
 
+    return dxvk;
+}
+
+static bool ReszNativeOverride() {
     wchar_t value[8] = {};
 
     return GetEnvironmentVariableW(L"WOL_RESZ_NATIVE", value, 8) > 0 && value[0] == L'1';
+}
+
+static bool ReszAllowed(IDirect3D9* d3d) {
+    if (IsDxvk(d3d)) {
+        return true;
+    }
+
+    if (ReszNativeOverride()) {
+        CGxDevice::Log("wolVolFog: WOL_RESZ_NATIVE=1: RESZ is used although d3d9.dll is not DXVK (for tests only: it can hang the GPU)");
+
+        return true;
+    }
+
+    return false;
+}
+
+// CreateDepthTexture has no IDirect3D9 (the client creates a pure device: no GetDirect3D) and uses the verdict that PrepareMsaaCopy reached for the
+// device it is making. No verdict yet (the back buffer is multisampled without PrepareMsaaCopy having run) is a refusal.
+static bool ReszAllowedCached() {
+    return s_dxvk == 1 || ReszNativeOverride();
 }
 
 // Hook point WOL_NVAPI (brief B13). On NVIDIA's native D3D9 driver there is no RESZ; coa-vfog copies the multisampled D24S8 depth there with
@@ -124,7 +196,7 @@ static bool ReszAllowed() {
 // Brief B13: the back buffer is multisampled and the driver has RESZ: INTZ becomes a copy of the multisampled depth that the device already has
 // as AutoDepthStencil (the backend made it in ISetPresentParms through PrepareMsaaCopy). Returns false like CreateDepthTexture does when the INTZ is
 // not the depth of the device; DepthTexture() tells whether the copy exists.
-static bool CreateDepthCopy(IDirect3DDevice9* device) {
+static bool CreateDepthCopy(IDirect3DDevice9* device, bool freshDevice) {
     const D3DFORMAT intz = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'));
     IDirect3DSurface9* depth = nullptr;
     D3DSURFACE_DESC depthDesc;
@@ -152,20 +224,24 @@ static bool CreateDepthCopy(IDirect3DDevice9* device) {
     }
 
     // Self-test (design 5.3): two known depths written to the multisampled depth, resolved into the INTZ and read back, twice with the halves
-    // swapped. If it fails the MSAA cannot be kept with the fog: s_reszBroken makes the next device single-sampled, and the backend's
-    // DeviceSetFormat rebuilds it right away (TakeDeviceRestart).
+    // swapped. Brief B13b: only a depth that comes back wrong, on a device that has just been created, shows that RESZ does not work: s_reszBroken
+    // makes the next device single-sampled and the backend's DeviceSetFormat rebuilds it right away (TakeDeviceRestart). A failed D3D call says
+    // nothing about RESZ (device lost right after a Reset, no video memory), and after a Reset (Alt+Tab, resize) nobody rebuilds the device: in those
+    // cases nothing is marked for the run, the copy is not made and the next Reset or gxRestart tries again.
     IDirect3DStateBlock9* block = VolFog::ReszCreateStateBlock(device);
     float first = -1.0f;
     float second = -1.0f;
-    bool passed = block != nullptr;
+    VolFog::ReszTest test = VolFog::ReszTest::CallFailed;
 
 #if defined(WOL_NVAPI)
     // WOL_NVAPI hook point (1/3): attach `depth` and `texture` to the NvAPI copy here when the driver has no RESZ.
 #endif
 
-    passed = passed && VolFog::ReszSelfTest(device, texture, depth, block, &first, &second);
+    if (block) {
+        test = VolFog::ReszSelfTest(device, texture, depth, block, &first, &second);
+    }
 
-    if (!passed) {
+    if (test != VolFog::ReszTest::Passed) {
         depth->Release();
 
         if (block) {
@@ -173,10 +249,20 @@ static bool CreateDepthCopy(IDirect3DDevice9* device) {
         }
 
         texture->Release();
-        s_reszBroken = true;
-        s_restartRequested = true;
-        CGxDevice::Log("wolVolFog: RESZ self-test failed (%s): the last round read %.4f / %.4f where the multisampled depth held 0.7500 / 0.3125; the MSAA is dropped on the next device", block ? "the resolve did not give the depth back" : "no state block", first, second);
-        VolFog::Message("wolVolFog: RESZ no funciona, MSAA desactivado");
+
+        if (test == VolFog::ReszTest::WrongValue && freshDevice) {
+            s_reszBroken = true;
+            s_restartRequested = true;
+            CGxDevice::Log("wolVolFog: RESZ self-test failed: the last round read %.4f / %.4f where the multisampled depth held 0.7500 / 0.3125; the MSAA is dropped and the device is rebuilt without it", first, second);
+            VolFog::Message("wolVolFog: RESZ no funciona, MSAA desactivado (se reconstruye el dispositivo sin MSAA)");
+        } else if (test == VolFog::ReszTest::WrongValue) {
+            CGxDevice::Log("wolVolFog: RESZ self-test failed after a device Reset: the last round read %.4f / %.4f where the multisampled depth held 0.7500 / 0.3125; RESZ is not marked as broken, no readable depth until the next Reset or gxRestart, which tries again", first, second);
+            VolFog::Message("wolVolFog: RESZ ha fallado tras reiniciar el dispositivo; la niebla no tiene depth hasta el proximo gxRestart (se reintenta)");
+        } else {
+            const char* const why = block ? "a D3D call of the test failed" : "no state block";
+            CGxDevice::Log("wolVolFog: the RESZ self-test could not run (%s); nothing is marked, the readable depth waits for the next Reset or gxRestart, which tries again", why);
+            VolFog::Message("wolVolFog: pendiente de gxRestart (no se ha podido comprobar RESZ; se reintenta)");
+        }
 
         return false;
     }
@@ -199,6 +285,8 @@ static bool CreateDepthCopy(IDirect3DDevice9* device) {
 bool VolFog::CreateDepthTexture(IDirect3DDevice9* device) {
     VolFog::ReleaseDepthTexture(device);
     s_restartRequested = false; // brief B13: only a failure of this very call asks for a rebuild
+    const bool freshDevice = s_newDevice; // brief B13b: NoteDeviceCreate, as opposed to a device that went through a Reset
+    s_newDevice = false;
 
     if (!device || !VolFog::WantsReadableDepth()) {
         return false;
@@ -220,8 +308,8 @@ bool VolFog::CreateDepthTexture(IDirect3DDevice9* device) {
 
     if (desc.MultiSampleType != D3DMULTISAMPLE_NONE) {
         // Brief B13: with RESZ the multisampled depth stays the depth of the device and the INTZ is a copy of it.
-        if (VolFog::s_caps.resz && !s_reszBroken && ReszAllowed()) {
-            return CreateDepthCopy(device);
+        if (VolFog::s_caps.resz && !s_reszBroken && ReszAllowedCached()) {
+            return CreateDepthCopy(device, freshDevice);
         }
 
         // A multisampled back buffer cannot share the depth of a plain texture. This happens on the very first device of a
@@ -337,7 +425,7 @@ IDirect3DTexture9* VolFog::DepthTexture() {
 bool VolFog::PrepareMsaaCopy(IDirect3D9* d3d, uint32_t backBufferFormat, bool windowed, uint32_t multisampleType, uint32_t* depthFormat, const char** message) {
     static const char* const s_noResz = "wolVolFog: gxMultisample ignorado (el driver no ofrece RESZ: el depth legible no admite MSAA)";
     static const char* const s_broken = "wolVolFog: RESZ no funciona, MSAA desactivado";
-    static const char* const s_native = "wolVolFog: gxMultisample ignorado (D3D9 nativo: el RESZ del driver bloquea la GPU; con DXVK si hay MSAA)";
+    static const char* const s_notDxvk = "wolVolFog: gxMultisample ignorado (d3d9.dll no es DXVK: el RESZ del driver nativo, o de un proxy como ReShade delante, puede bloquear la GPU; el MSAA con niebla solo se ofrece con DXVK)";
 
     *message = s_noResz;
 
@@ -351,8 +439,8 @@ bool VolFog::PrepareMsaaCopy(IDirect3D9* d3d, uint32_t backBufferFormat, bool wi
         return false;
     }
 
-    if (!ReszAllowed()) {
-        *message = s_native;
+    if (!ReszAllowed(d3d)) {
+        *message = s_notDxvk;
 
         return false;
     }
@@ -390,6 +478,10 @@ bool VolFog::TakeDeviceRestart() {
     return requested;
 }
 
+void VolFog::NoteDeviceCreate() {
+    s_newDevice = true;
+}
+
 bool VolFog::DepthIsCopy() {
     return s_copyMode && s_texture != nullptr;
 }
@@ -411,7 +503,11 @@ void VolFog::ResolveDepth() {
         return;
     }
 
-    if (++s_resolveFailures == 3) {
+    // Brief B13b: >= 3 and counting anew after the report. The pass stops calling this once SetHardFailure(true) is set and starts again after
+    // SetHardFailure(false) (a change of wolVolFog, a rebuilt device) without a new CreateDepthCopy, so the counter used to stay at 3 or more and
+    // never equalled 3 again: a resolve that kept failing was never reported again and the fog read an old INTZ.
+    if (++s_resolveFailures >= 3) {
+        s_resolveFailures = 0;
         static const char* const s_failed = "wolVolFog: the RESZ depth copy failed three frames in a row; the client's own fog is back.";
         CGxDevice::Log("%s", s_failed);
         VolFog::Message(s_failed);
@@ -448,6 +544,9 @@ bool VolFog::ReszBroken() {
 
 bool VolFog::TakeDeviceRestart() {
     return false;
+}
+
+void VolFog::NoteDeviceCreate() {
 }
 
 bool VolFog::DepthIsCopy() {

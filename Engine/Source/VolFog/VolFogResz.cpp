@@ -233,17 +233,17 @@ bool VolFog::ReszResolve(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDir
     return ok;
 }
 
-bool VolFog::ReszSelfTest(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDirect3DSurface9* multisampledDepth, IDirect3DStateBlock9* resolveBlock, float* firstRead, float* secondRead) {
+VolFog::ReszTest VolFog::ReszSelfTest(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDirect3DSurface9* multisampledDepth, IDirect3DStateBlock9* resolveBlock, float* firstRead, float* secondRead) {
     D3DSURFACE_DESC desc = {};
 
     if (!device || !intz || !multisampledDepth || !resolveBlock || FAILED(multisampledDepth->GetDesc(&desc)) || desc.Width < 4) {
-        return false;
+        return ReszTest::CallFailed;
     }
 
     IDirect3DSurface9* colour = nullptr;
 
     if (FAILED(device->GetRenderTarget(0, &colour)) || !colour) {
-        return false;
+        return ReszTest::CallFailed;
     }
 
     // The whole device state, so that the client finds it as it left it (this runs while the Gx backend builds the device).
@@ -252,19 +252,18 @@ bool VolFog::ReszSelfTest(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDi
     device->GetDepthStencilSurface(&depth);
 
     Probe probe;
-    bool passed = false;
+    ReszTest result = ReszTest::CallFailed; // brief B13b: a call that fails says nothing about RESZ; only a depth read back wrong does
 
     if (saved && CreateProbe(device, probe)) {
         float read[kProbeTexels] = {};
         const float rounds[2][2] = { { kFirstDepth, kSecondDepth }, { kSecondDepth, kFirstDepth } };
 
-        passed = true;
+        result = ReszTest::Passed;
 
-        for (int round = 0; round < 2 && passed; round++) {
-            passed = Round(device, intz, multisampledDepth, colour, resolveBlock, probe, desc, rounds[round][0], rounds[round][1], read);
-
-            for (UINT i = 0; i < kProbeTexels; i++) {
-                passed = passed && std::fabs(read[i] - rounds[round][i]) <= kTolerance;
+        for (int round = 0; round < 2 && result == ReszTest::Passed; round++) {
+            if (!Round(device, intz, multisampledDepth, colour, resolveBlock, probe, desc, rounds[round][0], rounds[round][1], read)) {
+                result = ReszTest::CallFailed;
+                break;
             }
 
             if (firstRead) {
@@ -273,6 +272,12 @@ bool VolFog::ReszSelfTest(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDi
 
             if (secondRead) {
                 *secondRead = read[1];
+            }
+
+            for (UINT i = 0; i < kProbeTexels; i++) {
+                if (!(std::fabs(read[i] - rounds[round][i]) <= kTolerance)) { // also true for NaN
+                    result = ReszTest::WrongValue;
+                }
             }
         }
 
@@ -285,7 +290,7 @@ bool VolFog::ReszSelfTest(IDirect3DDevice9* device, IDirect3DTexture9* intz, IDi
     SafeRelease(depth);
     SafeRelease(colour);
 
-    return passed;
+    return result;
 }
 
 #else
@@ -298,8 +303,8 @@ bool VolFog::ReszResolve(IDirect3DDevice9*, IDirect3DTexture9*, IDirect3DStateBl
     return false;
 }
 
-bool VolFog::ReszSelfTest(IDirect3DDevice9*, IDirect3DTexture9*, IDirect3DSurface9*, IDirect3DStateBlock9*, float*, float*) {
-    return false;
+VolFog::ReszTest VolFog::ReszSelfTest(IDirect3DDevice9*, IDirect3DTexture9*, IDirect3DSurface9*, IDirect3DStateBlock9*, float*, float*) {
+    return ReszTest::CallFailed;
 }
 
 #endif
