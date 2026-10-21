@@ -1,0 +1,163 @@
+diff --git a/Engine/Source/ShaderEffect/ShadowCache.cpp b/Engine/Source/ShaderEffect/ShadowCache.cpp
+index 572dd9b..4aff67e 100644
+--- a/Engine/Source/ShaderEffect/ShadowCache.cpp
++++ b/Engine/Source/ShaderEffect/ShadowCache.cpp
+@@ -49,6 +49,12 @@ uint32_t CShadowCache::s_shadowSize;
+ // Not in the original client (World of Legends): see ShadowCache.h. Zero keeps the original size.
+ uint32_t CShadowCache::s_wolShadowMapSize;
+ 
++// Not in the original client (World of Legends): see ShadowCache.h. Zero keeps the original PCF offsets.
++uint32_t CShadowCache::s_wolShadowSoft;
++
++// Not in the original client (World of Legends): see ShadowCache.h. Set by Init().
++uint32_t CShadowCache::s_wolShadowRefSize;
++
+ // STATIC: 0x00D43154
+ EShadowMode CShadowCache::s_shadowMode;
+ 
+@@ -346,6 +352,37 @@ void CShadowCache::InitPcfOffsets() {
+     CShadowCache::s_pcfOffsets[7].y = texel * -0.6f;
+     CShadowCache::s_pcfOffsets[7].z = 0.0f;
+     CShadowCache::s_pcfOffsets[7].w = 0.0f;
++
++    // Not in the original client (World of Legends): wolShadowSoft (patches-cliente/sombras-suaves/README-sombras-suaves.md).
++    // 0 keeps the table above. 1 - 3 replace it with a wider kernel, defined in texels of the ORIGINAL map size (s_wolShadowRefSize:
++    // 1024, or 2048 in the MEDIUM and >= HIGH modes), so the blur is the same width in yards at any wolShadowMapSize:
++    //   uv offset = pattern * r / s_wolShadowRefSize,  r = 1.0 / 1.6 / 2.3 for levels 1 / 2 / 3.
++    // Even slots (the 4 taps WMO, M2, grass and terrain bands 1 - 2 use, plus the 5-tap core): a square rotated about 25 degrees so
++    // the taps do not line up on the axes. Odd slots (only terrain band 0, which takes 9 taps): the ring in between, at 0.85 * r.
++    // Both are shifted by the centroid of the original even taps, (-0.15, -0.55) texel, so the 5-tap kernel keeps its centre of mass
++    // and the shadow edge does not move compared with the original.
++    if (CShadowCache::s_wolShadowSoft != 0) {
++        static const float s_levelRadius[3] = { 1.0f, 1.6f, 2.3f };
++        static const float s_evenPattern[4][2] = { { 0.45f, 0.95f }, { 0.95f, -0.45f }, { -0.45f, -0.95f }, { -0.95f, 0.45f } };
++        static const float s_oddPattern[4][2] = { { 0.71f, 0.71f }, { 0.71f, -0.71f }, { -0.71f, -0.71f }, { -0.71f, 0.71f } };
++        static const float s_centroidX = -0.15f;
++        static const float s_centroidY = -0.55f;
++
++        uint32_t level = CShadowCache::s_wolShadowSoft > 3 ? 3 : CShadowCache::s_wolShadowSoft;
++        float refTexel = 1.0f / static_cast<float>(CShadowCache::s_wolShadowRefSize ? CShadowCache::s_wolShadowRefSize : CShadowCache::s_shadowSize);
++        float radius = s_levelRadius[level - 1];
++
++        for (uint32_t i = 0; i < 4; i++) {
++            CShadowCache::s_pcfOffsets[i * 2].x = (s_evenPattern[i][0] * radius + s_centroidX) * refTexel;
++            CShadowCache::s_pcfOffsets[i * 2].y = (s_evenPattern[i][1] * radius + s_centroidY) * refTexel;
++            CShadowCache::s_pcfOffsets[i * 2].z = 0.0f;
++            CShadowCache::s_pcfOffsets[i * 2].w = 0.0f;
++            CShadowCache::s_pcfOffsets[i * 2 + 1].x = (s_oddPattern[i][0] * 0.85f * radius + s_centroidX) * refTexel;
++            CShadowCache::s_pcfOffsets[i * 2 + 1].y = (s_oddPattern[i][1] * 0.85f * radius + s_centroidY) * refTexel;
++            CShadowCache::s_pcfOffsets[i * 2 + 1].z = 0.0f;
++            CShadowCache::s_pcfOffsets[i * 2 + 1].w = 0.0f;
++        }
++    }
+ }
+ 
+ // VERIFY: 0ffef1a7 auto
+@@ -869,6 +906,9 @@ void CShadowCache::Init() {
+         CShadowCache::s_shadowSize = 2048;
+     }
+ 
++    // Not in the original client: the size the code above chose, before wolShadowMapSize overrides it (reference for wolShadowSoft).
++    CShadowCache::s_wolShadowRefSize = CShadowCache::s_shadowSize;
++
+     // Not in the original client: wolShadowMapSize (0 by default) overrides the size above. A graphics card that cannot
+     // create a texture that big gets the biggest one it supports (never below the original 1024).
+     if (CShadowCache::s_wolShadowMapSize != 0) {
+diff --git a/Engine/Source/ShaderEffect/ShadowCache.h b/Engine/Source/ShaderEffect/ShadowCache.h
+index 5c6c6ed..f2ad5d8 100644
+--- a/Engine/Source/ShaderEffect/ShadowCache.h
++++ b/Engine/Source/ShaderEffect/ShadowCache.h
+@@ -80,6 +80,11 @@ class CShadowCache {
+     // Not in the original client (World of Legends): CVar wolShadowMapSize, see patches-cliente/sombras-4096/README-sombras.md.
+     // 0 = the original size (1024, or 2048 in the MEDIUM and >= HIGH modes); otherwise 1024, 2048 or 4096. Set by the WoW layer.
+     static uint32_t s_wolShadowMapSize;
++    // Not in the original client (World of Legends): CVar wolShadowSoft, see patches-cliente/sombras-suaves/README-sombras-suaves.md.
++    // 0 = the original PCF offsets; 1 - 3 = wider kernel (InitPcfOffsets). s_wolShadowRefSize is the size the original code would use
++    // (1024, or 2048 in the MEDIUM and >= HIGH modes), set by Init(): the kernel is defined in texels of that size.
++    static uint32_t s_wolShadowSoft;
++    static uint32_t s_wolShadowRefSize;
+     static const char* s_shadowModeDescs[NUM_SHADOW_MODES + 1];
+     static const uint32_t s_shadowValues[NUM_SHADOW_MODES + 1];
+     static C3Vector s_sunDir;
+diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
+index 029a93f..cf57c4b 100644
+--- a/WoW/Source/WorldClient/WorldParam.h
++++ b/WoW/Source/WorldClient/WorldParam.h
+@@ -42,6 +42,8 @@ class CWorldParam {
+     static CVar* cvar_wolFarClipFactor;
+     // Not in the original client (World of Legends): see patches-cliente/sombras-4096/README-sombras.md.
+     static CVar* cvar_wolShadowMapSize;
++    // Not in the original client (World of Legends): see patches-cliente/sombras-suaves/README-sombras-suaves.md.
++    static CVar* cvar_wolShadowSoft;
+     // Not in the original client (World of Legends): see patches-cliente/hd-cache/README-hdcache.md.
+     static CVar* cvar_wolTextureCacheMB;
+     // Not in the original client (World of Legends): native volumetric fog, see patches-cliente/niebla-volumetrica/README-niebla.md.
+@@ -94,6 +96,7 @@ class CWorldParam {
+     // Not in the original client.
+     static bool WolFarClipFactorCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolShadowMapSizeCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolShadowSoftCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolTextureCacheMBCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolVolFogCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index 521b563..df42ab4 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -119,6 +119,9 @@ CVar* CWorldParam::cvar_wolFarClipFactor;
+ // Not in the original client (World of Legends): wolShadowMapSize, see patches-cliente/sombras-4096/README-sombras.md.
+ CVar* CWorldParam::cvar_wolShadowMapSize;
+ 
++// Not in the original client (World of Legends): wolShadowSoft, see patches-cliente/sombras-suaves/README-sombras-suaves.md.
++CVar* CWorldParam::cvar_wolShadowSoft;
++
+ // Not in the original client (World of Legends): wolTextureCacheMB, see patches-cliente/hd-cache/README-hdcache.md.
+ CVar* CWorldParam::cvar_wolTextureCacheMB;
+ 
+@@ -224,6 +227,37 @@ bool CWorldParam::WolShadowMapSizeCallback(CVar* var, const char* oldValue, cons
+     return true;
+ }
+ 
++// Not in the original client. Softness of the exterior shadow edges: 0 keeps the original PCF offsets, 1 - 3 widen the kernel
++// (radius about x1.3 / x2 / x2.9 of the original, in texels of the original map size, so it is the same width in yards at any
++// wolShadowMapSize). Applied at once: CShadowCache::InitPcfOffsets rewrites the offsets and they are uploaded every frame, no
++// texture is recreated. See CShadowCache::InitPcfOffsets for the formula.
++bool CWorldParam::WolShadowSoftCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    if (!value || value[0] < '0' || value[0] > '3' || value[1] != '\0') {
++        ConsoleWrite("wolShadowSoft must be 0 (original), 1 (soft), 2 (softer) or 3 (softest).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    static const char* s_names[4] = { "original", "soft, kernel x1.3", "softer, kernel x2", "softest, kernel x2.9" };
++    uint32_t level = static_cast<uint32_t>(value[0] - '0');
++
++    CShadowCache::s_wolShadowSoft = level;
++
++    // Before the shadow cache starts there is no map size yet: CShadowCache::Init builds the offsets then.
++    if (CShadowCache::s_shadowSize != 0) {
++        CShadowCache::InitPcfOffsets();
++    }
++
++    // No message while the CVar is first registered (no previous value).
++    if (oldValue && *oldValue) {
++        char buffer[256];
++        SStrPrintf(buffer, sizeof(buffer), "wolShadowSoft: %u (%s)", level, s_names[level]);
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
+ // VERIFY: 54f5415a manual
+ // OFFSET: 0x004023C0
+ bool CWorldParam::TextureFilteringCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
+@@ -1077,6 +1111,8 @@ void CWorldParam::Initialize() {
+     CWorldParam::cvar_wolFarClipFactor = CVar::Register("wolFarclipFactor", "Scales the view distance limits (1.0 original, up to 3.0)", 1, "1.0", CWorldParam::WolFarClipFactorCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Not in the original client: also before extShadowQuality, so the saved shadow map size is in place when the shadow cache starts.
+     CWorldParam::cvar_wolShadowMapSize = CVar::Register("wolShadowMapSize", "Exterior shadow map size (0 original, 1024, 2048 or 4096)", 1, "0", CWorldParam::WolShadowMapSizeCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Not in the original client: exterior shadow edge softness (PCF kernel width), 0 = original.
++    CWorldParam::cvar_wolShadowSoft = CVar::Register("wolShadowSoft", "Exterior shadow edge softness (0 original, 1 - 3 wider)", 1, "0", CWorldParam::WolShadowSoftCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Not in the original client: the wolVolFog* CVars are registered earlier, in RegisterGxCVars (CWorldParam::RegisterVolFogCVars, briefs B3b and B4).
+     // Brief B5: the console command wolVolFogDump (it only prints; it is not a CVar).
+     VolFogWorld::RegisterCommands();

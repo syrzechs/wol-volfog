@@ -35,6 +35,7 @@ defecto; con 0 la imagen es la del cliente sin el módulo). Licencia: **GPL-3.0-
 ```
 LICENSE, NOTICE, README.md, aplicar.ps1, .gitattributes
 patches/                      18 parches en el orden de aplicación (00a-00e prerrequisitos WoL, 01-B1 ... 12-B13, 13-B13b)
+patches/propios/              los demás cambios propios del cliente de la «noche de gráficos» (post-proceso FXAA y tonemapping, sombras suaves, caché de texturas HD, oclusión ambiental experimental, carpeta Data\WoL64), GPL-3.0-only: orden y licencias en README-propios.md
 cambios-cliente.diff          lo que los parches cambian FUERA del módulo (16 ficheros), en un solo diff
 Engine/Source/VolFog/         el módulo C++ (pase de niebla, modelo, luces, haces, entradas, volcado, textura INTZ)
 Shaders/VolFog/               los HLSL, el CMake de la cadena fxc -> .bls -> MPQ, LICENSE y NOTICE-modificaciones.txt

@@ -1,0 +1,1306 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b09aa57..96f3b60 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -111,6 +111,8 @@ add_subdirectory(Engine/Source/Tempest)
+ add_subdirectory(Engine/Source/VolFog)
+ # Not in the original client (World of Legends): native post-processing pass (wolAA, wolTonemap), brief E1.
+ add_subdirectory(Engine/Source/WolPost)
++# Not in the original client (World of Legends): native ambient occlusion (wolAO), brief E2.
++add_subdirectory(Engine/Source/WolAO)
+ add_subdirectory(WoW/Common)
+ add_subdirectory(WoW/Source/Battlenet)
+ add_subdirectory(WoW/Source/Console)
+diff --git a/Engine/Source/VolFog/VolFog.h b/Engine/Source/VolFog/VolFog.h
+index 29be74a..9b5ba74 100644
+--- a/Engine/Source/VolFog/VolFog.h
++++ b/Engine/Source/VolFog/VolFog.h
+@@ -54,7 +54,28 @@ namespace VolFog {
+     void SetGodRays(float value);
+     void SetLocalLights(bool value);
+ 
+-    // True when the main depth should be the readable INTZ texture: wolVolFog > 0 and the device reports INTZ. The Gx
++    // Brief E2: wolAO (0-2), set by WolAO::SetMode (the CVar callback in WorldParam_CVar.cpp). It lives here because the readable depth belongs to
++    // this module: wolAO > 0 arms the INTZ depth (and the MSAA + copy mode of B13) exactly like wolVolFog > 0, with the fog off.
++    extern int32_t s_aoMode;
++
++    // Brief E2: somebody wants the readable depth: the fog (wolVolFog > 0) or the ambient occlusion (wolAO > 0). Replaces `s_mode > 0` in the four
++    // places of VolFogDepth.cpp that decide on the INTZ texture; Armed() and the fog pass keep looking at wolVolFog alone.
++    bool DepthWanted();
++
++    // Brief E2: the CVar callbacks of wolVolFog and wolAO call it after writing their value: when the depth that is wanted now differs from the one
++    // the device was built with, it says "<cvarName>: pendiente de gxRestart" (console, through Message(), and gx.log).
++    void NoteDepthWantChanged(const char* cvarName);
++
++    // Brief E2: the constants of the depth mapping of the world, c2 = cViewToNdc (projection x scale, y scale, x offset, y offset) and c3 =
++    // cDepthToViewZ (depth at infinite z, depth per 1 / viewZ, far plane of the projection, deepest world depth), from the projection and the viewport
++    // Z range the world was drawn with (0..0.94 inside CGWorldFrame::OnWorldRender). Factored out of the debug pass of the fog; the AO uses it too.
++    void WorldDepthConstants(float c2[4], float c3[4]);
++
++    // Brief E2: the world frame counter. CGWorldFrame::OnWorldRender calls NoteWorldFrame() when it starts; ResolveDepth() resolves the multisampled
++    // depth once per world frame (the AO and the fog both ask for it in the copy mode, whichever comes first does the work).
++    void NoteWorldFrame();
++
++    // True when the main depth should be the readable INTZ texture: DepthWanted() (wolVolFog > 0 or wolAO > 0) and the device reports INTZ. The Gx
+     // backends ask it in ISetPresentParms (to drop MSAA) and in IStateSetD3DDefaults (to create the texture).
+     bool WantsReadableDepth();
+ 
+@@ -89,7 +110,7 @@ namespace VolFog {
+     bool DepthIsCopy();
+ 
+     // Brief B13: refreshes the INTZ copy from the multisampled depth. Called first thing in Render(), at the same point of the frame the
+-    // fog always read the depth at. It changes raw device state (texture 0, shaders, three render states and the RESZ point size) and puts
++    // fog always read the depth at. Brief E2: once per world frame (NoteWorldFrame), so the AO can resolve before the fog and the fog finds it done. It changes raw device state (texture 0, shaders, three render states and the RESZ point size) and puts
+     // all of it back with a state block, so the client's render-state cache stays true. No-op unless DepthIsCopy().
+     void ResolveDepth();
+ 
+diff --git a/Engine/Source/VolFog/VolFogDepth.cpp b/Engine/Source/VolFog/VolFogDepth.cpp
+index 3b0c227..8bfbdb5 100644
+--- a/Engine/Source/VolFog/VolFogDepth.cpp
++++ b/Engine/Source/VolFog/VolFogDepth.cpp
+@@ -3,6 +3,9 @@
+ #include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
+ #include "Engine/Source/Gx/CGxTex.h"
+ #include "Engine/Source/Gx/CGxTexFlags.h"
++#include "Engine/Source/Gx/Gx.h"
++#include "Engine/Source/Tempest/C44Matrix.h"
++#include <cstdio>
+ 
+ #if defined(_WIN32)
+ #include <d3d9.h>
+@@ -15,6 +18,7 @@
+ // so there DepthTexture() stays nullptr and the pass reports "no depth".
+ 
+ int32_t VolFog::s_mode;
++int32_t VolFog::s_aoMode; // brief E2
+ VolFog::MessageHook VolFog::s_messageHook;
+ bool VolFog::s_noDepthWarned;
+ 
+@@ -37,8 +41,73 @@ namespace {
+     uint32_t s_resolveFailures;
+ }
+ 
++bool VolFog::DepthWanted() {
++    return VolFog::s_mode > 0 || VolFog::s_aoMode > 0;
++}
++
+ bool VolFog::WantsReadableDepth() {
+-    return VolFog::s_mode > 0 && VolFog::s_caps.intz;
++    return VolFog::DepthWanted() && VolFog::s_caps.intz;
++}
++
++// Brief E2: the depth that is wanted now (wolVolFog or wolAO) against the one the device holds; a difference needs a gxRestart. The same lines as the
++// check that lived in the callback of wolVolFog (WorldParam_CVar.cpp), which calls this now as well.
++void VolFog::NoteDepthWantChanged(const char* cvarName) {
++    const bool wantsDepth = VolFog::DepthWanted() && VolFog::s_caps.intz;
++    const bool hasDepth = VolFog::DepthTexture() != nullptr;
++
++    if (wantsDepth != hasDepth) {
++        char line[96];
++        snprintf(line, sizeof(line), "%s: pendiente de gxRestart", cvarName);
++        VolFog::Message(line);
++        CGxDevice::Log("%s", static_cast<const char*>(line));
++    }
++}
++
++// Brief E2: c2 / c3 of the register contract (README-niebla.md) from the projection the world was drawn with and its viewport depth range
++// (World.cpp: z 0..0.94). The projection is the GL-style matrix of GxuXformCreateProjection_Exact: ndc z = c2 + d2 / z, and the depth buffer
++// holds minZ + (maxZ - minZ) * (ndc z + 1) / 2, so  depth = x + y / viewZ  with x = c3.x and y = c3.y (y < 0). Moved here from DebugPass
++// (VolFogRender.cpp) without changes of behaviour.
++void VolFog::WorldDepthConstants(float c2[4], float c3[4]) {
++    C44Matrix projection;
++    GxXformProjection(projection);
++
++    float minX = 0.0f;
++    float maxX = 0.0f;
++    float minY = 0.0f;
++    float maxY = 0.0f;
++    float minZ = 0.0f;
++    float maxZ = 0.0f;
++    GxXformViewport(minX, maxX, minY, maxY, minZ, maxZ);
++
++    if (!(maxZ - minZ > 0.0001f) || minZ < 0.0f || maxZ > 1.0f) {
++        minZ = 0.0f;
++        maxZ = 1.0f;
++    }
++
++    const float extent = maxZ - minZ;
++    c2[0] = projection.a0;
++    c2[1] = projection.b1;
++    c2[2] = projection.c0;
++    c2[3] = projection.c1;
++    c3[0] = minZ + extent * (1.0f + projection.c2) * 0.5f;
++    c3[1] = extent * projection.d2 * 0.5f;
++    c3[2] = 5000.0f;
++    c3[3] = maxZ;
++
++    if (projection.c2 > 1.0f && projection.d2 < 0.0f) {
++        // Far plane of the projection. The final fog uses max(5000, farclip) here; the debug view normalises by the far plane so that
++        // the gradient shows up (design brief B3).
++        c3[2] = projection.d2 / (1.0f - projection.c2);
++    }
++}
++
++namespace {
++    uint32_t s_worldFrame;                      // brief E2: bumped by NoteWorldFrame at the start of every world frame
++    uint32_t s_resolvedFrame = 0xFFFFFFFFu;     // the world frame ResolveDepth last worked on
++}
++
++void VolFog::NoteWorldFrame() {
++    s_worldFrame++;
+ }
+ 
+ void VolFog::Message(const char* line) {
+@@ -60,7 +129,7 @@ static uint32_t RoundUpToPow2(uint32_t value) {
+ }
+ 
+ bool VolFog::WantsReadableDepthFor(IDirect3D9* d3d, uint32_t backBufferFormat) {
+-    if (VolFog::s_mode <= 0 || !d3d) {
++    if (!VolFog::DepthWanted() || !d3d) {
+         return false;
+     }
+ 
+@@ -429,7 +498,7 @@ bool VolFog::PrepareMsaaCopy(IDirect3D9* d3d, uint32_t backBufferFormat, bool wi
+ 
+     *message = s_noResz;
+ 
+-    if (VolFog::s_mode <= 0 || !d3d || !depthFormat) {
++    if (!VolFog::DepthWanted() || !d3d || !depthFormat) {
+         return false;
+     }
+ 
+@@ -487,10 +556,17 @@ bool VolFog::DepthIsCopy() {
+ }
+ 
+ void VolFog::ResolveDepth() {
+-    if (!s_copyMode || !s_texture || !s_device || !s_block || VolFog::s_mode <= 0) {
++    if (!s_copyMode || !s_texture || !s_device || !s_block || !VolFog::DepthWanted()) {
++        return;
++    }
++
++    // Brief E2: once per world frame. The AO (late mode) and the fog both call this in the copy mode; the first one does the work. A resolve that
++    // failed is not tried again in the same frame either, so the failure count below is a count of frames.
++    if (s_resolvedFrame == s_worldFrame) {
+         return;
+     }
+ 
++    s_resolvedFrame = s_worldFrame;
+     bool ok = VolFog::ReszResolve(s_device, s_texture, s_block);
+ 
+ #if defined(WOL_NVAPI)
+diff --git a/Engine/Source/VolFog/VolFogRender.cpp b/Engine/Source/VolFog/VolFogRender.cpp
+index 62ac949..2953b54 100644
+--- a/Engine/Source/VolFog/VolFogRender.cpp
++++ b/Engine/Source/VolFog/VolFogRender.cpp
+@@ -65,39 +65,9 @@ namespace {
+             float c3[4] = { 0.0f, 0.0f, 5000.0f, 0.94f };
+             float c4[4] = { this->m_raysGain, 0.0f, 0.0f, 0.0f };
+ 
+-            // Contract of the design (section 3) from the projection the world was drawn with and its viewport depth range
+-            // (World.cpp: z 0..0.94). The projection is the GL-style matrix of GxuXformCreateProjection_Exact: ndc z = c2 + d2 / z, and the
+-            // depth buffer holds minZ + (maxZ - minZ) * (ndc z + 1) / 2, so  depth = x + y / viewZ  with x = c3.x and y = c3.y (y < 0).
+-            C44Matrix projection;
+-            GxXformProjection(projection);
+-
+-            float minX = 0.0f;
+-            float maxX = 0.0f;
+-            float minY = 0.0f;
+-            float maxY = 0.0f;
+-            float minZ = 0.0f;
+-            float maxZ = 0.0f;
+-            GxXformViewport(minX, maxX, minY, maxY, minZ, maxZ);
+-
+-            if (!(maxZ - minZ > 0.0001f) || minZ < 0.0f || maxZ > 1.0f) {
+-                minZ = 0.0f;
+-                maxZ = 1.0f;
+-            }
+-
+-            float extent = maxZ - minZ;
+-            c2[0] = projection.a0;
+-            c2[1] = projection.b1;
+-            c2[2] = projection.c0;
+-            c2[3] = projection.c1;
+-            c3[0] = minZ + extent * (1.0f + projection.c2) * 0.5f;
+-            c3[1] = extent * projection.d2 * 0.5f;
+-            c3[3] = maxZ;
+-
+-            if (projection.c2 > 1.0f && projection.d2 < 0.0f) {
+-                // Far plane of the projection. The final fog uses max(5000, farclip) here; the debug view normalises by the far plane so that
+-                // the gradient shows up (design brief B3).
+-                c3[2] = projection.d2 / (1.0f - projection.c2);
+-            }
++            // Contract of the design (section 3) from the projection the world was drawn with and its viewport depth range (World.cpp: z 0..0.94).
++            // Brief E2: the computation moved to VolFog::WorldDepthConstants (VolFogDepth.cpp), shared with the ambient occlusion; same values.
++            VolFog::WorldDepthConstants(c2, c3);
+ 
+             this->Begin();
+ 
+diff --git a/Engine/Source/WolAO/CMakeLists.txt b/Engine/Source/WolAO/CMakeLists.txt
+new file mode 100644
+index 0000000..e510f37
+--- /dev/null
++++ b/Engine/Source/WolAO/CMakeLists.txt
+@@ -0,0 +1,16 @@
++file(GLOB_RECURSE PRIVATE_SOURCES CONFIGURE_DEPENDS "*.cpp")
++
++add_library(WolAO STATIC
++    ${PRIVATE_SOURCES}
++)
++
++target_include_directories(WolAO
++    PUBLIC
++        ${CMAKE_SOURCE_DIR}
++)
++
++# Not in the original client (World of Legends): the passes are VolFog::Pass (quad, shaders from patch-Z.MPQ) over the INTZ depth of the fog module, so it links it.
++target_link_libraries(WolAO
++    PUBLIC
++        VolFog
++)
+diff --git a/Engine/Source/WolAO/WolAO.cpp b/Engine/Source/WolAO/WolAO.cpp
+new file mode 100644
+index 0000000..171274d
+--- /dev/null
++++ b/Engine/Source/WolAO/WolAO.cpp
+@@ -0,0 +1,61 @@
++#include "Engine/Source/WolAO/WolAO.h"
++#include "Engine/Source/WolAO/WolAOInternal.h"
++#include "Engine/Source/VolFog/VolFog.h"
++
++// Not in the original client (World of Legends): native ambient occlusion (wolAO), brief E2. The settings of the CVars and the choice between the
++// mid frame and the late frame position; the passes are in WolAORender.cpp.
++
++namespace {
++    WolAO::Settings s_settings;
++    uint32_t s_generation;      // bumped by SetMode / SetDebug: a change of a CVar gives the pass a clean slate after a failure
++}
++
++const WolAO::Settings& WolAO::GetSettings() {
++    return s_settings;
++}
++
++void WolAO::SetMode(int32_t value) {
++    s_settings.mode = value;
++    VolFog::s_aoMode = value; // the INTZ depth is armed with wolAO > 0, like with wolVolFog > 0
++    s_generation++;
++}
++
++void WolAO::SetRadius(float value) {
++    s_settings.radius = value;
++}
++
++void WolAO::SetStrength(float value) {
++    s_settings.strength = value;
++}
++
++void WolAO::SetDebug(int32_t value) {
++    s_settings.debug = value;
++    s_generation++;
++}
++
++bool WolAO::Active() {
++    return s_settings.mode > 0;
++}
++
++uint32_t WolAO::Generation() {
++    return s_generation;
++}
++
++// aoLate of the design: the depth is a RESZ copy of the multisampled one (the copy costs a resolve) and the fog is on (it resolves too, late).
++bool WolAO::LateMode() {
++    return VolFog::DepthIsCopy() && VolFog::s_mode > 0;
++}
++
++void WolAO::RenderMid() {
++    if (WolAO::Active() && !WolAO::LateMode()) {
++        WolAO::Draw(false);
++    } else if (!WolAO::Active()) {
++        WolAO::Idle();
++    }
++}
++
++void WolAO::RenderLate() {
++    if (WolAO::Active() && WolAO::LateMode()) {
++        WolAO::Draw(true);
++    }
++}
+diff --git a/Engine/Source/WolAO/WolAO.h b/Engine/Source/WolAO/WolAO.h
+new file mode 100644
+index 0000000..7bad204
+--- /dev/null
++++ b/Engine/Source/WolAO/WolAO.h
+@@ -0,0 +1,36 @@
++#ifndef ENGINE_SOURCE_WOLAO_WOLAO_H
++#define ENGINE_SOURCE_WOLAO_WOLAO_H
++
++#include <cstdint>
++
++// Not in the original client (World of Legends): native ambient occlusion (HBAO at half resolution over the INTZ depth), brief E2.
++// Licensed under GPL-3.0-only. Shaders/WolAO/WolAO.hlsl implements the occlusion term of the horizon-based family from the published paper.
++
++namespace WolAO {
++    // The CVars of the pass (WorldParam_CVar.cpp validates them and writes here; Render* reads them every frame, so a change applies at once,
++    // except that going between wolAO 0 and above 0 needs a gxRestart when the readable depth was not armed: see VolFog::NoteDepthWantChanged).
++    struct Settings {
++        int32_t mode = 0;           // wolAO 0-2: 0 off, 1 half resolution with 4 steps per direction, 2 half resolution with 6 steps and a wider blur
++        float radius = 1.5f;        // wolAORadius 0.5-4.0 yards
++        float strength = 1.0f;      // wolAOStrength 0.0-2.0
++        int32_t debug = 0;          // wolAODebug 0-3: 0 off, 1 the multiplier in grey, 2 the raw AO (no blur), 3 the normals rebuilt from the depth
++    };
++
++    const Settings& GetSettings();
++    // Also writes VolFog::s_aoMode: the readable depth belongs to the fog module.
++    void SetMode(int32_t value);
++    void SetRadius(float value);
++    void SetStrength(float value);
++    void SetDebug(int32_t value);
++
++    // True when Render* has something to draw (wolAO above 0).
++    bool Active();
++
++    // The AO runs "mid frame" (RenderMid, right after RenderDetailDoodads: before the water, the transparent M2s, the weather and the particles, so
++    // those are not darkened) unless the depth is a RESZ copy of the multisampled depth and the fog is on: then it runs "late" (RenderLate, right
++    // before VolFog::Render) and shares the one resolve of the frame with it. Exactly one of the two draws in a given frame.
++    void RenderMid();
++    void RenderLate();
++}
++
++#endif
+diff --git a/Engine/Source/WolAO/WolAOInternal.h b/Engine/Source/WolAO/WolAOInternal.h
+new file mode 100644
+index 0000000..f8f62a2
+--- /dev/null
++++ b/Engine/Source/WolAO/WolAOInternal.h
+@@ -0,0 +1,19 @@
++#ifndef ENGINE_SOURCE_WOLAO_WOLAOINTERNAL_H
++#define ENGINE_SOURCE_WOLAO_WOLAOINTERNAL_H
++
++#include <cstdint>
++
++// Not in the original client (World of Legends): native ambient occlusion (wolAO), brief E2. Between WolAO.cpp (settings) and WolAORender.cpp (passes).
++
++namespace WolAO {
++    // Bumped when wolAO or wolAODebug change.
++    uint32_t Generation();
++    // The depth is a RESZ copy and the fog is on: the AO draws late (RenderLate) instead of mid frame (RenderMid).
++    bool LateMode();
++    // Runs the three low resolution passes and the composition. `late` only says which position of the frame it is, for the log.
++    void Draw(bool late);
++    // wolAO 0: releases the targets (cost zero: no draw, no memory).
++    void Idle();
++}
++
++#endif
+diff --git a/Engine/Source/WolAO/WolAORender.cpp b/Engine/Source/WolAO/WolAORender.cpp
+new file mode 100644
+index 0000000..de4ffe1
+--- /dev/null
++++ b/Engine/Source/WolAO/WolAORender.cpp
+@@ -0,0 +1,391 @@
++#include "Engine/Source/WolAO/WolAO.h"
++#include "Engine/Source/WolAO/WolAOInternal.h"
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include "Engine/Source/ConsoleBase/IConsole.h"
++#include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
++#include "Engine/Source/Gx/CGxTex.h"
++#include "Engine/Source/Gx/CGxTexFlags.h"
++#include "Engine/Source/Gx/Gx.h"
++#include "Engine/Source/ShaderEffect/ShaderEffect.h"
++#include "Engine/Source/Tempest/CRect.h"
++#include "Engine/Source/VolFog/VolFog.h"
++#include "Engine/Source/VolFog/VolFogPass.h"
++
++// Not in the original client (World of Legends): native ambient occlusion (wolAO), brief E2.
++// Licensed under GPL-3.0-only. Same plumbing as the fog and WolPost (VolFog::Pass: quad in clip space, shaders from Data\patch-Z.MPQ).
++//
++// Per frame (Draw): AO into a half resolution target (INTZ depth -> target 0), a horizontal and a vertical bilateral blur (0 -> 1 -> 2) and a
++// composition over the world viewport of the back buffer with GxBlend_Mod (DESTCOLOR * src + 0: no copy of the scene), or, with wolAODebug,
++// an opaque view of the multiplier / the raw AO / the normals. The sky (depth >= 0.95) is left alone, and so is the interface: the pass runs inside
++// CGWorldFrame::OnWorldRender, long before the 3D names and the UI.
++
++namespace {
++    // The slowest shader is WolAO.bls QUALITY 2 at 248 instruction slots (fxc); every ps_3_0 device declares at least 512.
++    constexpr uint32_t kMinPs30Slots = 512;
++    constexpr uint32_t kMaxFailures = 3;
++    constexpr uint32_t kConstants = 8;              // c0-c7
++    constexpr float kMaxRadiusPx = 48.0f;           // design: largest sphere of influence on the screen, in full resolution pixels
++    constexpr float kFadeStart = 120.0f;            // yards: the AO fades out between these two distances
++    constexpr float kFadeEnd = 250.0f;
++    constexpr float kBias = 0.1f;                   // angular bias of the occlusion term (cos of the angle at which a sample starts to count)
++    constexpr float kGain = 5.0f;                   // scales the mean occlusion of the samples to the darkening of a concave corner (measured: 2.0 gave a 1 % drop of the lower third)
++    constexpr float kBlurSharpness = 20.0f;         // weight of the blur taps: exp(-|dz| / z * 20)
++    constexpr float kUpsampleSharpness = 60.0f;     // weight of the up-sampling taps: exp(-|dz| / z * 60)
++    constexpr uint32_t kDirections = 8;
++
++    void Say(const char* message) {
++        ConsoleWrite(message, DEFAULT_COLOR);
++        CGxDevice::Log("%s", message); // message is a const char*: a char* would pick the va_list overload
++    }
++
++    void NullTexFunc(EGxTexCommand command, uint32_t width, uint32_t height, uint32_t face, uint32_t level, void* userArg, uint32_t& texelStrideInBytes, const void*& texels) {
++    }
++
++    class AoPass : public VolFog::Pass {
++        public:
++        AoPass(const char* pixelName, uint32_t permutations, EGxBlend blend) : VolFog::Pass(pixelName, permutations, "WolVolFogQuad", blend) {}
++
++        void Execute() override {}
++
++        // One draw of the quad with c0-c7 = `constants`, s0 = `depth`, s1 = `source`. `target` is a low resolution texture drawn whole; nullptr means the
++        // world viewport of the back buffer (the viewport the caller left set). False when the device could not make the target.
++        bool Draw(CGxTex* target, uint32_t permutation, const float (*constants)[4], CGxTex* depth, CGxTex* source) {
++            this->SetPixelPermutation(permutation);
++            this->Begin();
++
++            if (target) {
++                GxRenderTargetSet(GxBuffers_Color, target, 0);
++
++                if (target->m_needsCreation) {
++                    // The device could not make the texture: nothing must be drawn (the colour target would still be the back buffer).
++                    GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++                    this->End();
++
++                    return false;
++                }
++
++                GxXformSetViewport(0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f);
++            }
++
++            GxRsSet(GxRs_ColorWrite, 15);
++            GxRsSet(GxRs_ScissorTest, 0);
++
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, &constants[0][0], kConstants);
++            GxRsSet(GxRs_Texture0, static_cast<void*>(depth));  // sDepth: POINT, CLAMP (flags of the wrapper)
++            GxRsSet(GxRs_Texture1, static_cast<void*>(source)); // sAO: POINT, CLAMP (flags of the targets)
++
++            this->DrawQuad();
++
++            if (target) {
++                GxRenderTargetSet(GxBuffers_Color, nullptr, 0);
++            }
++
++            this->End();
++
++            return true;
++        }
++    };
++
++    struct AoState {
++        const CGxDevice* device;
++        AoPass* ao;             // WolAO.bls (permutation quality - 1), drawn into target 0
++        AoPass* blur;           // WolAOBlur.bls (permutation wide), drawn into targets 1 and 2
++        AoPass* composite;      // WolAOComposite.bls permutation 0, GxBlend_Mod
++        AoPass* debug;          // WolAOComposite.bls permutations 1-3, GxBlend_Opaque
++        CGxTex* target[3];
++        uint32_t lowWidth;
++        uint32_t lowHeight;
++        uint32_t epoch;
++        uint32_t seenGeneration;
++        uint32_t consecutiveFailures;
++        bool disabled;          // failed for good (shaders, caps, targets) until a CVar or the device changes
++        bool noDepthSaid;
++        int32_t lastPosition;   // 0 mid, 1 late, -1 none yet: only for the log
++        int32_t lastQuality;
++    };
++
++    AoState s_ao = { nullptr, nullptr, nullptr, nullptr, nullptr, { nullptr, nullptr, nullptr }, 0, 0, 0, 0, 0, false, false, -1, 0 };
++
++    void DestroyTargets() {
++        for (CGxTex*& target : s_ao.target) {
++            if (target) {
++                GxTexDestroy(target);
++                target = nullptr;
++            }
++        }
++
++        s_ao.lowWidth = 0;
++        s_ao.lowHeight = 0;
++    }
++
++    // Three half float targets (R = AO, G = view depth in yards), exact size, POINT filter, CLAMP; render targets of the device (it releases them on a
++    // reset and makes them again when they are next used).
++    bool EnsureTargets(uint32_t lowWidth, uint32_t lowHeight) {
++        if (s_ao.target[0] && s_ao.target[1] && s_ao.target[2] && s_ao.lowWidth == lowWidth && s_ao.lowHeight == lowHeight) {
++            return true;
++        }
++
++        DestroyTargets();
++
++        static const char* const s_names[3] = { "WolAO raw", "WolAO blur 1", "WolAO blur 2" };
++        CGxTexFlags flags(GxTex_Nearest, 0, 0, 0, 0, 1, 1, 0, 0, 0);
++
++        for (int i = 0; i < 3; i++) {
++            CGxTex* texture = nullptr;
++
++            if (!GxTexCreate(GxTex_NonPow2, lowWidth, lowHeight, 0, GxTex_Abgr16F, GxTex_Abgr16F, flags, nullptr, NullTexFunc, s_names[i], texture) || !texture) {
++                DestroyTargets();
++
++                return false;
++            }
++
++            s_ao.target[i] = texture;
++        }
++
++        s_ao.lowWidth = lowWidth;
++        s_ao.lowHeight = lowHeight;
++
++        char line[96];
++        std::snprintf(line, sizeof(line), "WolAO: targets %ux%u ABGR16F x3", lowWidth, lowHeight);
++        CGxDevice::Log("%s", static_cast<const char*>(line));
++
++        return true;
++    }
++
++    // The failure policy of the fog (design 1.3): say it once, draw nothing, touch nothing else, and wait for a CVar or a device change.
++    void Disable(const char* message) {
++        if (!s_ao.disabled) {
++            s_ao.disabled = true;
++            Say(message);
++        }
++    }
++}
++
++void WolAO::Idle() {
++    // Cost zero: no draw, and the targets do not stay in video memory.
++    if (s_ao.target[0]) {
++        DestroyTargets();
++    }
++
++    s_ao.lastPosition = -1;
++}
++
++void WolAO::Draw(bool late) {
++    if (!g_theGxDevicePtr) {
++        return;
++    }
++
++    const WolAO::Settings& settings = WolAO::GetSettings();
++
++    // A change of wolAO / wolAODebug or a rebuilt device (gxRestart, resize, reset) gives the pass a clean slate.
++    if (s_ao.seenGeneration != WolAO::Generation() || s_ao.epoch != VolFog::DeviceEpoch() || s_ao.device != g_theGxDevicePtr) {
++        s_ao.seenGeneration = WolAO::Generation();
++        s_ao.epoch = VolFog::DeviceEpoch();
++        s_ao.consecutiveFailures = 0;
++        s_ao.disabled = false;
++        s_ao.noDepthSaid = false;
++        s_ao.lastPosition = -1;
++
++        if (s_ao.device != g_theGxDevicePtr) {
++            // The device that owned the textures and the shaders is gone (gxApi change): they went with it.
++            for (CGxTex*& target : s_ao.target) {
++                target = nullptr;
++            }
++
++            s_ao.lowWidth = 0;
++            s_ao.lowHeight = 0;
++            s_ao.ao = nullptr;
++            s_ao.blur = nullptr;
++            s_ao.composite = nullptr;
++            s_ao.debug = nullptr;
++            s_ao.device = g_theGxDevicePtr;
++        }
++    }
++
++    if (s_ao.disabled) {
++        return;
++    }
++
++    // The fog says it cannot work with this device or this depth: neither can the AO. Wireframe (the polygon fill is off for the whole world pass): the
++    // quad would be drawn as lines. The world drawn into a texture (not the back buffer): not the picture of the player, leave it alone.
++    if (VolFog::HardFailure() || !g_theGxDevicePtr->MasterEnable(GxMasterEnable_PolygonFill)) {
++        return;
++    }
++
++    CGxTex* renderTarget = nullptr;
++    g_theGxDevicePtr->DeviceGetRenderTarget(GxBuffers_Color, renderTarget);
++
++    if (renderTarget) {
++        return;
++    }
++
++    CGxTex* depth = VolFog::DepthTex();
++
++    if (!depth || !VolFog::DepthWidth() || !VolFog::DepthHeight()) {
++        // wolAO is on but there is no readable depth yet (waiting for gxRestart, or the card has no INTZ): the callback of the CVar already said so.
++        if (!s_ao.noDepthSaid) {
++            s_ao.noDepthSaid = true;
++            CGxDevice::Log("WolAO: there is no readable INTZ depth (wolAO needs a gxRestart, and a video card that reports INTZ); nothing is drawn.");
++        }
++
++        return;
++    }
++
++    if (VolFog::s_caps.ps30Slots < kMinPs30Slots || !VolFog::s_caps.abgr16f || !g_theGxDevicePtr->Caps().m_texTarget[GxTex_NonPow2]) {
++        Disable("WolAO: this video card cannot run the ambient occlusion (it needs ps_3_0 with 512 instruction slots, A16B16G16R16F render targets and non power of two textures); wolAO does nothing.");
++
++        return;
++    }
++
++    if (!s_ao.ao) {
++        // Created on first use and kept for the whole run; the shaders belong to the device and go with it.
++        s_ao.ao = new AoPass("WolAO", 2, GxBlend_Opaque);
++        s_ao.blur = new AoPass("WolAOBlur", 2, GxBlend_Opaque);
++        s_ao.composite = new AoPass("WolAOComposite", 4, GxBlend_Alpha); // black with alpha = 1 - multiplier: dest * multiplier
++        s_ao.debug = new AoPass("WolAOComposite", 4, GxBlend_Opaque);
++    }
++
++    const uint32_t quality = static_cast<uint32_t>(std::clamp(settings.mode, 1, 2));
++    const int32_t debugMode = std::clamp(settings.debug, 0, 3);
++    AoPass* const finish = debugMode > 0 ? s_ao.debug : s_ao.composite;
++
++    s_ao.ao->SetPixelPermutation(quality - 1);
++    s_ao.blur->SetPixelPermutation(quality - 1);
++    finish->SetPixelPermutation(static_cast<uint32_t>(debugMode));
++
++    if (!s_ao.ao->Valid() || !s_ao.blur->Valid() || !finish->Valid()) {
++        Disable("WolAO: the shaders WolAO / WolAOBlur / WolAOComposite are not valid (is Data\\patch-Z.MPQ up to date, and does the video card support ps_3_0?); wolAO does nothing.");
++
++        return;
++    }
++
++    // The world viewport that CGWorldFrame::OnWorldRender left set, in pixels from the top-left corner of the back buffer (Gx viewport y grows
++    // upwards; D3D9 viewport y is (1 - maxY) * height, CGxDeviceD3d::IXformSetViewport). The same conversion as the fog and WolPost.
++    CRect window = { 0.0f, 0.0f, 0.0f, 0.0f };
++    g_theGxDevicePtr->CapsWindowSize(window);
++
++    const float windowWidth = window.maxX - window.minX;
++    const float windowHeight = window.maxY - window.minY;
++
++    if (windowWidth <= 0.0f || windowHeight <= 0.0f) {
++        return;
++    }
++
++    float minX = 0.0f;
++    float maxX = 0.0f;
++    float minY = 0.0f;
++    float maxY = 0.0f;
++    float minZ = 0.0f;
++    float maxZ = 0.0f;
++    GxXformViewport(minX, maxX, minY, maxY, minZ, maxZ);
++
++    int32_t x = static_cast<int32_t>(std::floor(minX * windowWidth + 0.5f));
++    int32_t y = static_cast<int32_t>(std::floor((1.0f - maxY) * windowHeight + 0.5f));
++    int32_t width = static_cast<int32_t>(std::floor((maxX - minX) * windowWidth + 0.5f));
++    int32_t height = static_cast<int32_t>(std::floor((maxY - minY) * windowHeight + 0.5f));
++
++    x = std::max(x, 0);
++    y = std::max(y, 0);
++    width = std::min(width, static_cast<int32_t>(windowWidth) - x);
++    height = std::min(height, static_cast<int32_t>(windowHeight) - y);
++
++    if (width < 16 || height < 16) {
++        return;
++    }
++
++    const uint32_t lowWidth = static_cast<uint32_t>((width + 1) / 2);
++    const uint32_t lowHeight = static_cast<uint32_t>((height + 1) / 2);
++
++    if (!EnsureTargets(lowWidth, lowHeight)) {
++        Disable("WolAO: the half resolution targets (A16B16G16R16F) could not be created; wolAO does nothing.");
++
++        return;
++    }
++
++    // The depth: in the copy mode (MSAA) it is refreshed from the multisampled depth here, once per world frame (the fog finds it done).
++    if (VolFog::DepthIsCopy()) {
++        VolFog::ResolveDepth();
++    }
++
++    if (s_ao.lastPosition != (late ? 1 : 0) || s_ao.lastQuality != static_cast<int32_t>(quality)) {
++        s_ao.lastPosition = late ? 1 : 0;
++        s_ao.lastQuality = static_cast<int32_t>(quality);
++
++        const char* const where = late ? "late (right before the fog, sharing the RESZ resolve of the frame)" : "mid frame (right after the opaque world, before the water and the particles)";
++        const char* const depthMode = VolFog::DepthIsCopy() ? "MSAA+copy" : "main depth";
++        CGxDevice::Log("WolAO: wolAO %d, %s, depth: %s, %ux%u -> %ux%u", static_cast<int>(quality), where, depthMode, static_cast<unsigned>(width), static_cast<unsigned>(height), lowWidth, lowHeight);
++    }
++
++    // The contract of the registers (Shaders/WolAO/WolAO.hlsl). c2 / c3 from the projection and the viewport Z of the world (0..0.94 here).
++    float c[kConstants][4] = {};
++    float depthC2[4];
++    float depthC3[4];
++    VolFog::WorldDepthConstants(depthC2, depthC3);
++
++    const float radius = std::max(settings.radius, 0.05f);
++    const float steps = quality == 2 ? 6.0f : 4.0f;
++
++    c[0][0] = static_cast<float>(x);
++    c[0][1] = static_cast<float>(y);
++    c[0][2] = static_cast<float>(width);
++    c[0][3] = static_cast<float>(height);
++    c[1][0] = 1.0f / static_cast<float>(lowWidth);
++    c[1][1] = 1.0f / static_cast<float>(lowHeight);
++    c[1][2] = 1.0f / static_cast<float>(VolFog::DepthWidth());
++    c[1][3] = 1.0f / static_cast<float>(VolFog::DepthHeight());
++    std::memcpy(c[2], depthC2, sizeof(depthC2));
++    std::memcpy(c[3], depthC3, sizeof(depthC3));
++    c[4][0] = radius;
++    c[4][1] = 1.0f / (radius * radius);
++    c[4][2] = kBias;
++    c[4][3] = settings.strength * kGain / (static_cast<float>(kDirections) * steps);
++    c[5][0] = kMaxRadiusPx;
++    c[5][2] = kFadeStart;
++    c[5][3] = 1.0f / (kFadeEnd - kFadeStart);
++
++    // The linear fog of the client (factor = saturate(x * viewZ + y), 1 = no fog) is in the scene unless the volumetric fog is armed (it then pushes
++    // the client's fog out of range and the factor is 1 everywhere). x = y = 0 means the fog parameters were never set (fixed function path).
++    const C4Vector& fog = CShaderEffect::s_fogParams;
++    c[6][0] = fog.x;
++    c[6][1] = fog.y;
++    c[6][2] = (!VolFog::Armed() && (fog.x != 0.0f || fog.y != 0.0f)) ? 1.0f : 0.0f;
++
++    // The constants the pass overwrites belong to whoever draws next: put them back as they were (mid frame the engine has already uploaded c2 =
++    // the colour of the fog and c3-c12 = the shadows for the passes that come after).
++    float saved[kConstants * 4];
++    std::memcpy(saved, CGxDevice::s_shadowConstants[0].constants, sizeof(saved));
++
++    float blurH[kConstants][4];
++    float blurV[kConstants][4];
++    float finishC[kConstants][4];
++    std::memcpy(blurH, c, sizeof(c));
++    std::memcpy(blurV, c, sizeof(c));
++    std::memcpy(finishC, c, sizeof(c));
++    blurH[7][0] = c[1][0];
++    blurH[7][1] = 0.0f;
++    blurH[7][2] = kBlurSharpness;
++    blurV[7][0] = 0.0f;
++    blurV[7][1] = c[1][1];
++    blurV[7][2] = kBlurSharpness;
++    finishC[7][2] = kUpsampleSharpness;
++
++    bool drawn = s_ao.ao->Draw(s_ao.target[0], quality - 1, c, depth, nullptr);
++    drawn = drawn && s_ao.blur->Draw(s_ao.target[1], quality - 1, blurH, depth, s_ao.target[0]);
++    drawn = drawn && s_ao.blur->Draw(s_ao.target[2], quality - 1, blurV, depth, s_ao.target[1]);
++
++    if (drawn) {
++        // Composition over the world viewport of the back buffer; the debug view 2 shows the raw AO, before the blur.
++        drawn = finish->Draw(nullptr, static_cast<uint32_t>(debugMode), finishC, depth, debugMode == 2 ? s_ao.target[0] : s_ao.target[2]);
++    }
++
++    g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, saved, kConstants);
++
++    if (drawn) {
++        s_ao.consecutiveFailures = 0;
++    } else if (++s_ao.consecutiveFailures >= kMaxFailures) {
++        Disable("WolAO: the targets could not be used three frames in a row; wolAO does nothing until the setting or the video mode changes.");
++    }
++}
+diff --git a/Shaders/VolFog/CMakeLists.txt b/Shaders/VolFog/CMakeLists.txt
+index ba489e8..6b3297e 100644
+--- a/Shaders/VolFog/CMakeLists.txt
++++ b/Shaders/VolFog/CMakeLists.txt
+@@ -130,6 +130,9 @@ volfog_shader(WolVolFogRayComposite ps vf_ray_composite.hlsl)
+ # E1: the post-processing shader (wolAA / wolTonemap) goes into the same patch-Z.MPQ.
+ include(${CMAKE_CURRENT_SOURCE_DIR}/../WolPost/WolPost.cmake)
+ 
++# E2: the ambient occlusion shaders (wolAO) go into the same patch-Z.MPQ.
++include(${CMAKE_CURRENT_SOURCE_DIR}/../WolAO/WolAO.cmake)
++
+ add_custom_command(
+     OUTPUT ${VOLFOG_MPQ}
+     COMMAND "${VOLFOG_PYTHON}" -I ${VOLFOG_MKMPQ} ${VOLFOG_MPQ} ${VOLFOG_STAGE} ${VOLFOG_BLS_FILES}
+diff --git a/Shaders/WolAO/WolAO.cmake b/Shaders/WolAO/WolAO.cmake
+new file mode 100644
+index 0000000..1935ae5
+--- /dev/null
++++ b/Shaders/WolAO/WolAO.cmake
+@@ -0,0 +1,8 @@
++# Not in the original client (World of Legends): the shaders of the native ambient occlusion WolAO (wolAO), brief E2.
++# Included by Shaders/VolFog/CMakeLists.txt right before the patch-Z.MPQ command, like WolPost.cmake: same chain (volfog_shader: fxc ->
++# Tools/VolFog/mkbls.py -> Tools/VolFog/mkmpq.py), same MPQ. CMAKE_CURRENT_SOURCE_DIR is Shaders/VolFog here, hence the ../WolAO.
++# One source, three passes (/D PASS=0|1|2). Permutations: WolAO QUALITY 1 / 2 (index quality - 1); WolAOBlur WIDE 0 / 1; WolAOComposite DEBUG 0..3.
++# The vertex shader is the quad one of the fog (WolVolFogQuad, vf_fullscreen_vs.hlsl).
++volfog_shader(WolAO ps ../WolAO/WolAO.hlsl PERMUTATIONS "PASS=0,QUALITY=1" "PASS=0,QUALITY=2")
++volfog_shader(WolAOBlur ps ../WolAO/WolAO.hlsl PERMUTATIONS "PASS=1,WIDE=0" "PASS=1,WIDE=1")
++volfog_shader(WolAOComposite ps ../WolAO/WolAO.hlsl PERMUTATIONS "PASS=2,DEBUG=0" "PASS=2,DEBUG=1" "PASS=2,DEBUG=2" "PASS=2,DEBUG=3")
+diff --git a/Shaders/WolAO/WolAO.hlsl b/Shaders/WolAO/WolAO.hlsl
+new file mode 100644
+index 0000000..a09942c
+--- /dev/null
++++ b/Shaders/WolAO/WolAO.hlsl
+@@ -0,0 +1,240 @@
++// Not in the original client (World of Legends): pixel shaders of the native ambient occlusion WolAO (wolAO), brief E2.
++// Written for this project (GPL-3.0-only like the rest of the client changes). The occlusion term per sample is the one of the horizon-based
++// family (Bavoil and Sainz, "Image-space horizon-based ambient occlusion", 2008, and the normal-oriented variants that followed):
++//   occlusion(sample) = saturate(dot(N, V) / |V| - bias) * saturate(1 - |V|^2 / R^2),   V = (position of the sample) - (position of the pixel)
++// implemented from the paper, not copied from the code of any SDK. One source, three passes, selected with /D PASS=0|1|2:
++//   PASS 0  WolAO.bls           /D QUALITY=1|2  AO at half resolution: 8 directions x 4 (QUALITY 1) or 6 (QUALITY 2) steps from the INTZ depth,
++//                                               normal rebuilt from the depth (the neighbour with the smaller depth difference on each axis, so a
++//                                               silhouette gives no halo), a rotation and a step jitter per pixel from interleaved gradient noise
++//                                               (Jimenez, 2014). Output R = AO (1 = open), G = view depth in yards (sky 10000).
++//   PASS 1  WolAOBlur.bls       /D WIDE=0|1     separable bilateral blur of the low resolution AO, 9 taps (WIDE=0) or 13 taps (WIDE=1); the step of
++//                                               the pass (horizontal or vertical) comes in c7.xy; the weights fall with the difference of view depth.
++//   PASS 2  WolAOComposite.bls  /D DEBUG=0..3   full resolution: bilateral up-sampling of the four nearest low resolution texels by the view depth of
++//                                               the pixel, fade with the distance and with the linear fog of the client, and the result as a grey
++//                                               multiplier (black with alpha = 1 - multiplier, drawn with GxBlend_Alpha: dest * multiplier). Sky and beyond the
++//                                               world (depth >= 0.95) is left alone. DEBUG 1 = the multiplier in grey (opaque blend), 2 = the raw AO
++//                                               before the blur, 3 = the normal rebuilt from the depth.
++// Register contract (the same registers as the fog where they coincide):
++//   c0 world viewport in pixels (x, y, w, h), c1 (1 / low width, 1 / low height, 1 / INTZ width, 1 / INTZ height), c2 cViewToNdc, c3 cDepthToViewZ,
++//   c4 (R yards, 1 / R^2, bias, strength * gain / samples), c5 (largest radius in pixels, -, fade start yards, 1 / (fade end - fade start)),
++//   c6 (fog x, fog y, use fog 0 / 1, -), c7 (blur step x, blur step y, sharpness, -).  s0 = INTZ depth (POINT), s1 = AO (POINT).
++#ifndef PASS
++#error PASS must be 0, 1 or 2
++#endif
++
++float4 cViewportPx : register(c0);
++float4 cPixelGrid : register(c1);
++float4 cViewToNdc : register(c2);
++float4 cDepthToViewZ : register(c3);
++float4 cAO : register(c4);
++float4 cLimits : register(c5);
++float4 cFog : register(c6);
++float4 cBlur : register(c7);
++sampler2D sDepth : register(s0);
++sampler2D sAO : register(s1);
++
++static const float kSkyMinDepth = 0.95;   // the world uses the depth range 0..0.94: the sky is always above this (design 1.1)
++static const float kSkyViewZ = 10000.0;   // what a sky pixel reports as view depth (still a finite half float)
++
++#if PASS == 0 || (PASS == 2 && DEBUG == 3)
++// View depth in yards of an INTZ value: depth = x + y / viewZ with y < 0 (LinearDepth of vf_common.hlsli).
++float ViewZ(float depth)
++{
++    float denominator = depth - cDepthToViewZ.x;
++    return (depth >= kSkyMinDepth || denominator > -1e-6) ? kSkyViewZ : min(cDepthToViewZ.y / denominator, kSkyViewZ);
++}
++
++// `rel`: pixel centre in pixels from the top left corner of the world viewport.
++float SampleZ(float2 rel)
++{
++    rel = clamp(rel, 0.5, cViewportPx.zw - 0.5);
++    return ViewZ(tex2Dlod(sDepth, float4((cViewportPx.xy + rel) * cPixelGrid.zw, 0, 0)).r);
++}
++
++// Position in view space (x right, y up, z forward) of the pixel at `rel` seen at view depth z.
++float3 ViewPos(float2 rel, float z)
++{
++    float2 ndc = float2(rel.x / cViewportPx.z * 2 - 1, 1 - rel.y / cViewportPx.w * 2);
++    return float3((ndc - cViewToNdc.zw) / cViewToNdc.xy, 1) * z;
++}
++
++// Normal of the surface from the depth: the difference to the neighbour (left or right, up or down) with the smaller depth step.
++float3 RebuildNormal(float2 rel, float zc, float3 pc)
++{
++    float zr = SampleZ(rel + float2(1, 0));
++    float zl = SampleZ(rel - float2(1, 0));
++    float zd = SampleZ(rel + float2(0, 1));
++    float zu = SampleZ(rel - float2(0, 1));
++    float3 dx = abs(zr - zc) < abs(zl - zc) ? ViewPos(rel + float2(1, 0), zr) - pc : pc - ViewPos(rel - float2(1, 0), zl);
++    float3 dy = abs(zd - zc) < abs(zu - zc) ? ViewPos(rel + float2(0, 1), zd) - pc : pc - ViewPos(rel - float2(0, 1), zu);
++    return normalize(cross(dx, dy)); // dx runs to the right and dy down the screen: the normal faces the camera
++}
++#endif
++
++#if PASS == 0
++#ifndef QUALITY
++#error QUALITY must be 1 or 2
++#endif
++#define DIRECTIONS 8
++#if QUALITY == 1
++#define STEPS 4
++#else
++#define STEPS 6
++#endif
++
++float Ign(float2 p)
++{
++    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
++}
++
++float4 main(float2 vpos : VPOS) : COLOR0
++{
++    // The low resolution texel is the full resolution pixel (2x, 2y); `rel` is its centre.
++    float2 rel = min(vpos * 2.0 + 0.5, cViewportPx.zw - 0.5);
++    float zc = SampleZ(rel);
++    float4 result = float4(1, zc, 0, 1);
++
++    if (zc >= kSkyViewZ)
++    {
++        return result;
++    }
++
++    // Radius of the sphere of influence on the screen: yards * (projection scale * half the width) / depth; under 2 pixels there is nothing to see.
++    float radiusPx = min(cAO.x * cViewToNdc.x * 0.5 * cViewportPx.z / zc, cLimits.x);
++
++    if (radiusPx < 2.0)
++    {
++        return result;
++    }
++
++    float3 pc = ViewPos(rel, zc);
++    float3 normal = RebuildNormal(rel, zc, pc);
++    float rotation = Ign(vpos);
++    float jitter = Ign(float2(vpos.y + 7.0, vpos.x * 1.7 + 3.0));
++    float sum = 0;
++
++    [loop] for (int i = 0; i < DIRECTIONS; i++)
++    {
++        float angle = (i + rotation) * (6.2831853 / DIRECTIONS);
++        float2 dir;
++        sincos(angle, dir.y, dir.x);
++
++        [loop] for (int s = 0; s < STEPS; s++)
++        {
++            float2 at = rel + dir * max(radiusPx * ((s + jitter) * (1.0 / STEPS)), 1.5);
++            float zs = SampleZ(at);
++            float3 v = ViewPos(at, zs) - pc;
++            float vv = dot(v, v);
++            sum += saturate(dot(normal, v) * rsqrt(vv + 1e-4) - cAO.z) * saturate(1 - vv * cAO.y);
++        }
++    }
++
++    result.x = saturate(1 - sum * cAO.w);
++
++    return result;
++}
++
++#elif PASS == 1
++#ifndef WIDE
++#error WIDE must be 0 or 1
++#endif
++#if WIDE
++#define TAPS 6
++static const float kSigma = 3.5;
++#else
++#define TAPS 4
++static const float kSigma = 2.5;
++#endif
++
++float4 main(float2 vpos : VPOS) : COLOR0
++{
++    float2 uv = (vpos + 0.5) * cPixelGrid.xy;
++    float4 centre = tex2Dlod(sAO, float4(uv, 0, 0));
++    float sum = centre.x;
++    float weights = 1.0;
++
++    [unroll] for (int i = 1; i <= TAPS; i++)
++    {
++        float gauss = exp(-0.5 * i * i / (kSigma * kSigma));
++        float4 a = tex2Dlod(sAO, float4(uv + cBlur.xy * i, 0, 0));
++        float4 b = tex2Dlod(sAO, float4(uv - cBlur.xy * i, 0, 0));
++        float wa = gauss * exp(-abs(a.y - centre.y) / centre.y * cBlur.z);
++        float wb = gauss * exp(-abs(b.y - centre.y) / centre.y * cBlur.z);
++        sum += a.x * wa + b.x * wb;
++        weights += wa + wb;
++    }
++
++    return float4(sum / weights, centre.y, 0, 1);
++}
++
++#else
++#ifndef DEBUG
++#error DEBUG must be 0, 1, 2 or 3
++#endif
++
++float4 main(float2 vpos : VPOS) : COLOR0
++{
++    float2 rel = vpos - cViewportPx.xy + 0.5;
++
++#if DEBUG == 2
++    // The raw AO, no blur and no up-sampling: the low resolution texel that covers this pixel.
++    float raw = tex2Dlod(sAO, float4((floor(rel * 0.5) + 0.5) * cPixelGrid.xy, 0, 0)).x;
++    return float4(raw, raw, raw, 1);
++#else
++    float zc = tex2Dlod(sDepth, float4((vpos + 0.5) * cPixelGrid.zw, 0, 0)).r;
++    float denominator = zc - cDepthToViewZ.x;
++    bool sky = zc >= kSkyMinDepth || denominator > -1e-6;
++    float viewZ = sky ? kSkyViewZ : min(cDepthToViewZ.y / denominator, kSkyViewZ);
++
++#if DEBUG == 3
++    if (sky)
++    {
++        return float4(0, 0, 0, 1);
++    }
++
++    float3 n = RebuildNormal(rel, viewZ, ViewPos(rel, viewZ));
++    return float4(n * 0.5 + 0.5, 1);
++#else
++    float multiplier = 1.0;
++
++    if (!sky)
++    {
++        // The AO texel i was computed at the full resolution pixel 2i, so the pixel with index p = rel - 0.5 sits at i = p / 2.
++        float2 u = (rel - 0.5) * 0.5;
++        float2 base = floor(u);
++        float2 f = u - base;
++        float sum = 0;
++        float weights = 0;
++
++        [unroll] for (int k = 0; k < 4; k++)
++        {
++            float2 corner = float2((k == 1 || k == 3) ? 1.0 : 0.0, k >= 2 ? 1.0 : 0.0); // ps_3_0 has no bitwise operators
++            float2 axis = lerp(1 - f, f, corner);
++            float4 tap = tex2Dlod(sAO, float4((base + corner + 0.5) * cPixelGrid.xy, 0, 0));
++            float w = axis.x * axis.y * max(exp(-abs(tap.y - viewZ) / viewZ * cBlur.z), 1e-3);
++            sum += tap.x * w;
++            weights += w;
++        }
++
++        float ao = sum / max(weights, 1e-6);
++        float weight = saturate(1 - (viewZ - cLimits.z) * cLimits.w);
++
++        if (cFog.z > 0.5)
++        {
++            weight *= saturate(cFog.x * viewZ + cFog.y); // the linear fog of the client is already in the scene: no AO on what fades into it
++        }
++
++        multiplier = lerp(1, ao, weight);
++    }
++
++#if DEBUG == 1
++    return float4(multiplier, multiplier, multiplier, 1); // opaque view of the multiplier
++#else
++    // The pass is drawn with the alpha blend (SRCALPHA, INVSRCALPHA): black with alpha = 1 - multiplier gives dest * multiplier, the same as
++    // DESTCOLOR * src + 0 (GxBlend_Mod) without relying on the destination colour factor.
++    return float4(0, 0, 0, 1.0 - multiplier);
++#endif
++#endif
++#endif
++}
++#endif
+diff --git a/Tools/WowClient/CMakeLists.txt b/Tools/WowClient/CMakeLists.txt
+index fb5ee1f..279135f 100644
+--- a/Tools/WowClient/CMakeLists.txt
++++ b/Tools/WowClient/CMakeLists.txt
+@@ -56,6 +56,7 @@ target_link_libraries(WowClient
+         Event
+         FFX
+         WolPost
++        WolAO
+         Frame
+         FrameScript
+         lua
+diff --git a/WoW/Source/Ui/WorldFrame.cpp b/WoW/Source/Ui/WorldFrame.cpp
+index 662bd11..f29524c 100644
+--- a/WoW/Source/Ui/WorldFrame.cpp
++++ b/WoW/Source/Ui/WorldFrame.cpp
+@@ -12,6 +12,7 @@
+ #include "Engine/Source/FFX/FFX.h"
+ #include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
+ #include "Engine/Source/WolPost/WolPost.h" // Not in the original client (World of Legends)
++#include "Engine/Source/WolAO/WolAO.h" // Not in the original client (World of Legends)
+ #include "Engine/Source/Frame/CRenderBatch.h"
+ #include "Engine/Source/Frame/CSimpleTop.h"
+ #include "Engine/Source/FrameScript/FrameScript.h"
+@@ -1674,6 +1675,8 @@ void CGWorldFrame::OnWorldRender() {
+     GxRsSet(GxRs_Multisample, 1);
+     CGWorldFrame::UpdateScreenEffectParams();
+     FFX::Start();
++    // Not in the original client (World of Legends): the world frame counter of the readable depth (brief E2: one RESZ resolve per frame).
++    VolFog::NoteWorldFrame();
+ 
+     CRect fullViewport = { 0.0f, 0.0f, 1.0f, 1.0f };
+ 
+@@ -1754,6 +1757,9 @@ void CGWorldFrame::OnWorldRender() {
+     GxuSortDrawList(GxuCat_0, GxuSort_VtxStream, *World::GetCamPos());
+     GxuFlushDrawList(GxuCat_0, *World::GetCamPos());
+     CWorldScene::RenderDetailDoodads();
++    // Not in the original client (World of Legends): native ambient occlusion (wolAO), brief E2. Mid frame: over the opaque world, before the water,
++    // the transparent M2s, the weather and the particles. With the RESZ copy of the depth and the fog on it waits for RenderLate (below).
++    WolAO::RenderMid();
+ 
+     if (World::SceneCamLiquidStatus(nullptr)) {
+         CWorldScene::RenderBarriers(this->m_elapsedSec);
+@@ -1781,6 +1787,9 @@ void CGWorldFrame::OnWorldRender() {
+     GxuSortDrawList(GxuCat_1, GxuSort_B2F, *World::GetCamPos());
+     GxuFlushDrawList(GxuCat_1, *World::GetCamPos());
+     DayNight::RenderGlares();
++    // Not in the original client (World of Legends): the late position of the ambient occlusion (brief E2), only in the MSAA + RESZ copy mode with
++    // the fog on: it shares the one resolve of the depth of the frame with VolFog::Render().
++    WolAO::RenderLate();
+     // Not in the original client (World of Legends): native volumetric fog, drawn before the 3D names so that the text stays sharp.
+     VolFog::Render();
+     // Not in the original client (World of Legends): native post-processing (wolAA, wolTonemap), brief E1. After the fog and before the 3D names, so the
+diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
+index acd0a0d..0e45bb4 100644
+--- a/WoW/Source/WorldClient/WorldParam.h
++++ b/WoW/Source/WorldClient/WorldParam.h
+@@ -58,6 +58,11 @@ class CWorldParam {
+     static CVar* cvar_wolTonemap;
+     static CVar* cvar_wolExposure;
+     static CVar* cvar_wolSaturation;
++    // Not in the original client (World of Legends): native ambient occlusion (brief E2), see patches-cliente/ao-nativo/README-ao.md.
++    static CVar* cvar_wolAO;
++    static CVar* cvar_wolAORadius;
++    static CVar* cvar_wolAOStrength;
++    static CVar* cvar_wolAODebug;
+ 
+     static bool BaseMipCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool BspCacheCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+@@ -109,6 +114,11 @@ class CWorldParam {
+     static bool WolTonemapCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolExposureCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolSaturationCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    // Not in the original client (brief E2): wolAO arms the readable INTZ depth like wolVolFog (a gxRestart when it was not armed); the rest apply at once.
++    static bool WolAOCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolAORadiusCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolAOStrengthCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolAODebugCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     // Not in the original client (brief B3b): registers wolVolFog, wolVolFogDebug and (brief B4) wolVolFogDensity, wolVolFogGodRays and wolVolFogLocalLights. RegisterGxCVars calls it before the Gx device exists.
+     static void RegisterVolFogCVars();
+     static bool TextureFilteringCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index 2afafe0..e6cc03d 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -9,6 +9,7 @@
+ #include "Engine/Source/ShaderEffect/ShadowCache.h"
+ #include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
+ #include "Engine/Source/WolPost/WolPost.h" // Not in the original client (World of Legends)
++#include "Engine/Source/WolAO/WolAO.h" // Not in the original client (World of Legends)
+ #include "WoW/Source/WorldClient/VolFogWorld.h" // Not in the original client (World of Legends)
+ #include "WoW/Common/AaBsp.h"
+ #include "WoW/Source/UIUtil/PortraitButton.h"
+@@ -138,6 +139,12 @@ CVar* CWorldParam::cvar_wolTonemap;
+ CVar* CWorldParam::cvar_wolExposure;
+ CVar* CWorldParam::cvar_wolSaturation;
+ 
++// Not in the original client (World of Legends): native ambient occlusion, brief E2.
++CVar* CWorldParam::cvar_wolAO;
++CVar* CWorldParam::cvar_wolAORadius;
++CVar* CWorldParam::cvar_wolAOStrength;
++CVar* CWorldParam::cvar_wolAODebug;
++
+ #define WOL_FARCLIP_FACTOR_MAX 3.0f
+ 
+ static float ClampEnvironmentDetail(float detail) {
+@@ -864,13 +871,12 @@ bool CWorldParam::WolVolFogCallback(CVar* var, const char* oldValue, const char*
+     }
+ 
+     // The depth texture exists only if the device was built with the CVar above 0 (and INTZ): compare with what is wanted now.
+-    bool wantsDepth = mode > 0 && VolFog::s_caps.intz;
++    // Brief E2: wolAO wants the same depth, so it is "the depth that is wanted" (VolFog::DepthWanted), not wolVolFog alone, that is compared.
++    bool wantsDepth = VolFog::DepthWanted() && VolFog::s_caps.intz;
+     bool hasDepth = VolFog::DepthTexture() != nullptr;
+ 
+     if (wantsDepth != hasDepth) {
+-        static const char* const s_pending = "wolVolFog: pendiente de gxRestart";
+-        ConsoleWrite(s_pending, DEFAULT_COLOR);
+-        CGxDevice::Log("%s", s_pending);
++        VolFog::NoteDepthWantChanged("wolVolFog"); // "wolVolFog: pendiente de gxRestart" to the console and gx.log, as before
+     } else if (changed && mode > 0 && !VolFog::s_caps.intz) {
+         static const char* const s_noIntz = "wolVolFog: this video card does not report INTZ, the fog stays off.";
+         ConsoleWrite(s_noIntz, DEFAULT_COLOR);
+@@ -1081,6 +1087,105 @@ bool CWorldParam::WolSaturationCallback(CVar* var, const char* oldValue, const c
+     return true;
+ }
+ 
++// Not in the original client (brief E2). wolAO 0-2 (default 0): 0 off, 1 ambient occlusion at half resolution with 4 steps per direction, 2 with 6 steps and a
++// wider blur. Above 0 it arms the readable INTZ depth like wolVolFog does (and drops MSAA, or keeps it with the RESZ copy under DXVK): turning it on or off
++// for the first time needs a gxRestart, which the message says. Read every frame (WolAO::RenderMid / RenderLate).
++bool CWorldParam::WolAOCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    if (!value || value[0] < '0' || value[0] > '2' || value[1] != '\0') {
++        ConsoleWrite("wolAO must be 0 (off), 1 (half resolution, 4 steps) or 2 (half resolution, 6 steps, wider blur).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    const int32_t mode = value[0] - '0';
++    VolFog::s_messageHook = WolVolFogMessage;
++    WolAO::SetMode(mode);
++
++    // No message while the CVar is first registered (no previous value), when the Gx device does not exist yet either.
++    if (oldValue && *oldValue) {
++        static const char* const s_names[3] = { "off", "half resolution, 4 steps", "half resolution, 6 steps, wider blur" };
++        char buffer[112];
++        SStrPrintf(buffer, sizeof(buffer), "wolAO: %d (%s)", mode, s_names[mode]);
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++        CGxDevice::Log("%s", static_cast<const char*>(buffer));
++
++        if (g_theGxDevicePtr) {
++            if (mode > 0 && !VolFog::s_caps.intz) {
++                static const char* const s_noIntz = "wolAO: this video card does not report INTZ, the ambient occlusion stays off.";
++                ConsoleWrite(s_noIntz, DEFAULT_COLOR);
++                CGxDevice::Log("%s", s_noIntz);
++            } else {
++                VolFog::NoteDepthWantChanged("wolAO");
++            }
++        }
++    }
++
++    return true;
++}
++
++// Not in the original client (brief E2). wolAORadius 0.5-4.0 yards (default 1.5): the radius of the sphere around each pixel in which the geometry occludes.
++bool CWorldParam::WolAORadiusCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float radius = 0.0f;
++
++    if (!WolVolFogParseFloat(value, radius) || radius < 0.5f || radius > 4.0f) {
++        ConsoleWrite("wolAORadius must be in range 0.5 to 4.0 (yards).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    WolAO::SetRadius(radius);
++
++    if (oldValue && *oldValue) {
++        char buffer[96];
++        SStrPrintf(buffer, sizeof(buffer), "wolAORadius: %.2f yards%s", static_cast<double>(radius), WolAO::GetSettings().mode ? "" : " (needs wolAO 1 or 2)");
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief E2). wolAOStrength 0.0-2.0 (default 1.0): how dark the occlusion makes the corners.
++bool CWorldParam::WolAOStrengthCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float strength = 0.0f;
++
++    if (!WolVolFogParseFloat(value, strength) || strength < 0.0f || strength > 2.0f) {
++        ConsoleWrite("wolAOStrength must be in range 0.0 to 2.0.", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    WolAO::SetStrength(strength);
++
++    if (oldValue && *oldValue) {
++        char buffer[96];
++        SStrPrintf(buffer, sizeof(buffer), "wolAOStrength: %.2f%s", static_cast<double>(strength), WolAO::GetSettings().mode ? "" : " (needs wolAO 1 or 2)");
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief E2). wolAODebug 0-3 (default 0): 1 = the multiplier the AO applies, in grey, over the whole world view; 2 = the raw AO
++// (before the blur); 3 = the normals rebuilt from the depth. Needs wolAO 1 or 2.
++bool CWorldParam::WolAODebugCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    if (!value || value[0] < '0' || value[0] > '3' || value[1] != '\0') {
++        ConsoleWrite("wolAODebug must be 0 (off), 1 (AO in grey), 2 (raw AO, no blur) or 3 (normals).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    WolAO::SetDebug(value[0] - '0');
++
++    if (oldValue && *oldValue) {
++        static const char* const s_names[4] = { "off", "AO in grey", "raw AO, no blur", "normals rebuilt from the depth" };
++        char buffer[112];
++        SStrPrintf(buffer, sizeof(buffer), "wolAODebug: %c (%s)%s", value[0], s_names[value[0] - '0'], WolAO::GetSettings().mode ? "" : " (needs wolAO 1 or 2)");
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
+ // Not in the original client (brief B3b). Called from RegisterGxCVars, before the Gx device is created (it used to be in Initialize,
+ // after the device): with wolVolFog saved in Config.wtf the first device already drops MSAA and builds the INTZ depth, no gxRestart.
+ void CWorldParam::RegisterVolFogCVars() {
+@@ -1099,6 +1204,12 @@ void CWorldParam::RegisterVolFogCVars() {
+     CWorldParam::cvar_wolTonemap = CVar::Register("wolTonemap", "Native filmic tonemapping in linear light (0 off, 1 on)", 1, "0", CWorldParam::WolTonemapCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolExposure = CVar::Register("wolExposure", "Tonemapping exposure (0.5 to 2.0), needs wolTonemap 1", 1, "1.0", CWorldParam::WolExposureCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolSaturation = CVar::Register("wolSaturation", "Tonemapping saturation (0.5 to 1.5), needs wolTonemap 1", 1, "1.0", CWorldParam::WolSaturationCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Not in the original client (brief E2): native ambient occlusion, saved in Config.wtf. Registered here, before the Gx device exists, so a saved
++    // wolAO > 0 arms the INTZ depth for the first device (no gxRestart needed at start-up), exactly like wolVolFog.
++    CWorldParam::cvar_wolAO = CVar::Register("wolAO", "Native ambient occlusion (0 off, 1 half resolution 4 steps, 2 half resolution 6 steps and wider blur); needs gxRestart to turn on or off", 1, "0", CWorldParam::WolAOCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolAORadius = CVar::Register("wolAORadius", "Ambient occlusion radius in yards (0.5 to 4.0)", 1, "1.5", CWorldParam::WolAORadiusCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolAOStrength = CVar::Register("wolAOStrength", "Ambient occlusion strength (0.0 to 2.0)", 1, "1.0", CWorldParam::WolAOStrengthCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolAODebug = CVar::Register("wolAODebug", "Ambient occlusion debug view (0 off, 1 AO in grey, 2 raw AO, 3 normals)", 1, "0", CWorldParam::WolAODebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Brief B5: the reader of the frame inputs for the fog model (Engine/ does not depend on WoW/).
+     VolFogWorld::Install();
+ }

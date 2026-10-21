@@ -1,0 +1,235 @@
+diff --git a/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.cpp b/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.cpp
+index b46f129..7b0b2d1 100644
+--- a/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.cpp
++++ b/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.cpp
+@@ -96,7 +96,11 @@ IOUnit* System_SFile::CreateRangeUnit(IOUnitContainer* container, int64_t start,
+ }
+ 
+ // Not in the original client (World of Legends): Logs/files.log, one line per open of a file whose path has "Tileset\\"
+-// (terrain textures), to diagnose which name the client asks for and which archive answers. Off by default.
++// (terrain textures) or ends in ".blp" (every texture: icons, interface, models, terrain), to diagnose which name the client
++// asks for and which archive answers, and to pick what goes to a x4 package. Off by default.
++// Line: open <path> found=<0 not found | 1 in an MPQ | 2 loose file on disk> archive=<MPQ or file, - if none> priority=<n, -1 if none>
++// size=<bytes in the MPQ, 0 if not in an MPQ or not found> flags=0x<open flags>. One line per open, not per texture:
++// the same texture can appear several times (reloads after the cache dropped it).
+ static volatile int32_t s_wolFileLog = -1;  // -1 = not read yet (environment variable), 0/1 = decided
+ 
+ void Blizzard::Mopaq::WolFileLogSet(int32_t enabled) {
+@@ -113,6 +117,17 @@ static bool WolFileLogWanted(const char* name) {
+         return false;
+     }
+ 
++    // Every .blp (any folder), case-insensitive.
++    uint32_t length = 0;
++
++    while (name[length]) {
++        length++;
++    }
++
++    if (length >= 4 && name[length - 4] == '.' && (name[length - 3] | 0x20) == 'b' && (name[length - 2] | 0x20) == 'l' && (name[length - 1] | 0x20) == 'p') {
++        return true;
++    }
++
+     static const char kKey[] = "tileset";
+ 
+     for (const char* p = name; *p; p++) {
+diff --git a/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.h b/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.h
+index 5a9d0f2..4ef5279 100644
+--- a/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.h
++++ b/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.h
+@@ -53,7 +53,7 @@ bool CreateDiskFile(const char* name, uint32_t flags, const char* path, System_S
+ namespace Blizzard {
+ namespace Mopaq {
+ 
+-// Not in the original client (World of Legends): log of every open of a Tileset\ file (name, archive, size) to Logs/files.log.
++// Not in the original client (World of Legends): log of every open of a .blp or Tileset\ file (name, archive, size) to Logs/files.log.
+ // Off by default; on with the CVar wolFileLog 1 or the environment variable WOL_FILELOG=1.
+ void WolFileLogSet(int32_t enabled);
+ 
+diff --git a/WoW/Source/Client_CVar.cpp b/WoW/Source/Client_CVar.cpp
+index 82d3200..e5727d9 100644
+--- a/WoW/Source/Client_CVar.cpp
++++ b/WoW/Source/Client_CVar.cpp
+@@ -658,7 +658,7 @@ static bool WolBuildCallback(CVar* var, const char* oldValue, const char* value,
+     return value && !SStrCmp(value, g_wolBuildString, STORM_MAX_STR);
+ }
+ 
+-// Not in the original client (World of Legends): CVar wolFileLog (0/1), Logs/files.log with every Tileset\ open.
++// Not in the original client (World of Legends): CVar wolFileLog (0/1), Logs/files.log with every .blp and Tileset\ open.
+ static bool WolFileLogCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
+     Blizzard::Mopaq::WolFileLogSet(value && value[0] == '1');
+     return true;
+@@ -679,8 +679,8 @@ void ClientRegisterConsoleCommands() {
+     g_savedPasswordVar = CVar::Register("savedPassword", "Saved account password (obfuscated, not encrypted)", 0x40, "", nullptr, CATEGORY_GAME, false, nullptr, false);
+     // Not in the original client (World of Legends): read-only build string (flag 0x100: "is read only" in the console).
+     CVar::Register("wolBuild", "Build of the World of Legends 64-bit client (read-only)", 0x100, g_wolBuildString, WolBuildCallback, CATEGORY_GAME, false, nullptr, false);
+-    // Not in the original client (World of Legends): file-open log for terrain textures (0 = off, default).
+-    CVar::Register("wolFileLog", "Log every Tileset file open to Logs/files.log (0 = off, 1 = on)", 0, "0", WolFileLogCallback, CATEGORY_DEBUG, false, nullptr, false);
++    // Not in the original client (World of Legends): file-open log for textures (.blp) and terrain files (0 = off, default).
++    CVar::Register("wolFileLog", "Log every .blp and Tileset file open to Logs/files.log (0 = off, 1 = on)", 0, "0", WolFileLogCallback, CATEGORY_DEBUG, false, nullptr, false);
+     s_cvMovie = CVar::Register("movie", "Show movie on startup", 0, "1", nullptr, CATEGORY_GAME, false, nullptr, false);
+     s_cvExpansionMovie = CVar::Register("expansionMovie", "Show expansion movie on startup", 0, "1", nullptr, CATEGORY_GAME, false, nullptr, false);
+     s_cvMovieSubtitle = CVar::Register("movieSubtitle", "Show movie subtitles", 0, "0", nullptr, CATEGORY_GAME, false, nullptr, false);
+diff --git a/WoW/Source/WorldClient/World.cpp b/WoW/Source/WorldClient/World.cpp
+index 273b24c..f8c0119 100644
+--- a/WoW/Source/WorldClient/World.cpp
++++ b/WoW/Source/WorldClient/World.cpp
+@@ -310,6 +310,9 @@ int32_t World::s_texCacheDirty = 1;
+ // STATIC: 0x00CD7760
+ uint32_t World::s_texCacheOverride;
+ 
++// Not in the original client: set by the wolTextureCacheMB callback (CWorldParam::WolTextureCacheMBCallback).
++uint32_t World::s_wolTexCacheMB;
++
+ // STATIC: 0x00CDFFD0
+ int32_t World::s_waterLOD;
+ 
+@@ -716,6 +719,14 @@ static void UpdateShadowGxTex(EGxTexCommand command, uint32_t width, uint32_t he
+ // VERIFY: 7e2d825d manual
+ // OFFSET: 0x0077F900
+ void CWorld::UpdateTextureCacheBudget() {
++    // Not in the original client (World of Legends): wolTextureCacheMB > 0 replaces the calculation below and wins over
++    // gxTextureCacheSize. It is applied every frame (one virtual call that stores an integer) so that it also survives
++    // a Gx restart, which creates the device again with its default of 16 MB.
++    if (World::s_wolTexCacheMB) {
++        g_theGxDevicePtr->TexSetCacheSize(World::s_wolTexCacheMB << 20);
++        return;
++    }
++
+     if (!World::s_texCacheDirty || World::s_texCacheOverride) {
+         return;
+     }
+diff --git a/WoW/Source/WorldClient/World.h b/WoW/Source/WorldClient/World.h
+index 8cd2089..2ef1bf7 100644
+--- a/WoW/Source/WorldClient/World.h
++++ b/WoW/Source/WorldClient/World.h
+@@ -462,6 +462,9 @@ extern float s_nearClip;
+ extern float s_prevFarClip;
+ extern int32_t s_texCacheDirty;
+ extern uint32_t s_texCacheOverride;
++// Not in the original client (World of Legends): CVar wolTextureCacheMB, the texture cache budget in MB (0 = the original
++// calculation / gxTextureCacheSize; 256 - 2048 replaces both). See patches-cliente/hd-cache/README-hdcache.md.
++extern uint32_t s_wolTexCacheMB;
+ extern int32_t s_waterLOD;
+ 
+ int32_t FrustumCull(const CAaBox& box);
+diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
+index 04c95f6..8479276 100644
+--- a/WoW/Source/WorldClient/WorldParam.h
++++ b/WoW/Source/WorldClient/WorldParam.h
+@@ -42,6 +42,8 @@ class CWorldParam {
+     static CVar* cvar_wolFarClipFactor;
+     // Not in the original client (World of Legends): see patches-cliente/sombras-4096/README-sombras.md.
+     static CVar* cvar_wolShadowMapSize;
++    // Not in the original client (World of Legends): see patches-cliente/hd-cache/README-hdcache.md.
++    static CVar* cvar_wolTextureCacheMB;
+     // Not in the original client (World of Legends): native volumetric fog, see patches-cliente/niebla-volumetrica/README-niebla.md.
+     static CVar* cvar_wolVolFog;
+     static CVar* cvar_wolVolFogDebug;
+@@ -87,6 +89,7 @@ class CWorldParam {
+     // Not in the original client.
+     static bool WolFarClipFactorCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolShadowMapSizeCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolTextureCacheMBCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolVolFogCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     // Not in the original client (brief B4): validated, applied at once (read every frame through VolFog::Settings()).
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index 669c0f0..0a6066f 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -118,6 +118,9 @@ CVar* CWorldParam::cvar_wolFarClipFactor;
+ // Not in the original client (World of Legends): wolShadowMapSize, see patches-cliente/sombras-4096/README-sombras.md.
+ CVar* CWorldParam::cvar_wolShadowMapSize;
+ 
++// Not in the original client (World of Legends): wolTextureCacheMB, see patches-cliente/hd-cache/README-hdcache.md.
++CVar* CWorldParam::cvar_wolTextureCacheMB;
++
+ // Not in the original client (World of Legends): wolVolFogDebug, see patches-cliente/niebla-volumetrica/README-niebla.md.
+ CVar* CWorldParam::cvar_wolVolFog;
+ CVar* CWorldParam::cvar_wolVolFogDebug;
+@@ -708,6 +711,13 @@ bool CWorldParam::GxTextureCacheSizeCallback(CVar* var, const char* oldValue, co
+ 
+     if (size) {
+         World::s_texCacheOverride = size << 20;
++
++        // Not in the original client (World of Legends): wolTextureCacheMB > 0 wins; this value is kept for when it goes back to 0.
++        if (World::s_wolTexCacheMB) {
++            ConsoleWrite("gxTextureCacheSize is ignored while wolTextureCacheMB is set.", DEFAULT_COLOR);
++            return true;
++        }
++
+         g_theGxDevicePtr->TexSetCacheSize(size << 20);
+ 
+         char buffer[256];
+@@ -722,6 +732,61 @@ bool CWorldParam::GxTextureCacheSizeCallback(CVar* var, const char* oldValue, co
+     return true;
+ }
+ 
++// Not in the original client (World of Legends). Texture cache budget in MB: 0 keeps the original behaviour (the
++// calculation of CWorld::UpdateTextureCacheBudget, or gxTextureCacheSize when that is set); 256 - 2048 replaces both with
++// this value, whatever farclip, baseMip or gxTextureCacheSize say. Applied at once (TexSetCacheSize only stores the limit; the
++// textures already resident stay, and the LRU trims at the end of the next scene if the new limit is lower). It is a
++// budget of D3D textures (the resident ones), not an allocation up front. Also written to Logs\gx.log.
++bool CWorldParam::WolTextureCacheMBCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    uint32_t megabytes = 0;
++    bool valid = value && *value;
++
++    for (const char* digit = value; valid && *digit; digit++) {
++        if (*digit < '0' || *digit > '9') {
++            valid = false;
++        } else if (megabytes < 100000) {
++            megabytes = megabytes * 10 + static_cast<uint32_t>(*digit - '0');
++        }
++    }
++
++    if (!valid || (megabytes != 0 && (megabytes < 256 || megabytes > 2048))) {
++        ConsoleWrite("wolTextureCacheMB must be 0 (original) or 256 to 2048 (MB).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    World::s_wolTexCacheMB = megabytes;
++
++    // The device may not exist yet (the saved value arrives when the CVar is registered): CWorld::UpdateTextureCacheBudget applies it then.
++    if (megabytes) {
++        if (g_theGxDevicePtr) {
++            g_theGxDevicePtr->TexSetCacheSize(megabytes << 20);
++        }
++    } else if (World::s_texCacheOverride) {
++        if (g_theGxDevicePtr) {
++            g_theGxDevicePtr->TexSetCacheSize(World::s_texCacheOverride);
++        }
++    } else {
++        World::s_texCacheDirty = 1;
++    }
++
++    // No message while the CVar is first registered with its default (no previous value, 0).
++    if (megabytes || (oldValue && *oldValue)) {
++        char buffer[256];
++
++        if (megabytes) {
++            SStrPrintf(buffer, sizeof(buffer), "wolTextureCacheMB: texture cache budget %u MB (replaces the automatic budget and gxTextureCacheSize).", megabytes);
++        } else {
++            SStrPrintf(buffer, sizeof(buffer), "wolTextureCacheMB: original (automatic budget, or gxTextureCacheSize if set).");
++        }
++
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++        CGxDevice::Log("%s", static_cast<const char*>(buffer)); // const char*: a char* would pick the va_list overload
++    }
++
++    return true;
++}
++
+ // Not in the original client. The Gx library does not link the console: VolFog::Message goes through this hook.
+ static void WolVolFogMessage(const char* line) {
+     ConsoleWrite(line, DEFAULT_COLOR);
+@@ -943,6 +1008,8 @@ void CWorldParam::Initialize() {
+     CWorldParam::cvar_extShadowQuality = CVar::Register("extShadowQuality", "Quality of exterior shadows (0-5)", 1, "0", CWorldParam::ExtShadowQualityCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_projectedTextures = CVar::Register("projectedTextures", "Projected Textures", 1, "0", CWorldParam::ProjectedTexturesCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_gxTextureCacheSize = CVar::Register("gxTextureCacheSize", "GX Texture Cache Size", 1, "0", CWorldParam::GxTextureCacheSizeCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Not in the original client (World of Legends): texture cache budget in MB that replaces the automatic one and gxTextureCacheSize (0 = original; 256 - 2048). Saved in Config.wtf.
++    CWorldParam::cvar_wolTextureCacheMB = CVar::Register("wolTextureCacheMB", "Texture cache budget in MB (0 original, 256 to 2048); wins over gxTextureCacheSize", 1, "0", CWorldParam::WolTextureCacheMBCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CVar::Register("spellEffectLevel", "Video Option: Spell Effects", 1, "9", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);
+ 
+     AddConsoleDeviceDefaultCallback(CWorldParam::SetDefaults);

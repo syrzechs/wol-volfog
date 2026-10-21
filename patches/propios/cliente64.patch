@@ -1,0 +1,250 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fc42b44..c9a1f2d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -54,6 +54,29 @@ if (WOWDECOMP_DISABLE_SIGNATURE_CHECKS)
+     add_compile_definitions(DISABLE_SIGNATURE_CHECKS=1)
+ endif ()
+ 
++# Not in the original client (World of Legends): build string of the wolBuild CVar, "WoL64 <date>+<git hash>", also written to
++# WowClient_crash.log and Logs/gx.log. Taken when CMake configures (run cmake again to refresh it); git missing gives "nogit".
++# Only WoW/Source/Client_CVar.cpp gets the definitions (see WoW/Source and Tools/WowClient), so a new day does not rebuild
++# the whole client.
++string(TIMESTAMP WOL_BUILD_DATE "%Y-%m-%d")
++set(WOL_BUILD_HASH "nogit")
++find_package(Git QUIET)
++if (GIT_FOUND)
++    execute_process(
++        COMMAND ${GIT_EXECUTABLE} rev-parse --short=7 HEAD
++        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
++        OUTPUT_VARIABLE WOL_GIT_HASH
++        RESULT_VARIABLE WOL_GIT_RESULT
++        ERROR_QUIET
++        OUTPUT_STRIP_TRAILING_WHITESPACE
++    )
++    if (WOL_GIT_RESULT EQUAL 0 AND WOL_GIT_HASH)
++        string(SUBSTRING "${WOL_GIT_HASH}" 0 7 WOL_BUILD_HASH)
++    endif ()
++endif ()
++set(WOL_BUILD_COMPILE_DEFINITIONS "WOL_BUILD_DATE=\"${WOL_BUILD_DATE}\"" "WOL_BUILD_HASH=\"${WOL_BUILD_HASH}\"")
++message(STATUS "wolBuild: WoL64 ${WOL_BUILD_DATE}+${WOL_BUILD_HASH}")
++
+ # Third-party code is linked, not decompiled, for now.
+ if (EXISTS ${CMAKE_SOURCE_DIR}/ThirdParty/CMakeLists.txt)
+     add_subdirectory(ThirdParty)
+diff --git a/Tools/WowClient/CMakeLists.txt b/Tools/WowClient/CMakeLists.txt
+index db32a71..0be638e 100644
+--- a/Tools/WowClient/CMakeLists.txt
++++ b/Tools/WowClient/CMakeLists.txt
+@@ -21,6 +21,9 @@ endif ()
+ 
+ add_executable(WowClient WIN32 ${CLIENT_SOURCES} ${CLIENT_PLATFORM_SOURCES} ${CLIENT_TOOL_SOURCES})
+ 
++# Not in the original client (World of Legends): build string of the wolBuild CVar (see the top CMakeLists.txt).
++set_source_files_properties(${CMAKE_SOURCE_DIR}/WoW/Source/Client_CVar.cpp PROPERTIES COMPILE_DEFINITIONS "${WOL_BUILD_COMPILE_DEFINITIONS}")
++
+ # Not in the original client (World of Legends): patch-Z.MPQ with the volumetric fog shaders is built before the client.
+ if (TARGET VolFogShaders)
+     add_dependencies(WowClient VolFogShaders)
+diff --git a/Tools/WowClient/crash_log.cpp b/Tools/WowClient/crash_log.cpp
+index 54f51ab..0b8c5db 100644
+--- a/Tools/WowClient/crash_log.cpp
++++ b/Tools/WowClient/crash_log.cpp
+@@ -6,6 +6,9 @@
+ #include <cstdio>
+ #include <cstring>
+ 
++// Not in the original client (World of Legends): "WoL64 YYYY-MM-DD+hash", defined in WoW/Source/Client_CVar.cpp.
++extern const char g_wolBuildString[];
++
+ static char s_logPath[MAX_PATH];
+ static HANDLE s_console = INVALID_HANDLE_VALUE;
+ static HANDLE s_logFile = INVALID_HANDLE_VALUE;
+@@ -140,6 +143,15 @@ static struct CrashLogInit {
+         DeleteFileA(s_logPath);
+         s_logFile = CreateFileA(s_logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+ 
++        // Not in the original client (World of Legends): the build string is the first line of the log, so a crash report
++        // says which build it comes from.
++        if (s_logFile != INVALID_HANDLE_VALUE) {
++            char header[128];
++            int length = sprintf_s(header, sizeof(header), "%s\r\n", g_wolBuildString);
++            DWORD written = 0;
++            WriteFile(s_logFile, header, static_cast<DWORD>(length), &written, nullptr);
++        }
++
+         // Not in the original client (World of Legends): sin ventana de consola; el registro de cierres sigue en
+         // WowClient_crash.log. Define WOWCLIENT_CRASH_CONSOLE para recuperar la consola de depuracion.
+ #ifdef WOWCLIENT_CRASH_CONSOLE
+diff --git a/WoW/Source/CMakeLists.txt b/WoW/Source/CMakeLists.txt
+index 24e68e8..d5f87c6 100644
+--- a/WoW/Source/CMakeLists.txt
++++ b/WoW/Source/CMakeLists.txt
+@@ -8,6 +8,9 @@ endif ()
+ 
+ add_executable(Wow WIN32 ${PRIVATE_SOURCES} ${PLATFORM_SOURCES})
+ 
++# Not in the original client (World of Legends): build string of the wolBuild CVar (see the top CMakeLists.txt).
++set_source_files_properties(${CMAKE_SOURCE_DIR}/WoW/Source/Client_CVar.cpp PROPERTIES COMPILE_DEFINITIONS "${WOL_BUILD_COMPILE_DEFINITIONS}")
++
+ if (WOWDECOMP_ARCH_64)
+     set(WOW_OUTPUT_NAME Wow64)
+ else ()
+diff --git a/WoW/Source/Client.cpp b/WoW/Source/Client.cpp
+index 1986ea7..b8f9b0f 100644
+--- a/WoW/Source/Client.cpp
++++ b/WoW/Source/Client.cpp
+@@ -1347,6 +1347,13 @@ void ClientInitializeGame(uint32_t mapId, C3Vector position) {
+     s_gameInitialized = 1;
+ }
+ 
++// Not in the original client (World of Legends): the Data\WoL64\*.MPQ packages that OpenArchives opened. Logs\gx.log does
++// not exist yet at that point, so the startup code writes "WoL64 patch: <path>" once ConsoleDeviceInitialize has opened
++// it (see below). Support can tell from there which packages the client really loaded.
++static char s_wolPatchPaths[16][128];
++static int32_t s_wolPatchPriorities[16];
++static uint32_t s_wolPatchCount;
++
+ // VERIFY: a768ccd6 manual
+ // OFFSET: 0x00405DD0
+ static void OpenArchives() {
+@@ -1370,6 +1377,13 @@ static void OpenArchives() {
+                 s_startArchivePriority = priority;
+             }
+ 
++            // Not in the original client (World of Legends): remember Data\WoL64\ packages for gx.log.
++            if (!SStrCmpI(patches.m_files[i - 1], "Data\\WoL64\\", 11) && s_wolPatchCount < sizeof(s_wolPatchPaths) / sizeof(s_wolPatchPaths[0])) {
++                SStrCopy(s_wolPatchPaths[s_wolPatchCount], patches.m_files[i - 1], sizeof(s_wolPatchPaths[0]));
++                s_wolPatchPriorities[s_wolPatchCount] = priority;
++                s_wolPatchCount++;
++            }
++
+             slot++;
+             priority++;
+         }
+@@ -1762,6 +1776,12 @@ bool InitializeGlobal() {
+     SStrCopy(windowTitle, title ? title->m_message : "World of Warcraft", STORM_MAX_STR);
+     ConsoleDeviceInitialize(windowTitle, 1, 1);
+ 
++    // Not in the original client (World of Legends): build string and loaded Data\WoL64 packages in Logs\gx.log.
++    GxLog("%s", g_wolBuildString);
++    for (uint32_t i = 0; i < s_wolPatchCount; i++) {
++        GxLog("WoL64 patch: %s (priority %d)", s_wolPatchPaths[i], s_wolPatchPriorities[i]);
++    }
++
+     OsIMEInitialize();
+     g_rndSeed.SetSeed(OsGetAsyncTimeMs());
+     g_clientEventContext = EventCreateContextEx(1, InitializeEngineCallback, DestroyEngineCallback, 0, 0);
+diff --git a/WoW/Source/Client.h b/WoW/Source/Client.h
+index 91cb560..ee49a5a 100644
+--- a/WoW/Source/Client.h
++++ b/WoW/Source/Client.h
+@@ -59,6 +59,8 @@ extern CVar* g_readTerminationWithoutNoticeVar;
+ extern CVar* g_readTOSVar;
+ // Not in the original client: remember-password support for the login screen.
+ extern CVar* g_savePasswordVar;
++// Not in the original client (World of Legends): "WoL64 YYYY-MM-DD+hash", see the wolBuild CVar (Client_CVar.cpp).
++extern const char g_wolBuildString[];
+ extern CVar* g_savedPasswordVar;
+ extern WowClientDB<Startup_StringsRec> g_startup_StringsDB;
+ extern CVar* s_cvarUIFaster;
+diff --git a/WoW/Source/Client_CVar.cpp b/WoW/Source/Client_CVar.cpp
+index ff9609c..2de2ef1 100644
+--- a/WoW/Source/Client_CVar.cpp
++++ b/WoW/Source/Client_CVar.cpp
+@@ -639,6 +639,24 @@ bool LocaleCallback(CVar* var, const char* oldValue, const char* value, void* ar
+     return true;
+ }
+ 
++// Not in the original client (World of Legends): build string for support, "WoL64 <build date>+<git hash>". CMake injects
++// WOL_BUILD_DATE and WOL_BUILD_HASH (see the top CMakeLists.txt); without them the string says unknown / nogit. The same
++// text goes to the wolBuild CVar, the first line of WowClient_crash.log and a line of Logs\gx.log.
++#ifndef WOL_BUILD_DATE
++#define WOL_BUILD_DATE "unknown"
++#endif
++#ifndef WOL_BUILD_HASH
++#define WOL_BUILD_HASH "nogit"
++#endif
++const char g_wolBuildString[] = "WoL64 " WOL_BUILD_DATE "+" WOL_BUILD_HASH;
++
++// Not in the original client (World of Legends): wolBuild is read-only. The only value it accepts is the build string
++// itself (CVar::Register, Reset and Default hand it back); anything else, from /console, Lua or Config.wtf, is dropped
++// and the CVar keeps its value. It equals the default, so CVar::SaveAll never writes it to Config.wtf.
++static bool WolBuildCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    return value && !SStrCmp(value, g_wolBuildString, STORM_MAX_STR);
++}
++
+ // VERIFY: 9951b118 manual
+ // OFFSET: 0x00401B60
+ void ClientRegisterConsoleCommands() {
+@@ -652,6 +670,8 @@ void ClientRegisterConsoleCommands() {
+     // savedPassword from GetCVar in the in-game UI, like accountName.
+     g_savePasswordVar = CVar::Register("savePassword", "Remember the account password on the login screen", 0, "0", nullptr, CATEGORY_GAME, false, nullptr, false);
+     g_savedPasswordVar = CVar::Register("savedPassword", "Saved account password (obfuscated, not encrypted)", 0x40, "", nullptr, CATEGORY_GAME, false, nullptr, false);
++    // Not in the original client (World of Legends): read-only build string (flag 0x100: "is read only" in the console).
++    CVar::Register("wolBuild", "Build of the World of Legends 64-bit client (read-only)", 0x100, g_wolBuildString, WolBuildCallback, CATEGORY_GAME, false, nullptr, false);
+     s_cvMovie = CVar::Register("movie", "Show movie on startup", 0, "1", nullptr, CATEGORY_GAME, false, nullptr, false);
+     s_cvExpansionMovie = CVar::Register("expansionMovie", "Show expansion movie on startup", 0, "1", nullptr, CATEGORY_GAME, false, nullptr, false);
+     s_cvMovieSubtitle = CVar::Register("movieSubtitle", "Show movie subtitles", 0, "0", nullptr, CATEGORY_GAME, false, nullptr, false);
+diff --git a/WoW/Source/WowServices/PatchFiles.cpp b/WoW/Source/WowServices/PatchFiles.cpp
+index 0fa7f48..49fef94 100644
+--- a/WoW/Source/WowServices/PatchFiles.cpp
++++ b/WoW/Source/WowServices/PatchFiles.cpp
+@@ -70,6 +70,18 @@ PatchFiles::PatchFiles(const char* locale, bool flag) {
+         }
+ 
+         if (pass == 0) {
++#if defined(WOWDECOMP_ARCH_64)
++            // Not in the original client (World of Legends): the 64-bit client also reads every Data\WoL64\*.MPQ (the
++            // "remember password" GlueXML, the volumetric fog shaders, future packages). They go into the list that is
++            // sorted just below: "Data\WoL64\..." sorts above "Data\patch-Y.MPQ" and "Data\<locale>\patch-<locale>-3.MPQ"
++            // (w > p, w > e), so they win over the official files, and the official Wow.exe never looks in that folder.
++            // Without the folder OsFileList finds nothing: no error, no message.
++            if (wanted == 0) {
++                SStrCopy(directory, "Data\\WoL64\\", sizeof(directory));
++                OsFileList(this->m_directory, "*.MPQ", PatchFiles::EnumPatchArchives, this, 0);
++            }
++#endif
++
+             quicksort(this->m_files.Ptr(), this->m_files.Count(), sizeof(char*), CompareStrings, nullptr);
+         }
+     }
+diff --git a/waystone.rc b/waystone.rc
+index 371ffd8..ca0f074 100644
+--- a/waystone.rc
++++ b/waystone.rc
+@@ -1 +1,34 @@
++#pragma code_page(1252)
++#include <winver.h>
++
+ BlizzardIcon.ico ICON "waystone.ico"
++
++// Not in the original client (World of Legends): version information of the 64-bit client, for support and so that the
++// exe has an identity for SmartScreen and antivirus. Win32 builds (the ones compared with Wow.exe) keep only the icon.
++#if defined(WOWDECOMP_ARCH_64)
++VS_VERSION_INFO VERSIONINFO
++ FILEVERSION 3,3,5,12340
++ PRODUCTVERSION 3,3,5,12340
++ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
++ FILEFLAGS 0x0L
++ FILEOS VOS_NT_WINDOWS32
++ FILETYPE VFT_APP
++ FILESUBTYPE VFT2_UNKNOWN
++BEGIN
++    BLOCK "StringFileInfo"
++    BEGIN
++        BLOCK "040904B0"
++        BEGIN
++            VALUE "CompanyName", "World of Legends (proyecto de aficionados, sin relaci\xF3n con Blizzard)"
++            VALUE "FileDescription", "World of Legends 64-bit client (fan project)"
++            VALUE "FileVersion", "3.3.5.12340"
++            VALUE "ProductName", "World of Legends 64-bit client (fan project)"
++            VALUE "ProductVersion", "3.3.5.12340"
++        END
++    END
++    BLOCK "VarFileInfo"
++    BEGIN
++        VALUE "Translation", 0x409, 1200
++    END
++END
++#endif

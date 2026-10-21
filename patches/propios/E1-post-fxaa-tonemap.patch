@@ -1,0 +1,842 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c9a1f2d..5f18d9e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -109,6 +109,8 @@ add_subdirectory(Engine/Source/Storm)
+ add_subdirectory(Engine/Source/Tempest)
+ # Not in the original client (World of Legends): native volumetric fog (wolVolFog).
+ add_subdirectory(Engine/Source/VolFog)
++# Not in the original client (World of Legends): native post-processing pass (wolAA, wolTonemap), brief E1.
++add_subdirectory(Engine/Source/WolPost)
+ add_subdirectory(WoW/Common)
+ add_subdirectory(WoW/Source/Battlenet)
+ add_subdirectory(WoW/Source/Console)
+diff --git b/Engine/Source/WolPost/CMakeLists.txt b/Engine/Source/WolPost/CMakeLists.txt
+new file mode 100644
+index 0000000..14b7225
+--- /dev/null
++++ b/Engine/Source/WolPost/CMakeLists.txt
+@@ -0,0 +1,16 @@
++file(GLOB_RECURSE PRIVATE_SOURCES CONFIGURE_DEPENDS "*.cpp")
++
++add_library(WolPost STATIC
++    ${PRIVATE_SOURCES}
++)
++
++target_include_directories(WolPost
++    PUBLIC
++        ${CMAKE_SOURCE_DIR}
++)
++
++# Not in the original client (World of Legends): the pass is a VolFog::Pass (quad, shaders from patch-Z.MPQ), so it links the fog module.
++target_link_libraries(WolPost
++    PUBLIC
++        VolFog
++)
+diff --git b/Engine/Source/WolPost/WolPost.cpp b/Engine/Source/WolPost/WolPost.cpp
+new file mode 100644
+index 0000000..537b521
+--- /dev/null
++++ b/Engine/Source/WolPost/WolPost.cpp
+@@ -0,0 +1,277 @@
++#include "Engine/Source/WolPost/WolPost.h"
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include "Engine/Source/ConsoleBase/IConsole.h"
++#include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
++#include "Engine/Source/Gx/CGxTex.h"
++#include "Engine/Source/Gx/CGxTexFlags.h"
++#include "Engine/Source/Gx/Gx.h"
++#include "Engine/Source/Tempest/C2iVector.h"
++#include "Engine/Source/Tempest/CRect.h"
++#include "Engine/Source/VolFog/VolFog.h"
++#include "Engine/Source/VolFog/VolFogPass.h"
++
++// Not in the original client (World of Legends): native post-processing pass (wolAA, wolTonemap), brief E1.
++// Licensed under GPL-3.0-only. Same plumbing as the fog (VolFog::Pass: quad in clip space, shaders from Data\patch-Z.MPQ, scene copy with GxTexCopy).
++
++namespace {
++    // The longest permutation of WolPost.bls is 587 instruction slots (fxc, AA 2 + TONEMAP 1): the device must declare at least 1024 (a ps_3_0 card
++    // declares 512 at the very least; DXVK and the AMD / NVIDIA drivers declare far more). A card that reports less (or the OpenGL stub, which reports 0) gets no pass.
++    constexpr uint32_t kMinPs30Slots = 1024;
++    constexpr uint32_t kPermutations = 6;
++    constexpr uint32_t kMaxFailures = 3;
++
++    WolPost::Settings s_settings;
++
++    void Say(const char* message) {
++        ConsoleWrite(message, DEFAULT_COLOR);
++        CGxDevice::Log("%s", message); // message is a const char*: a char* would pick the va_list overload
++    }
++
++    void NullTexFunc(EGxTexCommand command, uint32_t width, uint32_t height, uint32_t face, uint32_t level, void* userArg, uint32_t& texelStrideInBytes, const void*& texels) {
++    }
++
++    class PostPass : public VolFog::Pass {
++        public:
++        PostPass() : VolFog::Pass("WolPost", kPermutations, "WolVolFogQuad", GxBlend_Opaque) {}
++
++        void Execute() override {}
++
++        // Writes the world viewport of the back buffer from `scene`, its copy. c0 = origin and size of the area in pixels, c1 = exposure,
++        // saturation and one texel of the copy; the pixel constants c0 and c1 are put back as they were (they belong to whoever draws next).
++        void Draw(CGxTex* scene, uint32_t permutation, float exposure, float saturation) {
++            this->SetPixelPermutation(permutation);
++
++            float saved[8];
++            std::memcpy(saved, CGxDevice::s_shadowConstants[0].constants, sizeof(saved));
++
++            const float c0[4] = { this->m_viewportPx[0], this->m_viewportPx[1], this->m_viewportPx[2], this->m_viewportPx[3] };
++            const float c1[4] = { exposure, saturation, 1.0f / this->m_viewportPx[2], 1.0f / this->m_viewportPx[3] };
++
++            this->Begin();
++
++            GxRsSet(GxRs_ColorWrite, 15);
++            GxRsSet(GxRs_ScissorTest, 0);
++
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, c0, 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 1, c1, 1);
++            GxRsSet(GxRs_Texture0, scene); // sScene: bilinear, clamp (flags of the texture)
++
++            this->DrawQuad();
++            this->End();
++
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, &saved[0], 1);
++            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 1, &saved[4], 1);
++        }
++    };
++
++    struct PostState {
++        const CGxDevice* device;
++        PostPass* pass;
++        CGxTex* scene;
++        uint32_t sceneWidth;
++        uint32_t sceneHeight;
++        uint32_t epoch;
++        uint32_t seenGeneration;
++        uint32_t consecutiveFailures;
++        bool disabled;              // failed for good (shaders, caps, targets) until a CVar or the device changes
++    };
++
++    PostState s_post;
++    uint32_t s_generation;          // bumped by SetAA / SetTonemap: a change of a CVar gives the pass a clean slate after a failure
++
++    void DestroyScene() {
++        if (s_post.scene) {
++            GxTexDestroy(s_post.scene);
++            s_post.scene = nullptr;
++        }
++
++        s_post.sceneWidth = 0;
++        s_post.sceneHeight = 0;
++    }
++
++    bool EnsureScene(uint32_t width, uint32_t height) {
++        if (s_post.scene && s_post.sceneWidth == width && s_post.sceneHeight == height) {
++            return true;
++        }
++
++        DestroyScene();
++
++        // Exact size (GxTex_NonPow2): the shader addresses it as (pixel + 0.5 - origin) / size. Bilinear (FXAA reads between texels), clamp, a render
++        // target of the device (it releases it on a reset and makes it again when it is next used).
++        CGxTexFlags flags(GxTex_Linear, 0, 0, 0, 0, 1, 1, 0, 0, 0);
++        CGxTex* texture = nullptr;
++
++        if (!GxTexCreate(GxTex_NonPow2, width, height, 0, GxTex_Argb8888, GxTex_Argb8888, flags, nullptr, NullTexFunc, "WolPost scene", texture) || !texture) {
++            return false;
++        }
++
++        s_post.scene = texture;
++        s_post.sceneWidth = width;
++        s_post.sceneHeight = height;
++
++        char line[96];
++        std::snprintf(line, sizeof(line), "WolPost: scene copy %ux%u ARGB8", width, height);
++        CGxDevice::Log("%s", static_cast<const char*>(line));
++
++        return true;
++    }
++
++    // The failure policy of the fog (design 1.3): say it once, draw nothing, touch nothing else, and wait for a CVar or a device change.
++    void Disable(const char* message) {
++        if (!s_post.disabled) {
++            s_post.disabled = true;
++            Say(message);
++        }
++    }
++}
++
++const WolPost::Settings& WolPost::GetSettings() {
++    return s_settings;
++}
++
++void WolPost::SetAA(int32_t value) {
++    s_settings.aa = value;
++    s_generation++;
++}
++
++void WolPost::SetTonemap(int32_t value) {
++    s_settings.tonemap = value;
++    s_generation++;
++}
++
++void WolPost::SetExposure(float value) {
++    s_settings.exposure = value;
++}
++
++void WolPost::SetSaturation(float value) {
++    s_settings.saturation = value;
++}
++
++bool WolPost::Active() {
++    return s_settings.aa > 0 || s_settings.tonemap > 0;
++}
++
++void WolPost::Render() {
++    if (!WolPost::Active()) {
++        // Cost zero: no copy, no draw, and the texture does not stay in video memory.
++        if (s_post.scene) {
++            DestroyScene();
++        }
++
++        return;
++    }
++
++    if (!g_theGxDevicePtr) {
++        return;
++    }
++
++    // A change of wolAA / wolTonemap or a rebuilt device (gxRestart, resize, reset) gives the pass a clean slate.
++    if (s_post.seenGeneration != s_generation || s_post.epoch != VolFog::DeviceEpoch() || s_post.device != g_theGxDevicePtr) {
++        s_post.seenGeneration = s_generation;
++        s_post.epoch = VolFog::DeviceEpoch();
++        s_post.consecutiveFailures = 0;
++        s_post.disabled = false;
++
++        if (s_post.device != g_theGxDevicePtr) {
++            // The device that owned the texture is gone (gxApi change): it went with it.
++            s_post.scene = nullptr;
++            s_post.sceneWidth = 0;
++            s_post.sceneHeight = 0;
++            s_post.device = g_theGxDevicePtr;
++        }
++    }
++
++    if (s_post.disabled) {
++        return;
++    }
++
++    // The world drawn into a texture (not the back buffer): not the picture of the player, leave it alone.
++    CGxTex* renderTarget = nullptr;
++    g_theGxDevicePtr->DeviceGetRenderTarget(GxBuffers_Color, renderTarget);
++
++    if (renderTarget) {
++        return;
++    }
++
++    if (VolFog::s_caps.ps30Slots < kMinPs30Slots) {
++        Disable("WolPost: this video card does not offer pixel shader 3.0 (at least 1024 instruction slots): wolAA and wolTonemap do nothing.");
++
++        return;
++    }
++
++    if (!s_post.pass) {
++        // Created on first use and kept for the whole run; the shaders belong to the device and go with it.
++        s_post.pass = new PostPass();
++    }
++
++    const int32_t aa = s_settings.aa;
++    const int32_t tonemap = s_settings.tonemap;
++    const uint32_t permutation = static_cast<uint32_t>(aa * 2 + tonemap);
++
++    s_post.pass->SetPixelPermutation(permutation);
++
++    if (!s_post.pass->Valid()) {
++        Disable("WolPost: the shaders WolPost / WolVolFogQuad are not valid (is Data\\patch-Z.MPQ present, and does the video card support ps_3_0?); wolAA and wolTonemap do nothing.");
++
++        return;
++    }
++
++    // The world viewport that CGWorldFrame::OnWorldRender left set, in pixels from the top-left corner of the back buffer (Gx viewport y grows
++    // upwards; D3D9 viewport y is (1 - maxY) * height, CGxDeviceD3d::IXformSetViewport). The same conversion as the fog.
++    CRect window = { 0.0f, 0.0f, 0.0f, 0.0f };
++    g_theGxDevicePtr->CapsWindowSize(window);
++
++    const float windowWidth = window.maxX - window.minX;
++    const float windowHeight = window.maxY - window.minY;
++
++    if (windowWidth <= 0.0f || windowHeight <= 0.0f) {
++        return;
++    }
++
++    float minX = 0.0f;
++    float maxX = 0.0f;
++    float minY = 0.0f;
++    float maxY = 0.0f;
++    float minZ = 0.0f;
++    float maxZ = 0.0f;
++    GxXformViewport(minX, maxX, minY, maxY, minZ, maxZ);
++
++    int32_t x = static_cast<int32_t>(std::floor(minX * windowWidth + 0.5f));
++    int32_t y = static_cast<int32_t>(std::floor((1.0f - maxY) * windowHeight + 0.5f));
++    int32_t width = static_cast<int32_t>(std::floor((maxX - minX) * windowWidth + 0.5f));
++    int32_t height = static_cast<int32_t>(std::floor((maxY - minY) * windowHeight + 0.5f));
++
++    // Inside the back buffer, and big enough for the 3x3 neighbourhood of the filter.
++    x = std::max(x, 0);
++    y = std::max(y, 0);
++    width = std::min(width, static_cast<int32_t>(windowWidth) - x);
++    height = std::min(height, static_cast<int32_t>(windowHeight) - y);
++
++    if (width < 8 || height < 8) {
++        return;
++    }
++
++    bool drawn = EnsureScene(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
++
++    if (drawn) {
++        const C2iVector destination = { 0, 0 };
++        const C2iVector source = { x, y };
++        const C2iVector size = { width, height };
++        drawn = GxTexCopy(s_post.scene, destination, source, size, 0, 0) != 0;
++    }
++
++    if (drawn && s_post.scene->m_needsCreation) {
++        drawn = false; // the device could not make the texture
++    }
++
++    if (drawn) {
++        s_post.pass->SetViewport(static_cast<float>(x), static_cast<float>(y), static_cast<float>(width), static_cast<float>(height), windowWidth, windowHeight);
++        s_post.pass->Draw(s_post.scene, permutation, s_settings.exposure, s_settings.saturation);
++        s_post.consecutiveFailures = 0;
++    } else if (++s_post.consecutiveFailures >= kMaxFailures) {
++        Disable("WolPost: the scene copy failed three frames in a row; wolAA and wolTonemap do nothing until the setting or the video mode changes.");
++    }
++}
+diff --git b/Engine/Source/WolPost/WolPost.h b/Engine/Source/WolPost/WolPost.h
+new file mode 100644
+index 0000000..41b28b7
+--- /dev/null
++++ b/Engine/Source/WolPost/WolPost.h
+@@ -0,0 +1,34 @@
++#ifndef ENGINE_SOURCE_WOLPOST_WOLPOST_H
++#define ENGINE_SOURCE_WOLPOST_WOLPOST_H
++
++#include <cstdint>
++
++// Not in the original client (World of Legends): native post-processing pass (anti-aliasing and tonemapping), brief E1.
++// Licensed under GPL-3.0-only. The anti-aliasing shader follows the algorithm of NVIDIA FXAA 3.11 (see Shaders/WolPost/NOTICE.txt).
++
++namespace WolPost {
++    // The CVars of the pass (WorldParam_CVar.cpp validates them and writes here; Render() reads them every frame, so a change applies at once).
++    struct Settings {
++        int32_t aa = 0;             // wolAA 0-2: 0 off, 1 FXAA quality 12, 2 FXAA high quality
++        int32_t tonemap = 0;        // wolTonemap 0-1: filmic tonemapping in linear light
++        float exposure = 1.0f;      // wolExposure 0.5-2.0
++        float saturation = 1.0f;    // wolSaturation 0.5-1.5
++    };
++
++    const Settings& GetSettings();
++    void SetAA(int32_t value);
++    void SetTonemap(int32_t value);
++    void SetExposure(float value);
++    void SetSaturation(float value);
++
++    // True when Render() has something to draw (wolAA or wolTonemap above 0).
++    bool Active();
++
++    // Draws the pass over the world viewport of CGWorldFrame::OnWorldRender, right after VolFog::Render() and before PlayerNameUpdateLate (so the 3D
++    // names and the interface, drawn afterwards, stay sharp and untouched). With wolAA 0 and wolTonemap 0 it returns at once: no scene copy, no draw,
++    // and the scene texture is released. Otherwise it copies the world viewport of the back buffer to a texture and draws one full-screen quad over
++    // it with WolPost.bls (permutation wolAA * 2 + wolTonemap). Independent of wolVolFog.
++    void Render();
++}
++
++#endif
+diff --git a/Shaders/VolFog/CMakeLists.txt b/Shaders/VolFog/CMakeLists.txt
+index 8a3eeea..ba489e8 100644
+--- a/Shaders/VolFog/CMakeLists.txt
++++ b/Shaders/VolFog/CMakeLists.txt
+@@ -127,6 +127,9 @@ volfog_shader(WolVolFogRayMask ps vf_ray_mask.hlsl)
+ volfog_shader(WolVolFogRayBlur ps vf_ray_blur.hlsl)
+ volfog_shader(WolVolFogRayComposite ps vf_ray_composite.hlsl)
+ 
++# E1: the post-processing shader (wolAA / wolTonemap) goes into the same patch-Z.MPQ.
++include(${CMAKE_CURRENT_SOURCE_DIR}/../WolPost/WolPost.cmake)
++
+ add_custom_command(
+     OUTPUT ${VOLFOG_MPQ}
+     COMMAND "${VOLFOG_PYTHON}" -I ${VOLFOG_MKMPQ} ${VOLFOG_MPQ} ${VOLFOG_STAGE} ${VOLFOG_BLS_FILES}
+diff --git b/Shaders/WolPost/NOTICE.txt b/Shaders/WolPost/NOTICE.txt
+new file mode 100644
+index 0000000..7662045
+--- /dev/null
++++ b/Shaders/WolPost/NOTICE.txt
+@@ -0,0 +1,41 @@
++World of Legends - Shaders/WolPost (brief E1: native post-processing, wolAA and wolTonemap)
++
++Not in the original client (World of Legends). WolPost.hlsl, WolPost.cmake and the C++ of Engine/Source/WolPost are written for this project and are
++GPL-3.0-only like the rest of the client changes.
++
++1. Anti-aliasing (wolAA 1 and 2): FXAA 3.11
++--------------------------------------------
++The anti-aliasing of WolPost.hlsl implements the algorithm of "NVIDIA FXAA 3.11" by Timothy Lottes (NVIDIA): the local contrast test on the four
++neighbours, the sub-pixel aliasing estimate from the low-pass of the 3x3 neighbourhood, the choice of the edge direction from the second derivatives of
++the luma, the search for the two ends of the edge with the step table of the quality presets (preset 12 for wolAA 1: 1, 1.5, 2, 4, 12; the 12 steps of
++preset 39 for wolAA 2) and the single filtered fetch moved across the edge. The HLSL was written for this project from the published description of that
++algorithm; it contains no source code of Fxaa3_11.h and it uses no code of any other FXAA port. The edge thresholds and the sub-pixel amount are
++tuned for this client (see patches-cliente/post-nativo/README-post.md).
++
++The licence of FXAA 3.11, as it stands in the header of NVIDIA's Fxaa3_11.h (this file was not downloaded in the session that wrote this notice: the text
++below is the one of the header as known, and has to be compared with the original before the repository is redistributed):
++
++    NVIDIA FXAA 3.11 by TIMOTHY LOTTES
++
++    COPYRIGHT (C) 2010, 2011 NVIDIA CORPORATION. ALL RIGHTS RESERVED.
++
++    TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THIS SOFTWARE IS PROVIDED
++    *AS IS* AND NVIDIA AND ITS SUPPLIERS DISCLAIM ALL WARRANTIES, EITHER EXPRESS
++    OR IMPLIED, INCLUDING, BUT NOT LIMITED TO, IMPLIED WARRANTIES OF
++    MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.  IN NO EVENT SHALL NVIDIA
++    OR ITS SUPPLIERS BE LIABLE FOR ANY SPECIAL, INCIDENTAL, INDIRECT, OR
++    CONSEQUENTIAL DAMAGES WHATSOEVER (INCLUDING, WITHOUT LIMITATION, DAMAGES FOR
++    LOSS OF BUSINESS PROFITS, BUSINESS INTERRUPTION, LOSS OF BUSINESS INFORMATION,
++    OR ANY OTHER PECUNIARY LOSS) ARISING OUT OF THE USE OF OR INABILITY TO USE
++    THIS SOFTWARE, EVEN IF NVIDIA HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
++    DAMAGES.
++
++2. Tonemapping (wolTonemap)
++---------------------------
++The curve is the ACES fit of Krzysztof Narkowicz ("ACES Filmic Tone Mapping Curve", 2016: (x(2.51x+0.03)) / (x(2.43x+0.59)+0.14)), a published formula,
++normalised to white, mixed with the identity and followed by a soft clip. The sRGB transfer functions are the ones of the IEC 61966-2-1 standard.
++
++3. SMAA
++-------
++wolAA 2 is FXAA in its high quality form, not SMAA 1x: SMAA needs three passes, an area texture (160x560) and a search texture (64x16) of precomputed
++data that cannot be embedded without a dependency, so it was not written (see README-post.md).
+diff --git b/Shaders/WolPost/WolPost.cmake b/Shaders/WolPost/WolPost.cmake
+new file mode 100644
+index 0000000..e98319a
+--- /dev/null
++++ b/Shaders/WolPost/WolPost.cmake
+@@ -0,0 +1,9 @@
++# Not in the original client (World of Legends): the post-processing shader of the native pass WolPost (wolAA, wolTonemap), brief E1.
++# Included by Shaders/VolFog/CMakeLists.txt right before the patch-Z.MPQ command, so that it uses the same chain (volfog_shader: fxc ->
++# Tools/VolFog/mkbls.py -> Tools/VolFog/mkmpq.py) and lands in the same MPQ. CMAKE_CURRENT_SOURCE_DIR is Shaders/VolFog here, hence the ../WolPost.
++# WolPost.bls has six permutations, index = AA * 2 + TONEMAP (AA 0 off / 1 FXAA quality 12 / 2 FXAA high, TONEMAP 0 / 1); 0 is never drawn.
++# The vertex shader is the quad one of the fog (WolVolFogQuad, vf_fullscreen_vs.hlsl).
++volfog_shader(WolPost ps ../WolPost/WolPost.hlsl PERMUTATIONS
++    "AA=0,TONEMAP=0" "AA=0,TONEMAP=1"
++    "AA=1,TONEMAP=0" "AA=1,TONEMAP=1"
++    "AA=2,TONEMAP=0" "AA=2,TONEMAP=1")
+diff --git b/Shaders/WolPost/WolPost.hlsl b/Shaders/WolPost/WolPost.hlsl
+new file mode 100644
+index 0000000..efe74cf
+--- /dev/null
++++ b/Shaders/WolPost/WolPost.hlsl
+@@ -0,0 +1,206 @@
++// Not in the original client (World of Legends): pixel shader of the native post-processing pass WolPost (wolAA, wolTonemap), brief E1.
++// Written for this project (GPL-3.0-only like the rest of the client changes). The anti-aliasing is an independent implementation, written from
++// the published description of the algorithm, of "FXAA 3.11" by Timothy Lottes (NVIDIA): local contrast edge test, sub-pixel aliasing estimate,
++// search for the two ends of the edge along its direction with the step table of the "quality" presets, and a single filtered fetch moved
++// across the edge. No source of FXAA is included; the licence text of NVIDIA FXAA 3.11 is in Shaders/WolPost/NOTICE.txt.
++//
++// One pixel shader, compiled by fxc as ps_3_0 with /D AA=0|1|2 and /D TONEMAP=0|1 (WolPost.bls permutation = AA * 2 + TONEMAP; AA 0 + TONEMAP 0
++// is never drawn but is compiled so that the index is simple):
++//   AA 1: FXAA "quality 12" (5 search steps 1, 1.5, 2, 4, 12), the default edge thresholds of FXAA (0.166 / 0.0833) and a sub-pixel amount of 0.5
++//         (the default is 0.75: it blurred the textures and the leaves more than the test of E1 allows, see README-post.md).
++//   AA 2: FXAA high quality (12 search steps, the table of preset 39), thresholds 0.125 / 0.0625 (more edges), sub-pixel amount 0.5.
++//   TONEMAP 1: filmic tonemapping in linear light (see Tonemap()) with exposure (c1.x) and saturation (c1.y), after the anti-aliasing.
++// The scene is the back buffer copied to a texture of exactly the size of the world viewport (A8R8G8B8, bilinear, clamp): uv = (pixel + 0.5 - origin) / size.
++#ifndef AA
++#error AA must be 0, 1 or 2
++#endif
++#ifndef TONEMAP
++#error TONEMAP must be 0 or 1
++#endif
++
++float4 cArea : register(c0); // xy origin of the copied area in the back buffer (pixels, from the top left), zw its size in pixels
++float4 cLook : register(c1); // x exposure (0.5 - 2.0), y saturation (0.5 - 1.5), zw one texel of the copy (1 / width, 1 / height)
++sampler2D sScene : register(s0);
++
++float3 Fetch(float2 uv)
++{
++    return tex2Dlod(sScene, float4(uv, 0, 0)).rgb;
++}
++
++float Luma(float3 rgb)
++{
++    return dot(rgb, float3(0.299, 0.587, 0.114));
++}
++
++#if AA > 0
++#if AA == 1
++#define STEPS 5
++static const float kStep[STEPS] = { 1.0, 1.5, 2.0, 4.0, 12.0 };
++static const float kEdgeThreshold = 0.166;
++static const float kEdgeMin = 0.0833;
++static const float kSubpixel = 0.5;
++#else
++#define STEPS 12
++static const float kStep[STEPS] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0 };
++static const float kEdgeThreshold = 0.125;
++static const float kEdgeMin = 0.0625;
++static const float kSubpixel = 0.5;
++#endif
++
++float3 Antialias(float2 uv, float2 texel)
++{
++    float3 rgbM = Fetch(uv);
++    float lumaM = Luma(rgbM);
++    float lumaN = Luma(Fetch(uv + float2(0, -texel.y)));
++    float lumaS = Luma(Fetch(uv + float2(0, texel.y)));
++    float lumaW = Luma(Fetch(uv + float2(-texel.x, 0)));
++    float lumaE = Luma(Fetch(uv + float2(texel.x, 0)));
++
++    float rangeMax = max(max(lumaN, lumaS), max(max(lumaW, lumaE), lumaM));
++    float rangeMin = min(min(lumaN, lumaS), min(min(lumaW, lumaE), lumaM));
++    float range = rangeMax - rangeMin;
++
++    // Not an edge: low local contrast (relative to the brightest neighbour, with a floor for the dark areas).
++    if (range < max(kEdgeMin, rangeMax * kEdgeThreshold))
++    {
++        return rgbM;
++    }
++
++    float lumaNW = Luma(Fetch(uv + float2(-texel.x, -texel.y)));
++    float lumaNE = Luma(Fetch(uv + float2(texel.x, -texel.y)));
++    float lumaSW = Luma(Fetch(uv + float2(-texel.x, texel.y)));
++    float lumaSE = Luma(Fetch(uv + float2(texel.x, texel.y)));
++
++    float lumaNS = lumaN + lumaS;
++    float lumaWE = lumaW + lumaE;
++    float lumaNWSW = lumaNW + lumaSW;
++    float lumaNESE = lumaNE + lumaSE;
++    float lumaNWNE = lumaNW + lumaNE;
++    float lumaSWSE = lumaSW + lumaSE;
++
++    // Sub-pixel aliasing: how far the pixel is from the low-pass of its eight neighbours, relative to the local range.
++    float lowPass = (2.0 * (lumaNS + lumaWE) + lumaNWSW + lumaNESE) * (1.0 / 12.0);
++    float subpixC = saturate(abs(lowPass - lumaM) / range);
++    float subpixF = (3.0 - 2.0 * subpixC) * subpixC * subpixC;
++    float subpixBlend = subpixF * subpixF * kSubpixel;
++
++    // Edge orientation: second derivative of the luma along the two axes, summed over three rows / columns.
++    float edgeHorz = abs(-2.0 * lumaW + lumaNWSW) + abs(-2.0 * lumaM + lumaNS) * 2.0 + abs(-2.0 * lumaE + lumaNESE);
++    float edgeVert = abs(-2.0 * lumaS + lumaSWSE) + abs(-2.0 * lumaM + lumaWE) * 2.0 + abs(-2.0 * lumaN + lumaNWNE);
++    bool horzSpan = edgeHorz >= edgeVert;
++
++    // The two pixels across the edge (N / S for a horizontal edge, W / E for a vertical one): which side has the steeper gradient.
++    float lumaA = horzSpan ? lumaN : lumaW;
++    float lumaB = horzSpan ? lumaS : lumaE;
++    float gradientA = lumaA - lumaM;
++    float gradientB = lumaB - lumaM;
++    bool pairA = abs(gradientA) >= abs(gradientB);
++    float gradient = max(abs(gradientA), abs(gradientB));
++    float lumaPair = pairA ? (lumaA + lumaM) : (lumaB + lumaM); // average (x2) of the pixel and its steeper neighbour
++    float acrossStep = horzSpan ? texel.y : texel.x;
++    acrossStep = pairA ? -acrossStep : acrossStep;
++
++    // Start on the edge between the two pixels and walk along it in both directions until the luma at the edge changes sign.
++    float2 along = horzSpan ? float2(texel.x, 0) : float2(0, texel.y);
++    float2 posEdge = uv + (horzSpan ? float2(0, acrossStep * 0.5) : float2(acrossStep * 0.5, 0));
++    float2 posN = posEdge - along * kStep[0];
++    float2 posP = posEdge + along * kStep[0];
++    float gradientScaled = gradient * 0.25;
++    float lumaMM = lumaM - lumaPair * 0.5;
++    bool centreBelow = lumaMM < 0.0;
++    float lumaEndN = Luma(Fetch(posN)) - lumaPair * 0.5;
++    float lumaEndP = Luma(Fetch(posP)) - lumaPair * 0.5;
++    bool doneN = abs(lumaEndN) >= gradientScaled;
++    bool doneP = abs(lumaEndP) >= gradientScaled;
++
++    [unroll]
++    for (int i = 1; i < STEPS; i++)
++    {
++        [branch]
++        if (!(doneN && doneP))
++        {
++            if (!doneN)
++            {
++                posN -= along * kStep[i];
++                lumaEndN = Luma(Fetch(posN)) - lumaPair * 0.5;
++                doneN = abs(lumaEndN) >= gradientScaled;
++            }
++            if (!doneP)
++            {
++                posP += along * kStep[i];
++                lumaEndP = Luma(Fetch(posP)) - lumaPair * 0.5;
++                doneP = abs(lumaEndP) >= gradientScaled;
++            }
++        }
++    }
++
++    float dstN = horzSpan ? (uv.x - posN.x) : (uv.y - posN.y);
++    float dstP = horzSpan ? (posP.x - uv.x) : (posP.y - uv.y);
++    bool goodN = (lumaEndN < 0.0) != centreBelow; // the end of the span must be on the other side of the edge than the pixel
++    bool goodP = (lumaEndP < 0.0) != centreBelow;
++    bool nearestIsN = dstN < dstP;
++    bool goodSpan = nearestIsN ? goodN : goodP;
++    float offset = goodSpan ? (0.5 - min(dstN, dstP) / (dstN + dstP)) : 0.0;
++    offset = max(offset, subpixBlend);
++
++    float2 posOut = uv + (horzSpan ? float2(0, offset * acrossStep) : float2(offset * acrossStep, 0));
++    return Fetch(posOut);
++}
++#endif
++
++#if TONEMAP == 1
++// sRGB <-> linear light (exact curves).
++float3 SrgbToLinear(float3 c)
++{
++    return lerp(pow(abs((c + 0.055) / 1.055), 2.4), c / 12.92, step(c, 0.04045));
++}
++
++float3 LinearToSrgb(float3 c)
++{
++    c = saturate(c);
++    return lerp(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, step(c, 0.0031308));
++}
++
++// ACES fit of K. Narkowicz (2016), per channel.
++float3 AcesFit(float3 x)
++{
++    return (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
++}
++
++// Filmic curve for an image that is already display referred (the client draws in gamma space with 8 bit targets). Pure ACES would darken the
++// shadows and lift the mid-tones of such an image by far too much, so the curve is the ACES fit normalised to white (kFilmicPre / kFilmicWhite)
++// and mixed with the identity by kFilmicMix: at exposure 1 and saturation 1 it is a gentle S (mean luminance within a few percent, a little more
++// contrast); a higher exposure pushes the lights into the shoulder instead of clipping them. The soft clip (exponential, from kKnee to 1) is the
++// last stage. The constants (0.7, 0.2, gain 1.04) come from an offline grid search on five captures of the earlier fog tests (mean luminance, standard deviation and the brightest 1 %), checked in game: see patches-cliente/post-nativo/README-post.md.
++static const float kFilmicPre = 0.7;
++static const float kFilmicWhite = 0.717383; // AcesFit(0.7) for a unit input, so that 1.0 stays 1.0 before the gain
++static const float kFilmicMix = 0.2;
++static const float kGain = 1.04;
++static const float kKnee = 0.9;
++
++float3 Tonemap(float3 rgb, float exposure, float saturation)
++{
++    float3 x = SrgbToLinear(rgb) * exposure;
++    float3 filmic = AcesFit(x * kFilmicPre) / kFilmicWhite;
++    float3 y = (x + (filmic - x) * kFilmicMix) * kGain;
++    float3 over = (y - kKnee) / (1.0 - kKnee);
++    y = lerp(y, kKnee + (1.0 - kKnee) * (1.0 - exp(-over)), step(kKnee, y));
++    float luminance = dot(y, float3(0.2126, 0.7152, 0.0722));
++    y = lerp(luminance.xxx, y, saturation);
++    return LinearToSrgb(y);
++}
++#endif
++
++float4 main(float2 pixel : VPOS) : COLOR0
++{
++    float2 uv = (pixel + 0.5 - cArea.xy) / cArea.zw;
++#if AA > 0
++    float3 rgb = Antialias(uv, cLook.zw);
++#else
++    float3 rgb = Fetch(uv);
++#endif
++#if TONEMAP == 1
++    rgb = Tonemap(rgb, cLook.x, cLook.y);
++#endif
++    return float4(rgb, 1.0);
++}
+diff --git a/Tools/WowClient/CMakeLists.txt b/Tools/WowClient/CMakeLists.txt
+index 0be638e..3eb5d9b 100644
+--- a/Tools/WowClient/CMakeLists.txt
++++ b/Tools/WowClient/CMakeLists.txt
+@@ -55,6 +55,7 @@ target_link_libraries(WowClient
+         ConsoleBase
+         Event
+         FFX
++        WolPost
+         Frame
+         FrameScript
+         lua
+diff --git a/WoW/Source/Ui/WorldFrame.cpp b/WoW/Source/Ui/WorldFrame.cpp
+index 53efbb7..54e2d6f 100644
+--- a/WoW/Source/Ui/WorldFrame.cpp
++++ b/WoW/Source/Ui/WorldFrame.cpp
+@@ -11,6 +11,7 @@
+ #include "Engine/Source/FFX/EffectGlow.h"
+ #include "Engine/Source/FFX/FFX.h"
+ #include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
++#include "Engine/Source/WolPost/WolPost.h" // Not in the original client (World of Legends)
+ #include "Engine/Source/Frame/CRenderBatch.h"
+ #include "Engine/Source/Frame/CSimpleTop.h"
+ #include "Engine/Source/FrameScript/FrameScript.h"
+@@ -1782,6 +1783,9 @@ void CGWorldFrame::OnWorldRender() {
+     DayNight::RenderGlares();
+     // Not in the original client (World of Legends): native volumetric fog, drawn before the 3D names so that the text stays sharp.
+     VolFog::Render();
++    // Not in the original client (World of Legends): native post-processing (wolAA, wolTonemap), brief E1. After the fog and before the 3D names, so the
++    // names (and the interface, drawn later) are neither smoothed nor tonemapped; with both CVars at 0 it returns at once.
++    WolPost::Render();
+     PlayerNameUpdateLate();
+ 
+     if (CWorld::enables & 0x20000000) {
+diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
+index 24eb63a..029a93f 100644
+--- a/WoW/Source/WorldClient/WorldParam.h
++++ b/WoW/Source/WorldClient/WorldParam.h
+@@ -51,6 +51,11 @@ class CWorldParam {
+     static CVar* cvar_wolVolFogDensity;
+     static CVar* cvar_wolVolFogGodRays;
+     static CVar* cvar_wolVolFogLocalLights;
++    // Not in the original client (World of Legends): native post-processing (brief E1), see patches-cliente/post-nativo/README-post.md.
++    static CVar* cvar_wolAA;
++    static CVar* cvar_wolTonemap;
++    static CVar* cvar_wolExposure;
++    static CVar* cvar_wolSaturation;
+ 
+     static bool BaseMipCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool BspCacheCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+@@ -96,6 +101,11 @@ class CWorldParam {
+     static bool WolVolFogDensityCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolVolFogGodRaysCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolVolFogLocalLightsCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    // Not in the original client (brief E1): validated, applied at once (read every frame through WolPost::GetSettings()).
++    static bool WolAACallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolTonemapCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolExposureCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolSaturationCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     // Not in the original client (brief B3b): registers wolVolFog, wolVolFogDebug and (brief B4) wolVolFogDensity, wolVolFogGodRays and wolVolFogLocalLights. RegisterGxCVars calls it before the Gx device exists.
+     static void RegisterVolFogCVars();
+     static bool TextureFilteringCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index 9972aa5..521b563 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -8,6 +8,7 @@
+ #include "Engine/Source/ShaderEffect/ShaderEffect.h"
+ #include "Engine/Source/ShaderEffect/ShadowCache.h"
+ #include "Engine/Source/VolFog/VolFog.h" // Not in the original client (World of Legends)
++#include "Engine/Source/WolPost/WolPost.h" // Not in the original client (World of Legends)
+ #include "WoW/Source/WorldClient/VolFogWorld.h" // Not in the original client (World of Legends)
+ #include "WoW/Common/AaBsp.h"
+ #include "WoW/Source/UIUtil/PortraitButton.h"
+@@ -128,6 +129,12 @@ CVar* CWorldParam::cvar_wolVolFogDensity;
+ CVar* CWorldParam::cvar_wolVolFogGodRays;
+ CVar* CWorldParam::cvar_wolVolFogLocalLights;
+ 
++// Not in the original client (World of Legends): native post-processing, brief E1.
++CVar* CWorldParam::cvar_wolAA;
++CVar* CWorldParam::cvar_wolTonemap;
++CVar* CWorldParam::cvar_wolExposure;
++CVar* CWorldParam::cvar_wolSaturation;
++
+ #define WOL_FARCLIP_FACTOR_MAX 3.0f
+ 
+ static float ClampEnvironmentDetail(float detail) {
+@@ -951,6 +958,95 @@ bool CWorldParam::WolVolFogLocalLightsCallback(CVar* var, const char* oldValue,
+     return true;
+ }
+ 
++// Not in the original client (brief E1). wolAA 0-2 (default 0): 0 off, 1 FXAA 3.11 quality 12, 2 FXAA high quality. Read every frame (WolPost::Render).
++bool CWorldParam::WolAACallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    if (!value || value[0] < '0' || value[0] > '2' || value[1] != '\0') {
++        ConsoleWrite("wolAA must be 0 (off), 1 (FXAA, quality 12) or 2 (FXAA, high quality).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    WolPost::SetAA(value[0] - '0');
++
++    // No message while the CVar is first registered (no previous value).
++    if (oldValue && *oldValue) {
++        static const char* const s_names[3] = { "off", "FXAA 3.11, quality 12", "FXAA 3.11, high quality" };
++        char buffer[96];
++        SStrPrintf(buffer, sizeof(buffer), "wolAA: %c (%s)", value[0], s_names[value[0] - '0']);
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief E1). wolTonemap 0 or 1 (default 0): filmic tonemapping in linear light, with wolExposure and wolSaturation.
++bool CWorldParam::WolTonemapCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    if (!value || (value[0] != '0' && value[0] != '1') || value[1] != '\0') {
++        ConsoleWrite("wolTonemap must be 0 (off) or 1 (on).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    WolPost::SetTonemap(value[0] - '0');
++
++    if (oldValue && *oldValue) {
++        char buffer[112];
++        const WolPost::Settings& settings = WolPost::GetSettings();
++
++        if (value[0] == '1') {
++            SStrPrintf(buffer, sizeof(buffer), "wolTonemap: on (filmic, exposure %.2f, saturation %.2f)", static_cast<double>(settings.exposure), static_cast<double>(settings.saturation));
++        } else {
++            SStrPrintf(buffer, sizeof(buffer), "wolTonemap: off");
++        }
++
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief E1). wolExposure 0.5-2.0 (default 1.0): multiplies the linear light before the tonemap curve (only with wolTonemap 1).
++bool CWorldParam::WolExposureCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float exposure = 0.0f;
++
++    if (!WolVolFogParseFloat(value, exposure) || exposure < 0.5f || exposure > 2.0f) {
++        ConsoleWrite("wolExposure must be in range 0.5 to 2.0.", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    WolPost::SetExposure(exposure);
++
++    if (oldValue && *oldValue) {
++        char buffer[96];
++        SStrPrintf(buffer, sizeof(buffer), "wolExposure: %.2f%s", static_cast<double>(exposure), WolPost::GetSettings().tonemap ? "" : " (needs wolTonemap 1)");
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief E1). wolSaturation 0.5-1.5 (default 1.0): 1.0 keeps the colours, below it desaturates, above it saturates (only with wolTonemap 1).
++bool CWorldParam::WolSaturationCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float saturation = 0.0f;
++
++    if (!WolVolFogParseFloat(value, saturation) || saturation < 0.5f || saturation > 1.5f) {
++        ConsoleWrite("wolSaturation must be in range 0.5 to 1.5.", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    WolPost::SetSaturation(saturation);
++
++    if (oldValue && *oldValue) {
++        char buffer[96];
++        SStrPrintf(buffer, sizeof(buffer), "wolSaturation: %.2f%s", static_cast<double>(saturation), WolPost::GetSettings().tonemap ? "" : " (needs wolTonemap 1)");
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
+ // Not in the original client (brief B3b). Called from RegisterGxCVars, before the Gx device is created (it used to be in Initialize,
+ // after the device): with wolVolFog saved in Config.wtf the first device already drops MSAA and builds the INTZ depth, no gxRestart.
+ void CWorldParam::RegisterVolFogCVars() {
+@@ -963,6 +1059,12 @@ void CWorldParam::RegisterVolFogCVars() {
+     CWorldParam::cvar_wolVolFogDensity = CVar::Register("wolVolFogDensity", "Volumetric fog density multiplier (0.0 to 4.0)", 1, "1.0", CWorldParam::WolVolFogDensityCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolVolFogGodRays = CVar::Register("wolVolFogGodRays", "Volumetric fog light shaft strength (0.0 off to 1.0)", 1, "0.0", CWorldParam::WolVolFogGodRaysCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolVolFogLocalLights = CVar::Register("wolVolFogLocalLights", "Point lights scattered in the volumetric fog (0 off, 1 on); only with wolVolFog 2 or 3", 1, "1", CWorldParam::WolVolFogLocalLightsCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    // Not in the original client (brief E1): native post-processing, saved in Config.wtf and applied at once. Registered here (before the Gx device
++    // exists) so the saved values are in place for the first frame.
++    CWorldParam::cvar_wolAA = CVar::Register("wolAA", "Native anti-aliasing (0 off, 1 FXAA quality 12, 2 FXAA high quality)", 1, "0", CWorldParam::WolAACallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolTonemap = CVar::Register("wolTonemap", "Native filmic tonemapping in linear light (0 off, 1 on)", 1, "0", CWorldParam::WolTonemapCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolExposure = CVar::Register("wolExposure", "Tonemapping exposure (0.5 to 2.0), needs wolTonemap 1", 1, "1.0", CWorldParam::WolExposureCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolSaturation = CVar::Register("wolSaturation", "Tonemapping saturation (0.5 to 1.5), needs wolTonemap 1", 1, "1.0", CWorldParam::WolSaturationCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Brief B5: the reader of the frame inputs for the fog model (Engine/ does not depend on WoW/).
+     VolFogWorld::Install();
+ }
