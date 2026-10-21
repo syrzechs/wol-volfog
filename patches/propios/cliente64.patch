@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index fc42b44..c9a1f2d 100644
+index 722eec3..96f3b60 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -54,6 +54,29 @@ if (WOWDECOMP_DISABLE_SIGNATURE_CHECKS)
@@ -33,7 +33,7 @@ index fc42b44..c9a1f2d 100644
  if (EXISTS ${CMAKE_SOURCE_DIR}/ThirdParty/CMakeLists.txt)
      add_subdirectory(ThirdParty)
 diff --git a/Tools/WowClient/CMakeLists.txt b/Tools/WowClient/CMakeLists.txt
-index db32a71..0be638e 100644
+index f9e58af..279135f 100644
 --- a/Tools/WowClient/CMakeLists.txt
 +++ b/Tools/WowClient/CMakeLists.txt
 @@ -21,6 +21,9 @@ endif ()
@@ -47,7 +47,7 @@ index db32a71..0be638e 100644
  if (TARGET VolFogShaders)
      add_dependencies(WowClient VolFogShaders)
 diff --git a/Tools/WowClient/crash_log.cpp b/Tools/WowClient/crash_log.cpp
-index 54f51ab..0b8c5db 100644
+index 3522038..e041633 100644
 --- a/Tools/WowClient/crash_log.cpp
 +++ b/Tools/WowClient/crash_log.cpp
 @@ -6,6 +6,9 @@
@@ -77,7 +77,7 @@ index 54f51ab..0b8c5db 100644
          // WowClient_crash.log. Define WOWCLIENT_CRASH_CONSOLE para recuperar la consola de depuracion.
  #ifdef WOWCLIENT_CRASH_CONSOLE
 diff --git a/WoW/Source/CMakeLists.txt b/WoW/Source/CMakeLists.txt
-index 24e68e8..d5f87c6 100644
+index 1a4cb7b..cf1625c 100644
 --- a/WoW/Source/CMakeLists.txt
 +++ b/WoW/Source/CMakeLists.txt
 @@ -8,6 +8,9 @@ endif ()
@@ -91,7 +91,7 @@ index 24e68e8..d5f87c6 100644
      set(WOW_OUTPUT_NAME Wow64)
  else ()
 diff --git a/WoW/Source/Client.cpp b/WoW/Source/Client.cpp
-index 1986ea7..b8f9b0f 100644
+index 1207fb9..a324028 100644
 --- a/WoW/Source/Client.cpp
 +++ b/WoW/Source/Client.cpp
 @@ -1347,6 +1347,13 @@ void ClientInitializeGame(uint32_t mapId, C3Vector position) {
@@ -136,7 +136,7 @@ index 1986ea7..b8f9b0f 100644
      g_rndSeed.SetSeed(OsGetAsyncTimeMs());
      g_clientEventContext = EventCreateContextEx(1, InitializeEngineCallback, DestroyEngineCallback, 0, 0);
 diff --git a/WoW/Source/Client.h b/WoW/Source/Client.h
-index 91cb560..ee49a5a 100644
+index 81462c2..727060d 100644
 --- a/WoW/Source/Client.h
 +++ b/WoW/Source/Client.h
 @@ -59,6 +59,8 @@ extern CVar* g_readTerminationWithoutNoticeVar;
@@ -149,10 +149,10 @@ index 91cb560..ee49a5a 100644
  extern WowClientDB<Startup_StringsRec> g_startup_StringsDB;
  extern CVar* s_cvarUIFaster;
 diff --git a/WoW/Source/Client_CVar.cpp b/WoW/Source/Client_CVar.cpp
-index ff9609c..2de2ef1 100644
+index 48c3fd8..e5727d9 100644
 --- a/WoW/Source/Client_CVar.cpp
 +++ b/WoW/Source/Client_CVar.cpp
-@@ -639,6 +639,24 @@ bool LocaleCallback(CVar* var, const char* oldValue, const char* value, void* ar
+@@ -640,6 +640,24 @@ bool LocaleCallback(CVar* var, const char* oldValue, const char* value, void* ar
      return true;
  }
  
@@ -174,20 +174,20 @@ index ff9609c..2de2ef1 100644
 +    return value && !SStrCmp(value, g_wolBuildString, STORM_MAX_STR);
 +}
 +
- // VERIFY: 9951b118 manual
- // OFFSET: 0x00401B60
- void ClientRegisterConsoleCommands() {
-@@ -652,6 +670,8 @@ void ClientRegisterConsoleCommands() {
+ // Not in the original client (World of Legends): CVar wolFileLog (0/1), Logs/files.log with every .blp and Tileset\ open.
+ static bool WolFileLogCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
+     Blizzard::Mopaq::WolFileLogSet(value && value[0] == '1');
+@@ -659,6 +677,8 @@ void ClientRegisterConsoleCommands() {
      // savedPassword from GetCVar in the in-game UI, like accountName.
      g_savePasswordVar = CVar::Register("savePassword", "Remember the account password on the login screen", 0, "0", nullptr, CATEGORY_GAME, false, nullptr, false);
      g_savedPasswordVar = CVar::Register("savedPassword", "Saved account password (obfuscated, not encrypted)", 0x40, "", nullptr, CATEGORY_GAME, false, nullptr, false);
 +    // Not in the original client (World of Legends): read-only build string (flag 0x100: "is read only" in the console).
 +    CVar::Register("wolBuild", "Build of the World of Legends 64-bit client (read-only)", 0x100, g_wolBuildString, WolBuildCallback, CATEGORY_GAME, false, nullptr, false);
+     // Not in the original client (World of Legends): file-open log for textures (.blp) and terrain files (0 = off, default).
+     CVar::Register("wolFileLog", "Log every .blp and Tileset file open to Logs/files.log (0 = off, 1 = on)", 0, "0", WolFileLogCallback, CATEGORY_DEBUG, false, nullptr, false);
      s_cvMovie = CVar::Register("movie", "Show movie on startup", 0, "1", nullptr, CATEGORY_GAME, false, nullptr, false);
-     s_cvExpansionMovie = CVar::Register("expansionMovie", "Show expansion movie on startup", 0, "1", nullptr, CATEGORY_GAME, false, nullptr, false);
-     s_cvMovieSubtitle = CVar::Register("movieSubtitle", "Show movie subtitles", 0, "0", nullptr, CATEGORY_GAME, false, nullptr, false);
 diff --git a/WoW/Source/WowServices/PatchFiles.cpp b/WoW/Source/WowServices/PatchFiles.cpp
-index 0fa7f48..49fef94 100644
+index ac8f886..7038aa9 100644
 --- a/WoW/Source/WowServices/PatchFiles.cpp
 +++ b/WoW/Source/WowServices/PatchFiles.cpp
 @@ -70,6 +70,18 @@ PatchFiles::PatchFiles(const char* locale, bool flag) {
@@ -210,7 +210,7 @@ index 0fa7f48..49fef94 100644
          }
      }
 diff --git a/waystone.rc b/waystone.rc
-index 371ffd8..ca0f074 100644
+index 7cc73c8..a1dd257 100644
 --- a/waystone.rc
 +++ b/waystone.rc
 @@ -1 +1,34 @@

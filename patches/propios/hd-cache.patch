@@ -47,11 +47,11 @@ index 5a9d0f2..4ef5279 100644
  void WolFileLogSet(int32_t enabled);
  
 diff --git a/WoW/Source/Client_CVar.cpp b/WoW/Source/Client_CVar.cpp
-index 82d3200..e5727d9 100644
+index 065c31e..48c3fd8 100644
 --- a/WoW/Source/Client_CVar.cpp
 +++ b/WoW/Source/Client_CVar.cpp
-@@ -658,7 +658,7 @@ static bool WolBuildCallback(CVar* var, const char* oldValue, const char* value,
-     return value && !SStrCmp(value, g_wolBuildString, STORM_MAX_STR);
+@@ -640,7 +640,7 @@ bool LocaleCallback(CVar* var, const char* oldValue, const char* value, void* ar
+     return true;
  }
  
 -// Not in the original client (World of Legends): CVar wolFileLog (0/1), Logs/files.log with every Tileset\ open.
@@ -59,10 +59,10 @@ index 82d3200..e5727d9 100644
  static bool WolFileLogCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
      Blizzard::Mopaq::WolFileLogSet(value && value[0] == '1');
      return true;
-@@ -679,8 +679,8 @@ void ClientRegisterConsoleCommands() {
+@@ -659,8 +659,8 @@ void ClientRegisterConsoleCommands() {
+     // savedPassword from GetCVar in the in-game UI, like accountName.
+     g_savePasswordVar = CVar::Register("savePassword", "Remember the account password on the login screen", 0, "0", nullptr, CATEGORY_GAME, false, nullptr, false);
      g_savedPasswordVar = CVar::Register("savedPassword", "Saved account password (obfuscated, not encrypted)", 0x40, "", nullptr, CATEGORY_GAME, false, nullptr, false);
-     // Not in the original client (World of Legends): read-only build string (flag 0x100: "is read only" in the console).
-     CVar::Register("wolBuild", "Build of the World of Legends 64-bit client (read-only)", 0x100, g_wolBuildString, WolBuildCallback, CATEGORY_GAME, false, nullptr, false);
 -    // Not in the original client (World of Legends): file-open log for terrain textures (0 = off, default).
 -    CVar::Register("wolFileLog", "Log every Tileset file open to Logs/files.log (0 = off, 1 = on)", 0, "0", WolFileLogCallback, CATEGORY_DEBUG, false, nullptr, false);
 +    // Not in the original client (World of Legends): file-open log for textures (.blp) and terrain files (0 = off, default).
@@ -114,7 +114,7 @@ index 8cd2089..2ef1bf7 100644
  
  int32_t FrustumCull(const CAaBox& box);
 diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
-index 04c95f6..8479276 100644
+index 3fd8133..c0bec3c 100644
 --- a/WoW/Source/WorldClient/WorldParam.h
 +++ b/WoW/Source/WorldClient/WorldParam.h
 @@ -42,6 +42,8 @@ class CWorldParam {
@@ -126,7 +126,7 @@ index 04c95f6..8479276 100644
      // Not in the original client (World of Legends): native volumetric fog, see patches-cliente/niebla-volumetrica/README-niebla.md.
      static CVar* cvar_wolVolFog;
      static CVar* cvar_wolVolFogDebug;
-@@ -87,6 +89,7 @@ class CWorldParam {
+@@ -92,6 +94,7 @@ class CWorldParam {
      // Not in the original client.
      static bool WolFarClipFactorCallback(CVar* var, const char* oldValue, const char* value, void* arg);
      static bool WolShadowMapSizeCallback(CVar* var, const char* oldValue, const char* value, void* arg);
@@ -135,10 +135,10 @@ index 04c95f6..8479276 100644
      static bool WolVolFogDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg);
      // Not in the original client (brief B4): validated, applied at once (read every frame through VolFog::Settings()).
 diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
-index 669c0f0..0a6066f 100644
+index 81d051d..98f4852 100644
 --- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
 +++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
-@@ -118,6 +118,9 @@ CVar* CWorldParam::cvar_wolFarClipFactor;
+@@ -119,6 +119,9 @@ CVar* CWorldParam::cvar_wolFarClipFactor;
  // Not in the original client (World of Legends): wolShadowMapSize, see patches-cliente/sombras-4096/README-sombras.md.
  CVar* CWorldParam::cvar_wolShadowMapSize;
  
@@ -148,7 +148,7 @@ index 669c0f0..0a6066f 100644
  // Not in the original client (World of Legends): wolVolFogDebug, see patches-cliente/niebla-volumetrica/README-niebla.md.
  CVar* CWorldParam::cvar_wolVolFog;
  CVar* CWorldParam::cvar_wolVolFogDebug;
-@@ -708,6 +711,13 @@ bool CWorldParam::GxTextureCacheSizeCallback(CVar* var, const char* oldValue, co
+@@ -715,6 +718,13 @@ bool CWorldParam::GxTextureCacheSizeCallback(CVar* var, const char* oldValue, co
  
      if (size) {
          World::s_texCacheOverride = size << 20;
@@ -162,7 +162,7 @@ index 669c0f0..0a6066f 100644
          g_theGxDevicePtr->TexSetCacheSize(size << 20);
  
          char buffer[256];
-@@ -722,6 +732,61 @@ bool CWorldParam::GxTextureCacheSizeCallback(CVar* var, const char* oldValue, co
+@@ -729,6 +739,61 @@ bool CWorldParam::GxTextureCacheSizeCallback(CVar* var, const char* oldValue, co
      return true;
  }
  
@@ -224,7 +224,7 @@ index 669c0f0..0a6066f 100644
  // Not in the original client. The Gx library does not link the console: VolFog::Message goes through this hook.
  static void WolVolFogMessage(const char* line) {
      ConsoleWrite(line, DEFAULT_COLOR);
-@@ -943,6 +1008,8 @@ void CWorldParam::Initialize() {
+@@ -1045,6 +1110,8 @@ void CWorldParam::Initialize() {
      CWorldParam::cvar_extShadowQuality = CVar::Register("extShadowQuality", "Quality of exterior shadows (0-5)", 1, "0", CWorldParam::ExtShadowQualityCallback, CATEGORY_GRAPHICS, false, nullptr, false);
      CWorldParam::cvar_projectedTextures = CVar::Register("projectedTextures", "Projected Textures", 1, "0", CWorldParam::ProjectedTexturesCallback, CATEGORY_GRAPHICS, false, nullptr, false);
      CWorldParam::cvar_gxTextureCacheSize = CVar::Register("gxTextureCacheSize", "GX Texture Cache Size", 1, "0", CWorldParam::GxTextureCacheSizeCallback, CATEGORY_GRAPHICS, false, nullptr, false);

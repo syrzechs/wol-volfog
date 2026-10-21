@@ -1,0 +1,164 @@
+diff --git a/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.cpp b/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.cpp
+index eae8ba7..b46f129 100644
+--- a/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.cpp
++++ b/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.cpp
+@@ -1,4 +1,6 @@
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include "Engine/Source/BlizzardCore/SFile2-Core.h"
+ #include "Engine/Source/BlizzardCore/Source/Packages/iounit/IOAlignUnit.h"
+@@ -93,6 +95,61 @@ IOUnit* System_SFile::CreateRangeUnit(IOUnitContainer* container, int64_t start,
+     return IORangeUnit::Create(container, start, end, next);
+ }
+ 
++// Not in the original client (World of Legends): Logs/files.log, one line per open of a file whose path has "Tileset\\"
++// (terrain textures), to diagnose which name the client asks for and which archive answers. Off by default.
++static volatile int32_t s_wolFileLog = -1;  // -1 = not read yet (environment variable), 0/1 = decided
++
++void Blizzard::Mopaq::WolFileLogSet(int32_t enabled) {
++    s_wolFileLog = enabled ? 1 : 0;
++}
++
++static bool WolFileLogWanted(const char* name) {
++    if (s_wolFileLog < 0) {
++        const char* env = getenv("WOL_FILELOG");
++        s_wolFileLog = (env && env[0] == '1') ? 1 : 0;
++    }
++
++    if (!s_wolFileLog || !name) {
++        return false;
++    }
++
++    static const char kKey[] = "tileset";
++
++    for (const char* p = name; *p; p++) {
++        uint32_t i = 0;
++
++        while (kKey[i] && p[i] && (p[i] | 0x20) == kKey[i]) {
++            i++;
++        }
++
++        if (!kKey[i] && (p[i] == '\\' || p[i] == '/')) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++static void WolFileLogLine(const char* name, int32_t found, const char* archiveName, int32_t priority, uint32_t size, uint32_t flags) {
++    // Next to the executable, whatever the working directory is.
++    static FILE* file = []() -> FILE* {
++        char path[520];
++        unsigned long n = GetModuleFileNameA(nullptr, path, 260);
++        while (n > 0 && path[n - 1] != 0x5C && path[n - 1] != 0x2F) {
++            n--;
++        }
++        memcpy(path + n, "Logs/files.log", sizeof("Logs/files.log"));
++        return fopen(path, "a");
++    }();
++
++    if (!file) {
++        return;
++    }
++
++    fprintf(file, "open %s found=%d archive=%s priority=%d size=%u flags=0x%X\n", name, found, archiveName ? archiveName : "-", priority, size, flags);
++    fflush(file);
++}
++
+ // VERIFY: 3c889fb5 manual
+ // OFFSET: 0x004609B0
+ int32_t Blizzard::Mopaq::SFileOpenFileEx(System_SFile::ARCHIVEREC* handle, const char* name, const Blizzard::Util::Digest<16>& md5, uint32_t flags, IOMpqUnit** result) {
+@@ -103,6 +160,11 @@ int32_t Blizzard::Mopaq::SFileOpenFileEx(System_SFile::ARCHIVEREC* handle, const
+     uint32_t blockIndex;
+     char path[260];
+     int32_t found = GetFileBlockEntry(handle, name, md5, flags, nullptr, &archive, &blockIndex, nullptr, path);
++    // Not in the original client (World of Legends): data for Logs/files.log (see WolFileLogLine).
++    bool wolLog = WolFileLogWanted(name);
++    const char* wolArchive = (archive && found == 1) ? archive->m_name : (found == 2 || found == 3 ? path : nullptr);
++    int32_t wolPriority = (archive && found == 1) ? archive->m_priority : -1;
++    uint32_t wolSize = 0;
+ 
+     Blizzard::Log::Printf(3, "Logs/Profiling_File_SFileOpenFileEx.log", "%s\n", name);
+ 
+@@ -115,6 +177,7 @@ int32_t Blizzard::Mopaq::SFileOpenFileEx(System_SFile::ARCHIVEREC* handle, const
+ 
+         case 1: {
+             System_SFile::BLOCKENTRY entry = archive->GetBlockEntry(blockIndex);
++            wolSize = entry.m_fileSize;
+ 
+             if (!(entry.m_flags & 0x80000000)) {
+                 error = 1006;
+@@ -229,6 +292,10 @@ int32_t Blizzard::Mopaq::SFileOpenFileEx(System_SFile::ARCHIVEREC* handle, const
+         }
+     }
+ 
++    if (wolLog) {
++        WolFileLogLine(name, found, wolArchive, wolPriority, wolSize, flags);
++    }
++
+     *result = file;
+     return found;
+ 
+@@ -236,6 +303,10 @@ fail:
+     System_SFile::s_lastError = error;
+     found = 0;
+ 
++    if (wolLog) {
++        WolFileLogLine(name, 0, wolArchive, wolPriority, wolSize, flags);
++    }
++
+     if (file) {
+         file->Release();
+         file = nullptr;
+diff --git a/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.h b/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.h
+index b54ea3a..5a9d0f2 100644
+--- a/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.h
++++ b/Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.h
+@@ -53,6 +53,10 @@ bool CreateDiskFile(const char* name, uint32_t flags, const char* path, System_S
+ namespace Blizzard {
+ namespace Mopaq {
+ 
++// Not in the original client (World of Legends): log of every open of a Tileset\ file (name, archive, size) to Logs/files.log.
++// Off by default; on with the CVar wolFileLog 1 or the environment variable WOL_FILELOG=1.
++void WolFileLogSet(int32_t enabled);
++
+ bool SFileCloseFile(IOMpqUnit* file);
+ bool SFileCreateFile(System_SFile::ARCHIVEREC* handle, const char* name, uint32_t size, uint32_t flags, IOMpqUnit** result);
+ int32_t SFileFileIsLocal(IOMpqUnit* file, int32_t flags);
+diff --git a/WoW/Source/Client_CVar.cpp b/WoW/Source/Client_CVar.cpp
+index ee763b6..065c31e 100644
+--- a/WoW/Source/Client_CVar.cpp
++++ b/WoW/Source/Client_CVar.cpp
+@@ -2,6 +2,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include "Client.h"
++#include "Engine/Source/BlizzardCore/Source/Packages/Mopaq/SFile.h"
+ #include "Engine/Source/BlizzardCore/Source/Packages/Streaming/Streaming.h"
+ #include "Engine/Source/BlizzardCore/SFile2-Core.h"
+ #include "Engine/Source/ConsoleBase/ConsoleCommand.h"
+@@ -639,6 +640,12 @@ bool LocaleCallback(CVar* var, const char* oldValue, const char* value, void* ar
+     return true;
+ }
+ 
++// Not in the original client (World of Legends): CVar wolFileLog (0/1), Logs/files.log with every Tileset\ open.
++static bool WolFileLogCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    Blizzard::Mopaq::WolFileLogSet(value && value[0] == '1');
++    return true;
++}
++
+ // VERIFY: 9951b118 manual
+ // OFFSET: 0x00401B60
+ void ClientRegisterConsoleCommands() {
+@@ -652,6 +659,8 @@ void ClientRegisterConsoleCommands() {
+     // savedPassword from GetCVar in the in-game UI, like accountName.
+     g_savePasswordVar = CVar::Register("savePassword", "Remember the account password on the login screen", 0, "0", nullptr, CATEGORY_GAME, false, nullptr, false);
+     g_savedPasswordVar = CVar::Register("savedPassword", "Saved account password (obfuscated, not encrypted)", 0x40, "", nullptr, CATEGORY_GAME, false, nullptr, false);
++    // Not in the original client (World of Legends): file-open log for terrain textures (0 = off, default).
++    CVar::Register("wolFileLog", "Log every Tileset file open to Logs/files.log (0 = off, 1 = on)", 0, "0", WolFileLogCallback, CATEGORY_DEBUG, false, nullptr, false);
+     s_cvMovie = CVar::Register("movie", "Show movie on startup", 0, "1", nullptr, CATEGORY_GAME, false, nullptr, false);
+     s_cvExpansionMovie = CVar::Register("expansionMovie", "Show expansion movie on startup", 0, "1", nullptr, CATEGORY_GAME, false, nullptr, false);
+     s_cvMovieSubtitle = CVar::Register("movieSubtitle", "Show movie subtitles", 0, "0", nullptr, CATEGORY_GAME, false, nullptr, false);

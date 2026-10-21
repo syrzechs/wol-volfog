@@ -1,0 +1,264 @@
+diff --git a/Engine/Source/WolAO/WolAORender.cpp b/Engine/Source/WolAO/WolAORender.cpp
+index de4ffe1..d3722b7 100644
+--- a/Engine/Source/WolAO/WolAORender.cpp
++++ b/Engine/Source/WolAO/WolAORender.cpp
+@@ -27,11 +27,11 @@ namespace {
+     constexpr uint32_t kMinPs30Slots = 512;
+     constexpr uint32_t kMaxFailures = 3;
+     constexpr uint32_t kConstants = 8;              // c0-c7
+-    constexpr float kMaxRadiusPx = 48.0f;           // design: largest sphere of influence on the screen, in full resolution pixels
++    constexpr float kMaxRadiusPx = 96.0f;           // largest sphere of influence on the screen, in full resolution pixels (E2b: 96; E2 had 48, which cut the 1.5 yd radius to 0.25 yd at 7 yd and left only thin lines)
+     constexpr float kFadeStart = 120.0f;            // yards: the AO fades out between these two distances
+     constexpr float kFadeEnd = 250.0f;
+     constexpr float kBias = 0.1f;                   // angular bias of the occlusion term (cos of the angle at which a sample starts to count)
+-    constexpr float kGain = 5.0f;                   // scales the mean occlusion of the samples to the darkening of a concave corner (measured: 2.0 gave a 1 % drop of the lower third)
++    constexpr float kGain = 4.5f;                   // scales the mean occlusion of the samples to the darkening of a concave corner (E2 had 5.0, measured with the cap at 48 px)
+     constexpr float kBlurSharpness = 20.0f;         // weight of the blur taps: exp(-|dz| / z * 20)
+     constexpr float kUpsampleSharpness = 60.0f;     // weight of the up-sampling taps: exp(-|dz| / z * 60)
+     constexpr uint32_t kDirections = 8;
+@@ -244,12 +244,12 @@ void WolAO::Draw(bool late) {
+         // Created on first use and kept for the whole run; the shaders belong to the device and go with it.
+         s_ao.ao = new AoPass("WolAO", 2, GxBlend_Opaque);
+         s_ao.blur = new AoPass("WolAOBlur", 2, GxBlend_Opaque);
+-        s_ao.composite = new AoPass("WolAOComposite", 4, GxBlend_Alpha); // black with alpha = 1 - multiplier: dest * multiplier
+-        s_ao.debug = new AoPass("WolAOComposite", 4, GxBlend_Opaque);
++        s_ao.composite = new AoPass("WolAOComposite", 5, GxBlend_Mod); // DESTCOLOR * multiplier (brief E2b: back to the blend of the design)
++        s_ao.debug = new AoPass("WolAOComposite", 5, GxBlend_Opaque);
+     }
+ 
+     const uint32_t quality = static_cast<uint32_t>(std::clamp(settings.mode, 1, 2));
+-    const int32_t debugMode = std::clamp(settings.debug, 0, 3);
++    const int32_t debugMode = std::clamp(settings.debug, 0, 4);
+     AoPass* const finish = debugMode > 0 ? s_ao.debug : s_ao.composite;
+ 
+     s_ao.ao->SetPixelPermutation(quality - 1);
+diff --git a/Shaders/WolAO/WolAO.cmake b/Shaders/WolAO/WolAO.cmake
+index 1935ae5..522ad6e 100644
+--- a/Shaders/WolAO/WolAO.cmake
++++ b/Shaders/WolAO/WolAO.cmake
+@@ -1,8 +1,8 @@
+ # Not in the original client (World of Legends): the shaders of the native ambient occlusion WolAO (wolAO), brief E2.
+ # Included by Shaders/VolFog/CMakeLists.txt right before the patch-Z.MPQ command, like WolPost.cmake: same chain (volfog_shader: fxc ->
+ # Tools/VolFog/mkbls.py -> Tools/VolFog/mkmpq.py), same MPQ. CMAKE_CURRENT_SOURCE_DIR is Shaders/VolFog here, hence the ../WolAO.
+-# One source, three passes (/D PASS=0|1|2). Permutations: WolAO QUALITY 1 / 2 (index quality - 1); WolAOBlur WIDE 0 / 1; WolAOComposite DEBUG 0..3.
++# One source, three passes (/D PASS=0|1|2). Permutations: WolAO QUALITY 1 / 2 (index quality - 1); WolAOBlur WIDE 0 / 1; WolAOComposite DEBUG 0..4.
+ # The vertex shader is the quad one of the fog (WolVolFogQuad, vf_fullscreen_vs.hlsl).
+ volfog_shader(WolAO ps ../WolAO/WolAO.hlsl PERMUTATIONS "PASS=0,QUALITY=1" "PASS=0,QUALITY=2")
+ volfog_shader(WolAOBlur ps ../WolAO/WolAO.hlsl PERMUTATIONS "PASS=1,WIDE=0" "PASS=1,WIDE=1")
+-volfog_shader(WolAOComposite ps ../WolAO/WolAO.hlsl PERMUTATIONS "PASS=2,DEBUG=0" "PASS=2,DEBUG=1" "PASS=2,DEBUG=2" "PASS=2,DEBUG=3")
++volfog_shader(WolAOComposite ps ../WolAO/WolAO.hlsl PERMUTATIONS "PASS=2,DEBUG=0" "PASS=2,DEBUG=1" "PASS=2,DEBUG=2" "PASS=2,DEBUG=3" "PASS=2,DEBUG=4")
+diff --git a/Shaders/WolAO/WolAO.hlsl b/Shaders/WolAO/WolAO.hlsl
+index a09942c..e659033 100644
+--- a/Shaders/WolAO/WolAO.hlsl
++++ b/Shaders/WolAO/WolAO.hlsl
+@@ -9,11 +9,17 @@
+ //                                               (Jimenez, 2014). Output R = AO (1 = open), G = view depth in yards (sky 10000).
+ //   PASS 1  WolAOBlur.bls       /D WIDE=0|1     separable bilateral blur of the low resolution AO, 9 taps (WIDE=0) or 13 taps (WIDE=1); the step of
+ //                                               the pass (horizontal or vertical) comes in c7.xy; the weights fall with the difference of view depth.
+-//   PASS 2  WolAOComposite.bls  /D DEBUG=0..3   full resolution: bilateral up-sampling of the four nearest low resolution texels by the view depth of
++//   PASS 2  WolAOComposite.bls  /D DEBUG=0..4   full resolution: bilateral up-sampling of the four nearest low resolution texels by the view depth of
+ //                                               the pixel, fade with the distance and with the linear fog of the client, and the result as a grey
+-//                                               multiplier (black with alpha = 1 - multiplier, drawn with GxBlend_Alpha: dest * multiplier). Sky and beyond the
+-//                                               world (depth >= 0.95) is left alone. DEBUG 1 = the multiplier in grey (opaque blend), 2 = the raw AO
+-//                                               before the blur, 3 = the normal rebuilt from the depth.
++//                                               multiplier (drawn with GxBlend_Mod: dest * multiplier). Sky and beyond the
++//                                               world (depth >= 0.95) is left alone. DEBUG 1 = the multiplier in grey (opaque blend), 2 = the linear depth,
++//                                               3 = the normal rebuilt from the depth, 4 = the raw AO before the blur.
++// Brief E2b (corrections of E2): (1) the normal falls back to the camera-facing normal when the neighbours of an axis are not on the same surface
++// (thin branches and silhouettes used to give a sideways normal and dark lines along the whole branch); (2) the radius of the sphere is the one actually
++// sampled (in yards: pixels * z / f) when the cap in pixels cuts it; (3) the rotation and the jitter come from a 4x4 ordered pattern (period 4 texels,
++// removed by the 9-tap blur) instead of interleaved gradient noise (its period of ~15 texels in x was the repeated vertical pattern); (4) every
++// VPOS is floor()ed (integer or half-integer pixel centres give the same texel); (5) the composition is drawn with GxBlend_Mod (dest * multiplier),
++// DEBUG 1 = multiplier in grey, 2 = linear depth like wolVolFogDebug 1, 3 = normals, 4 = raw AO.
+ // Register contract (the same registers as the fog where they coincide):
+ //   c0 world viewport in pixels (x, y, w, h), c1 (1 / low width, 1 / low height, 1 / INTZ width, 1 / INTZ height), c2 cViewToNdc, c3 cDepthToViewZ,
+ //   c4 (R yards, 1 / R^2, bias, strength * gain / samples), c5 (largest radius in pixels, -, fade start yards, 1 / (fade end - fade start)),
+@@ -58,16 +64,23 @@ float3 ViewPos(float2 rel, float z)
+     return float3((ndc - cViewToNdc.zw) / cViewToNdc.xy, 1) * z;
+ }
+ 
+-// Normal of the surface from the depth: the difference to the neighbour (left or right, up or down) with the smaller depth step.
++// Normal of the surface from the depth: the difference to the neighbour (left or right, up or down) with the smaller depth step. When even the smaller
++// step is a jump (a thin branch, a silhouette: the neighbours belong to other surfaces) there is no surface to measure and the normal faces the camera.
+ float3 RebuildNormal(float2 rel, float zc, float3 pc)
+ {
+     float zr = SampleZ(rel + float2(1, 0));
+     float zl = SampleZ(rel - float2(1, 0));
+     float zd = SampleZ(rel + float2(0, 1));
+     float zu = SampleZ(rel - float2(0, 1));
++    float stepX = min(abs(zr - zc), abs(zl - zc));
++    float stepY = min(abs(zd - zc), abs(zu - zc));
++    float tolerance = 0.3 + 0.02 * zc; // yards: a slanted ground at 80 degrees changes ~0.25 yd per pixel at 50 yd
+     float3 dx = abs(zr - zc) < abs(zl - zc) ? ViewPos(rel + float2(1, 0), zr) - pc : pc - ViewPos(rel - float2(1, 0), zl);
+     float3 dy = abs(zd - zc) < abs(zu - zc) ? ViewPos(rel + float2(0, 1), zd) - pc : pc - ViewPos(rel - float2(0, 1), zu);
+-    return normalize(cross(dx, dy)); // dx runs to the right and dy down the screen: the normal faces the camera
++    float3 facing = -normalize(pc);
++    float3 n = normalize(cross(dx, dy)); // dx runs to the right and dy down the screen: the normal faces the camera
++    n = dot(n, facing) < 0 ? -n : n;
++    return (stepX > tolerance || stepY > tolerance) ? facing : n;
+ }
+ #endif
+ 
+@@ -82,14 +95,18 @@ float3 RebuildNormal(float2 rel, float zc, float3 pc)
+ #define STEPS 6
+ #endif
+ 
+-float Ign(float2 p)
++// 4x4 ordered pattern (Bayer matrix) in 0..1 for integer texel coordinates; ps_3_0 has no bitwise operators, so the bits come from fmod.
++float Bayer4(float2 p)
+ {
+-    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
++    float2 a = fmod(p, 2.0);
++    float2 b = fmod(floor(p * 0.5), 2.0);
++    return (8.0 * abs(a.x - a.y) + 4.0 * a.y + 2.0 * abs(b.x - b.y) + b.y) * (1.0 / 16.0);
+ }
+ 
+-float4 main(float2 vpos : VPOS) : COLOR0
++float4 main(float2 vposIn : VPOS) : COLOR0
+ {
+     // The low resolution texel is the full resolution pixel (2x, 2y); `rel` is its centre.
++    float2 vpos = floor(vposIn);
+     float2 rel = min(vpos * 2.0 + 0.5, cViewportPx.zw - 0.5);
+     float zc = SampleZ(rel);
+     float4 result = float4(1, zc, 0, 1);
+@@ -99,8 +116,12 @@ float4 main(float2 vpos : VPOS) : COLOR0
+         return result;
+     }
+ 
+-    // Radius of the sphere of influence on the screen: yards * (projection scale * half the width) / depth; under 2 pixels there is nothing to see.
+-    float radiusPx = min(cAO.x * cViewToNdc.x * 0.5 * cViewportPx.z / zc, cLimits.x);
++    // Radius of the sphere of influence on the screen: yards * (projection scale * half the width) / depth, capped; under 2 pixels there is nothing to see.
++    // `radius` is the one in yards that the pixels cover once the cap has cut it, so the fall-off always matches what is sampled.
++    float focal = cViewToNdc.x * 0.5 * cViewportPx.z;
++    float radiusPx = min(cAO.x * focal / zc, cLimits.x);
++    float radius = radiusPx * zc / focal;
++    float invRadius2 = 1.0 / (radius * radius);
+ 
+     if (radiusPx < 2.0)
+     {
+@@ -109,8 +130,8 @@ float4 main(float2 vpos : VPOS) : COLOR0
+ 
+     float3 pc = ViewPos(rel, zc);
+     float3 normal = RebuildNormal(rel, zc, pc);
+-    float rotation = Ign(vpos);
+-    float jitter = Ign(float2(vpos.y + 7.0, vpos.x * 1.7 + 3.0));
++    float rotation = Bayer4(vpos);
++    float jitter = frac(Bayer4(vpos.yx + 2.0) + rotation * 0.37 + 0.11);
+     float sum = 0;
+ 
+     [loop] for (int i = 0; i < DIRECTIONS; i++)
+@@ -123,9 +144,15 @@ float4 main(float2 vpos : VPOS) : COLOR0
+         {
+             float2 at = rel + dir * max(radiusPx * ((s + jitter) * (1.0 / STEPS)), 1.5);
+             float zs = SampleZ(at);
++
++            if (zs >= kSkyViewZ)
++            {
++                continue; // the sky occludes nothing
++            }
++
+             float3 v = ViewPos(at, zs) - pc;
+             float vv = dot(v, v);
+-            sum += saturate(dot(normal, v) * rsqrt(vv + 1e-4) - cAO.z) * saturate(1 - vv * cAO.y);
++            sum += saturate(dot(normal, v) * rsqrt(vv + 1e-4) - cAO.z) * saturate(1 - vv * invRadius2);
+         }
+     }
+ 
+@@ -146,9 +173,9 @@ static const float kSigma = 3.5;
+ static const float kSigma = 2.5;
+ #endif
+ 
+-float4 main(float2 vpos : VPOS) : COLOR0
++float4 main(float2 vposIn : VPOS) : COLOR0
+ {
+-    float2 uv = (vpos + 0.5) * cPixelGrid.xy;
++    float2 uv = (floor(vposIn) + 0.5) * cPixelGrid.xy;
+     float4 centre = tex2Dlod(sAO, float4(uv, 0, 0));
+     float sum = centre.x;
+     float weights = 1.0;
+@@ -169,14 +196,15 @@ float4 main(float2 vpos : VPOS) : COLOR0
+ 
+ #else
+ #ifndef DEBUG
+-#error DEBUG must be 0, 1, 2 or 3
++#error DEBUG must be 0, 1, 2, 3 or 4
+ #endif
+ 
+-float4 main(float2 vpos : VPOS) : COLOR0
++float4 main(float2 vposIn : VPOS) : COLOR0
+ {
++    float2 vpos = floor(vposIn);
+     float2 rel = vpos - cViewportPx.xy + 0.5;
+ 
+-#if DEBUG == 2
++#if DEBUG == 4
+     // The raw AO, no blur and no up-sampling: the low resolution texel that covers this pixel.
+     float raw = tex2Dlod(sAO, float4((floor(rel * 0.5) + 0.5) * cPixelGrid.xy, 0, 0)).x;
+     return float4(raw, raw, raw, 1);
+@@ -186,7 +214,11 @@ float4 main(float2 vpos : VPOS) : COLOR0
+     bool sky = zc >= kSkyMinDepth || denominator > -1e-6;
+     float viewZ = sky ? kSkyViewZ : min(cDepthToViewZ.y / denominator, kSkyViewZ);
+ 
+-#if DEBUG == 3
++#if DEBUG == 2
++    // The linear depth, the same formula and normalisation as wolVolFogDebug 1 (grey = sqrt(distance / far plane), sky white).
++    float grey = sky ? 1.0 : sqrt(saturate(viewZ / cDepthToViewZ.z));
++    return float4(grey, grey, grey, 1);
++#elif DEBUG == 3
+     if (sky)
+     {
+         return float4(0, 0, 0, 1);
+@@ -227,13 +259,8 @@ float4 main(float2 vpos : VPOS) : COLOR0
+         multiplier = lerp(1, ao, weight);
+     }
+ 
+-#if DEBUG == 1
+-    return float4(multiplier, multiplier, multiplier, 1); // opaque view of the multiplier
+-#else
+-    // The pass is drawn with the alpha blend (SRCALPHA, INVSRCALPHA): black with alpha = 1 - multiplier gives dest * multiplier, the same as
+-    // DESTCOLOR * src + 0 (GxBlend_Mod) without relying on the destination colour factor.
+-    return float4(0, 0, 0, 1.0 - multiplier);
+-#endif
++    // DEBUG 1: the multiplier in grey over the whole view (opaque blend). DEBUG 0: the same value, drawn with GxBlend_Mod (DESTCOLOR * src + 0 * dest).
++    return float4(multiplier, multiplier, multiplier, 1);
+ #endif
+ #endif
+ }
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index e6cc03d..8db2167 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -1165,11 +1165,11 @@ bool CWorldParam::WolAOStrengthCallback(CVar* var, const char* oldValue, const c
+     return true;
+ }
+ 
+-// Not in the original client (brief E2). wolAODebug 0-3 (default 0): 1 = the multiplier the AO applies, in grey, over the whole world view; 2 = the raw AO
+-// (before the blur); 3 = the normals rebuilt from the depth. Needs wolAO 1 or 2.
++// Not in the original client (brief E2). wolAODebug 0-4 (default 0): 1 = the multiplier the AO applies, in grey, over the whole world view; 2 = the linear depth (as wolVolFogDebug 1);
++// 3 = the normals rebuilt from the depth; 4 = the raw AO (before the blur). Needs wolAO 1 or 2.
+ bool CWorldParam::WolAODebugCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
+-    if (!value || value[0] < '0' || value[0] > '3' || value[1] != '\0') {
+-        ConsoleWrite("wolAODebug must be 0 (off), 1 (AO in grey), 2 (raw AO, no blur) or 3 (normals).", DEFAULT_COLOR);
++    if (!value || value[0] < '0' || value[0] > '4' || value[1] != '\0') {
++        ConsoleWrite("wolAODebug must be 0 (off), 1 (AO in grey), 2 (linear depth), 3 (normals) or 4 (raw AO, no blur).", DEFAULT_COLOR);
+ 
+         return false;
+     }
+@@ -1177,7 +1177,7 @@ bool CWorldParam::WolAODebugCallback(CVar* var, const char* oldValue, const char
+     WolAO::SetDebug(value[0] - '0');
+ 
+     if (oldValue && *oldValue) {
+-        static const char* const s_names[4] = { "off", "AO in grey", "raw AO, no blur", "normals rebuilt from the depth" };
++        static const char* const s_names[5] = { "off", "AO in grey", "linear depth", "normals rebuilt from the depth", "raw AO, no blur" };
+         char buffer[112];
+         SStrPrintf(buffer, sizeof(buffer), "wolAODebug: %c (%s)%s", value[0], s_names[value[0] - '0'], WolAO::GetSettings().mode ? "" : " (needs wolAO 1 or 2)");
+         ConsoleWrite(buffer, DEFAULT_COLOR);
+@@ -1209,7 +1209,7 @@ void CWorldParam::RegisterVolFogCVars() {
+     CWorldParam::cvar_wolAO = CVar::Register("wolAO", "Native ambient occlusion (0 off, 1 half resolution 4 steps, 2 half resolution 6 steps and wider blur); needs gxRestart to turn on or off", 1, "0", CWorldParam::WolAOCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolAORadius = CVar::Register("wolAORadius", "Ambient occlusion radius in yards (0.5 to 4.0)", 1, "1.5", CWorldParam::WolAORadiusCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolAOStrength = CVar::Register("wolAOStrength", "Ambient occlusion strength (0.0 to 2.0)", 1, "1.0", CWorldParam::WolAOStrengthCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+-    CWorldParam::cvar_wolAODebug = CVar::Register("wolAODebug", "Ambient occlusion debug view (0 off, 1 AO in grey, 2 raw AO, 3 normals)", 1, "0", CWorldParam::WolAODebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolAODebug = CVar::Register("wolAODebug", "Ambient occlusion debug view (0 off, 1 AO in grey, 2 linear depth, 3 normals, 4 raw AO)", 1, "0", CWorldParam::WolAODebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Brief B5: the reader of the frame inputs for the fog model (Engine/ does not depend on WoW/).
+     VolFogWorld::Install();
+ }

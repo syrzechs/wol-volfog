@@ -11,12 +11,14 @@ pertenecen a sus propietarios y no se incluyen.
 
 | Parche | Bytes | Qué añade | CVars / comandos |
 |---|---:|---|---|
-| `cliente64.patch` | 12 307 | Carpeta `Data\WoL64\*.MPQ` (la lee solo el cliente de 64 bits), versión visible `wolBuild` (también primera línea de `WowClient_crash.log` y `Logs\gx.log`) y bloque `VERSIONINFO` | `wolBuild` (solo lectura) |
-| `hd-cache.patch` | 13 928 | Presupuesto de la caché de texturas configurable y registro de aperturas de `.blp` | `wolTextureCacheMB` 0 / 256-2048, `wolFileLog`; addon `/wolgfx hd on\|off` |
+| `00f-filelog.patch` | 7 371 | Base de `hd-cache`: registro de aperturas de fichero `Logs\files.log` (solo rutas `Tileset\`), en Storm/SFile y `Client_CVar.cpp`. Salió del diagnóstico del terreno y no tenía parche propio | `wolFileLog` 0/1 (o variable de entorno `WOL_FILELOG=1`) |
+| `cliente64.patch` | 12 518 | Carpeta `Data\WoL64\*.MPQ` (la lee solo el cliente de 64 bits), versión visible `wolBuild` (también primera línea de `WowClient_crash.log` y `Logs\gx.log`) y bloque `VERSIONINFO` | `wolBuild` (solo lectura) |
+| `hd-cache.patch` | 13 817 | Presupuesto de la caché de texturas configurable y registro de aperturas de `.blp` | `wolTextureCacheMB` 0 / 256-2048, `wolFileLog`; addon `/wolgfx hd on\|off` |
 | `E1-post-fxaa-tonemap.patch` | 40 342 | Pase de post-proceso `WolPost`: antialiasing FXAA 3.11 (reescritura propia, ver la nota de licencia) y tonemapping filmic en luz lineal | `wolAA` 0/1/2, `wolTonemap` 0/1, `wolExposure`, `wolSaturation`; `/wolgfx post`, `aa`, `tonemap` |
 | `E3-sombras-pcf.patch` | 10 817 | Bordes de sombra más suaves ensanchando los desplazamientos PCF por CPU, sin tocar shaders | `wolShadowSoft` 0-3; `/wolgfx sombras 0-3` |
+| `E4-gradacion-zona.patch` | 36 014 | Gradación de color por zona y hora (bordes `DayNight`) dentro del pase de post de E1; sube `kMaxPermutations` a 12 | `wolGradeStrength` 0-1, `wolGradeDebug`; se aplica después de E1 |
 | `E2-hbao.patch` | 60 996 | Oclusión ambiental HBAO a media resolución sobre el depth INTZ de la niebla. **EXPERIMENTAL**: estable, pero visualmente incorrecta (halos en bordes finos); no está en ningún perfil y viene apagada | `wolAO` 0/1/2, `wolAORadius`, `wolAOStrength`, `wolAODebug` |
-| `sin-consola.patch` | 1 046 | Quita la consola de tildes. **Es el mismo fichero que `patches/00e-sin-consola.patch`** (SHA-256 `331b4ca4…`): ya está entre los 18; no lo apliques otra vez | — |
+| `E2b-hbao-correccion.patch` | 17 428 | Corrige E2 (se aplica **después** de `E2-hbao.patch`): tope de radio 48 -> 96 px con la caída del radio realmente muestreado, normal que mira a la cámara cuando el vecino de un eje es otra superficie, ruido Bayer 4x4 en vez de gradiente intercalado, composición otra vez con `GxBlend_Mod`, `wolAODebug` 0-4 (2 = profundidad lineal). Probado en Ventormenta (mapa de AO con contacto suelo-pared correcto); **sigue experimental** y apagado | `wolAODebug` 0-4 |
 
 La documentación de cada pieza (diseño, pruebas, cifras, lo que no salió) está en el repositorio de trabajo en `patches-cliente/<pieza>/README-*.md`;
 los resúmenes de arriba salen de ahí. Los shaders de `WolPost` y de `WolAO` se compilan con la misma cadena `fxc -> mkbls.py -> mkmpq.py` que los de
@@ -24,30 +26,31 @@ la niebla y acaban en el mismo `Data\WoL64\patch-Z.MPQ` del paquete.
 
 ## Orden de aplicación
 
-Sobre un wowdecomp con los 18 parches de `patches/` ya aplicados (`aplicar.ps1`), en este orden (es el orden en que se hicieron; los READMEs de
-cada pieza dicen de cuáles dependen):
+`aplicar.ps1` aplica ahora **los 26 parches** (los 18 de `patches/` y los 8 de esta carpeta) sobre un `wowdecomp` limpio (`0e4e9fe`), en este orden, que es el
+de su lista `$Orden` y el que se ha verificado:
 
-1. `cliente64.patch` (va después de `00a-recordar-contrasena`, `00e-sin-consola` y la niebla)
-2. `hd-cache.patch` (después de `00b-topes-2008` y `00c-sombras-4096`)
+1. `00a`…`00e` y `01-B1`…`13-B13b` (los 18 de `patches/`; `00e-sin-consola` es la «sin consola»: ya no hay un duplicado en esta carpeta)
+2. `00f-filelog.patch` (base de `hd-cache`)
 3. `E1-post-fxaa-tonemap.patch` (después de la niebla, B1-B13b)
-4. `E3-sombras-pcf.patch` (después de `00c-sombras-4096`; toca los mismos `WorldParam.h` y `WorldParam_CVar.cpp`)
-5. `E2-hbao.patch` (después de E1: reutiliza su pase y el depth de la niebla)
+4. `hd-cache.patch` (después de `00b-topes-2008`, `00c-sombras-4096` y `00f-filelog`)
+5. `E3-sombras-pcf.patch` (toca los mismos `WorldParam.h` y `WorldParam_CVar.cpp` que `hd-cache`)
+6. `E2-hbao.patch` (después de E1: reutiliza su pase y el depth de la niebla)
+7. `E2b-hbao-correccion.patch` (después de E2: corrige el mapa de AO)
+8. `E4-gradacion-zona.patch` (después de E1, E2 y E2b)
+9. `cliente64.patch` (el último: su contexto incluye `wolFileLog`)
 
 ```powershell
-cd C:\ruta\wowdecomp
-foreach ($p in 'cliente64','hd-cache','E1-post-fxaa-tonemap','E3-sombras-pcf','E2-hbao') { git apply "C:\ruta\wol-volfog\patches\propios\$p.patch"; if ($LASTEXITCODE) { "falla $p"; break } }
+.\aplicar.ps1 -Destino C:\ruta\wowdecomp              # los 26 en orden; si uno falla, deshace los anteriores
+.\aplicar.ps1 -Destino C:\ruta\wowdecomp -Revertir    # los deshace en orden inverso
 ```
 
-`aplicar.ps1` **no** aplica esta carpeta: solo la lista de `patches/`.
+### Verificado el 2026-10-21 sobre `git archive HEAD` de wowdecomp (commit `0e4e9fe`, directorio nuevo)
 
-### Comprobado el 2026-10-21 sobre `git archive HEAD` de wowdecomp (commit `0e4e9fe`, sin tocar nada más)
-
-- Los 18 parches de `patches/` y después `cliente64.patch`: **aplican** (19 de 19).
-- `E1-post-fxaa-tonemap.patch` y después `E2-hbao.patch`: **aplican** sobre eso.
-- **`hd-cache.patch` NO aplica sobre un árbol limpio**: falla en `SFile.cpp`, `SFile.h` y `Client_CVar.cpp`. Presupone una versión anterior de `wolFileLog` (solo
-  registraba `Tileset\`) que existía en el árbol de trabajo sin parche propio. **`E3-sombras-pcf.patch` tampoco aplica sin `hd-cache.patch`** (su contexto en
-  `WorldParam.h` incluye la CVar `wolTextureCacheMB`). Para cerrarlo falta un parche base de `wolFileLog` (o regenerar `hd-cache.patch` contra HEAD + niebla +
-  `cliente64`); no se hizo en esta pasada. Hasta entonces, el orden de arriba solo se reproduce completo en el árbol de trabajo de World of Legends.
+- Los 26 parches aplican en orden y `-Revertir` deja el árbol igual que `HEAD`.
+- El árbol resultante es idéntico (`diff -r`, ignorando el final de línea CRLF/LF de los ficheros nuevos) al árbol de trabajo de World of Legends en `Engine/`, `WoW/`,
+  `Shaders/`, `Tools/`, `CMakeLists.txt` y `waystone.rc` (salvo `build/`, `bin/` y `ThirdParty/coa-vfog-205ade5`).
+- Regenerados el 2026-10-21 para que la cadena cierre: `00f-filelog.patch` (nuevo; el cambio del diagnóstico H4b nunca se había extraído), `hd-cache.patch` (ahora parte de
+  `00f`: solo añade el registro de todos los `.blp`) y `cliente64.patch` (contexto de `Client_CVar.cpp` para aplicar después de `00f` y `hd-cache`). Los demás, sin cambios.
 
 ## Licencias de terceros de estos parches
 
@@ -62,7 +65,4 @@ foreach ($p in 'cliente64','hd-cache','E1-post-fxaa-tonemap','E3-sombras-pcf','E
 
 - `cambios-cliente.diff` y estos parches contienen contexto del código reconstruido del cliente (igual que los 18 de `patches/`). Publicarlos es una decisión
   de los responsables del proyecto, no un requisito de la GPL para todos ellos; `WowClient64.exe` ya lleva todo esto dentro y por eso el paquete ofrece el código.
-- `hd-cache.patch` incluye la parte de `wolFileLog` que registra todos los `.blp` (en el árbol de trabajo existía antes una versión que solo registraba `Tileset\`,
-  sin parche propio); si `git apply` falla en `SFile.cpp` o `Client_CVar.cpp`, ese es el punto a mirar.
-
-> Nota 21-oct: `hd-cache.patch` y `E3-sombras-pcf.patch` dependen de un cambio previo del registro de aperturas de fichero (CVar `wolFileLog`, hecho durante el diagnóstico H4b) que aún no está extraído como parche; se añadirá como `00f-filelog.patch`.
+- `00f-filelog.patch` es la versión que solo registra `Tileset\`; `hd-cache.patch` la amplía a todos los `.blp`. Aplícalos en ese orden.

@@ -1,0 +1,754 @@
+diff --git a/Engine/Source/VolFog/VolFogPass.h b/Engine/Source/VolFog/VolFogPass.h
+index 21bc322..86146f6 100644
+--- a/Engine/Source/VolFog/VolFogPass.h
++++ b/Engine/Source/VolFog/VolFogPass.h
+@@ -1,53 +1,53 @@
+-#ifndef ENGINE_SOURCE_VOLFOG_VOLFOGPASS_H
+-#define ENGINE_SOURCE_VOLFOG_VOLFOGPASS_H
+-
+-#include <cstddef>
+-#include <cstdint>
+-#include "Engine/Source/FFX/FFX.h"
+-
+-class CGxShader;
+-
+-// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B2.
+-// Licensed under GPL-3.0-only (the module combines the FFX::Pass plumbing of the client with the shader contract of
+-// coa-vfog 205ade5; see Shaders/VolFog/NOTICE-modificaciones.txt).
+-
+-namespace VolFog {
+-    // Base of every sub-pass of the fog (design 1.1): an FFX::Pass that owns a vs_3_0 / ps_3_0 pair loaded by name from
+-    // Data\patch-Z.MPQ (Shaders\Vertex\vs_3_0\<vs>.bls, Shaders\Pixel\ps_3_0\<ps>.bls) and draws one full-screen quad
+-    // over the world viewport with the FFX quad index buffer. The vertex shader is vf_fullscreen_vs.hlsl, which returns
+-    // its position untouched, so the quad is built in clip space (-1..1) instead of the pixel space of FFX::SetupGeo_Quad.
+-    class Pass : public FFX::Pass {
+-        public:
+-        static const uint32_t kMaxPermutations = 6;
+-
+-        ~Pass() override;
+-        bool Valid() override;
+-
+-        // Permutation of the pixel shader used by the next Execute().
+-        void SetPixelPermutation(uint32_t index);
+-        // World viewport in pixels (origin at the top-left of the back buffer) and back buffer size, for the constants.
+-        void SetViewport(float x, float y, float width, float height, float targetWidth, float targetHeight);
+-
+-        protected:
+-        Pass(const char* pixelName, uint32_t pixelPermutations, const char* vertexName, EGxBlend blend);
+-
+-        // SetupGx equivalent: RsPush, culling / lighting / depth / fog off, blend of the pass, viewport of the world with
+-        // the full 0..1 depth range. End() undoes it (RsPop and the viewport as Begin() found it).
+-        void Begin();
+-        // Binds the shaders of the pass, builds the quad (FFX::SetupVB_PCT + FFX::SetupIB) and draws it.
+-        void DrawQuad();
+-        void End();
+-
+-        CGxShader* m_vertexShader;
+-        CGxShader* m_pixelShaders[kMaxPermutations];
+-        uint32_t m_pixelCount;
+-        uint32_t m_pixelIndex;
+-        float m_viewportPx[4];
+-        float m_targetPx[2];
+-
+-        private:
+-        float m_savedViewport[6];
+-    };
+-}
+-
+-#endif
++#ifndef ENGINE_SOURCE_VOLFOG_VOLFOGPASS_H
++#define ENGINE_SOURCE_VOLFOG_VOLFOGPASS_H
++
++#include <cstddef>
++#include <cstdint>
++#include "Engine/Source/FFX/FFX.h"
++
++class CGxShader;
++
++// Not in the original client (World of Legends): native volumetric fog (wolVolFog), brief B2.
++// Licensed under GPL-3.0-only (the module combines the FFX::Pass plumbing of the client with the shader contract of
++// coa-vfog 205ade5; see Shaders/VolFog/NOTICE-modificaciones.txt).
++
++namespace VolFog {
++    // Base of every sub-pass of the fog (design 1.1): an FFX::Pass that owns a vs_3_0 / ps_3_0 pair loaded by name from
++    // Data\patch-Z.MPQ (Shaders\Vertex\vs_3_0\<vs>.bls, Shaders\Pixel\ps_3_0\<ps>.bls) and draws one full-screen quad
++    // over the world viewport with the FFX quad index buffer. The vertex shader is vf_fullscreen_vs.hlsl, which returns
++    // its position untouched, so the quad is built in clip space (-1..1) instead of the pixel space of FFX::SetupGeo_Quad.
++    class Pass : public FFX::Pass {
++        public:
++        static const uint32_t kMaxPermutations = 12; // Not in the original client (brief E4): 12 for the post pass (6 of E1 times GRADE 0 / 1); it was 6
++
++        ~Pass() override;
++        bool Valid() override;
++
++        // Permutation of the pixel shader used by the next Execute().
++        void SetPixelPermutation(uint32_t index);
++        // World viewport in pixels (origin at the top-left of the back buffer) and back buffer size, for the constants.
++        void SetViewport(float x, float y, float width, float height, float targetWidth, float targetHeight);
++
++        protected:
++        Pass(const char* pixelName, uint32_t pixelPermutations, const char* vertexName, EGxBlend blend);
++
++        // SetupGx equivalent: RsPush, culling / lighting / depth / fog off, blend of the pass, viewport of the world with
++        // the full 0..1 depth range. End() undoes it (RsPop and the viewport as Begin() found it).
++        void Begin();
++        // Binds the shaders of the pass, builds the quad (FFX::SetupVB_PCT + FFX::SetupIB) and draws it.
++        void DrawQuad();
++        void End();
++
++        CGxShader* m_vertexShader;
++        CGxShader* m_pixelShaders[kMaxPermutations];
++        uint32_t m_pixelCount;
++        uint32_t m_pixelIndex;
++        float m_viewportPx[4];
++        float m_targetPx[2];
++
++        private:
++        float m_savedViewport[6];
++    };
++}
++
++#endif
+diff --git a/b/Engine/Source/WolPost/WolGrade.cpp b/Engine/Source/WolPost/WolGrade.cpp
+new file mode 100644
+index 0000000..d3de44a
+--- /dev/null
++++ b/Engine/Source/WolPost/WolGrade.cpp
+@@ -0,0 +1,190 @@
++#include "Engine/Source/WolPost/WolPost.h"
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++
++// Not in the original client (World of Legends): zone / time-of-day colour grading of the native post pass (wolGradeStrength), brief E4.
++// Licensed under GPL-3.0-only.
++//
++// The grade is derived, every frame, from the colours that the DayNight system of the client has already interpolated for the zone and the hour
++// (DNInfo::m_bands: ambient, diffuse, sky high, sky horizon, fog). Nothing is looked up in a table and nothing is keyed to a zone id, so it follows
++// the hour and the zone continuously, and a zone that Light.dbc paints green or blue is graded green or blue.
++//
++// Model (colours 0..255 sRGB -> linear with ^2.2; lum = Rec. 709; chroma(x) = x / max(lum(x), 1e-3), its deviation from white limited to 0.5 per
++// channel so that an extreme zone does not turn neon):
++//   shadow tint  Ts = chroma(0.6 ambient + 0.4 fog)          light tint  Tl = chroma(0.7 direct + 0.3 horizon)
++//   night        N  = 1 - saturate(lum(direct) / 0.25)        haze        Hz = saturate((800 - fogEnd) / 600)
++// and, for strength k (all of these are 1 + k * delta, which is why the filter below works on the deltas and the strength applies at once):
++//   gain = lerp(1, Tl, 0.25 k)   lift = (Ts - 1) 0.025 k   invGamma = 1 + 0.06 k N
++//   contrast = 1 + k (0.08 (1 - Hz) - 0.06 N)   saturation = 1 + k (0.10 (1 - Hz) - 0.12 N)
++// k is also scaled by (1 - 0.5 interior) and is 0 under water. The shader (WolPost.hlsl, GRADE=1) applies, in gamma space after the tonemap,
++// x = saturate(c * gain + lift * (1 - c)); x = pow(x, invGamma); contrast around 0.45; saturation around the luma.
++// Continuity: the deltas pass through an exponential filter with tau 1.5 s; they jump without the filter on the first frame, on a map change and on
++// a teleport (more than 100 yards in one frame).
++
++namespace {
++    WolPost::GradeInputsProvider s_provider;
++
++    constexpr float kTau = 1.5f;
++
++    // The deltas of the grade at strength 1 with the interior / water factor applied. Only floats: the filter walks it as an array.
++    struct Delta {
++        float gain[3];
++        float lift[3];
++        float invGamma;
++        float contrast;
++        float saturation;
++    };
++
++    struct State {
++        bool valid;
++        Delta delta;
++        uint32_t mapId;
++        float camPos[3];
++    };
++
++    State s_state;
++
++    float Saturate(float v) {
++        return std::min(std::max(v, 0.0f), 1.0f);
++    }
++
++    float ToLinear(float v) {
++        return std::pow(Saturate(v / 255.0f), 2.2f);
++    }
++
++    float Luma(const float* c) {
++        return 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
++    }
++
++    // Linear colour wx * x + wy * y (0..255 sRGB inputs).
++    void Mix(const float* x, float wx, const float* y, float wy, float* out) {
++        for (int i = 0; i < 3; i++) {
++            out[i] = wx * ToLinear(x[i]) + wy * ToLinear(y[i]);
++        }
++    }
++
++    void Chroma(const float* linear, float* out) {
++        float lum = std::max(Luma(linear), 1.0e-3f);
++        float deviation = 0.0f;
++
++        for (int i = 0; i < 3; i++) {
++            out[i] = linear[i] / lum;
++            deviation = std::max(deviation, std::fabs(out[i] - 1.0f));
++        }
++
++        if (deviation > 0.5f) {
++            float scale = 0.5f / deviation;
++
++            for (int i = 0; i < 3; i++) {
++                out[i] = 1.0f + (out[i] - 1.0f) * scale;
++            }
++        }
++    }
++
++    bool ComputeDelta(const WolPost::GradeInputs& in, Delta& out) {
++        float shadowLinear[3];
++        float lightLinear[3];
++        Mix(in.ambient, 0.6f, in.fog, 0.4f, shadowLinear);
++        Mix(in.direct, 0.7f, in.horizon, 0.3f, lightLinear);
++
++        float ts[3];
++        float tl[3];
++        Chroma(shadowLinear, ts);
++        Chroma(lightLinear, tl);
++
++        float directLinear[3] = { ToLinear(in.direct[0]), ToLinear(in.direct[1]), ToLinear(in.direct[2]) };
++        float night = 1.0f - Saturate(Luma(directLinear) / 0.25f);
++        float haze = std::isfinite(in.fogEnd) ? Saturate((800.0f - in.fogEnd) / 600.0f) : 0.0f;
++
++        float environment = in.underwater ? 0.0f : 1.0f - 0.5f * Saturate(in.interior);
++
++        for (int i = 0; i < 3; i++) {
++            out.gain[i] = 0.25f * (tl[i] - 1.0f) * environment;
++            out.lift[i] = 0.025f * (ts[i] - 1.0f) * environment;
++        }
++
++        out.invGamma = 0.06f * night * environment;
++        out.contrast = (0.08f * (1.0f - haze) - 0.06f * night) * environment;
++        out.saturation = (0.10f * (1.0f - haze) - 0.12f * night) * environment;
++
++        const float* all = reinterpret_cast<const float*>(&out);
++
++        for (size_t i = 0; i < sizeof(Delta) / sizeof(float); i++) {
++            if (!std::isfinite(all[i])) {
++                return false;
++            }
++        }
++
++        return true;
++    }
++}
++
++void WolPost::SetGradeProvider(GradeInputsProvider provider) {
++    s_provider = provider;
++}
++
++bool WolPost::ComputeGrade(float strength, GradeParams& out) {
++    out.gain[0] = out.gain[1] = out.gain[2] = 1.0f;
++    out.lift[0] = out.lift[1] = out.lift[2] = 0.0f;
++    out.contrast = 1.0f;
++    out.saturation = 1.0f;
++    out.invGamma = 1.0f;
++
++    if (!(strength > 0.0f) || !s_provider) {
++        s_state.valid = false; // the next frame with a grade starts from its own value, not from an old one
++
++        return false;
++    }
++
++    GradeInputs in;
++    std::memset(&in, 0, sizeof(in));
++    Delta target;
++
++    if (!s_provider(in) || !ComputeDelta(in, target)) {
++        s_state.valid = false;
++
++        return false;
++    }
++
++    float travelled = 0.0f;
++
++    for (int i = 0; i < 3; i++) {
++        float d = in.camPos[i] - s_state.camPos[i];
++        travelled += d * d;
++    }
++
++    bool jump = !s_state.valid || s_state.mapId != in.mapId || travelled > 100.0f * 100.0f;
++
++    if (jump) {
++        s_state.delta = target;
++    } else {
++        // Exponential filter, tau 1.5 s, on the deltas of the grade at strength 1.
++        float dt = std::isfinite(in.deltaSec) ? std::min(std::max(in.deltaSec, 0.0f), 0.25f) : 0.0f;
++        float a = 1.0f - std::exp(-dt / kTau);
++        float* now = reinterpret_cast<float*>(&s_state.delta);
++        const float* goal = reinterpret_cast<const float*>(&target);
++
++        for (size_t i = 0; i < sizeof(Delta) / sizeof(float); i++) {
++            now[i] += (goal[i] - now[i]) * a;
++        }
++    }
++
++    s_state.valid = true;
++    s_state.mapId = in.mapId;
++    std::memcpy(s_state.camPos, in.camPos, sizeof(s_state.camPos));
++
++    const float k = std::min(std::max(strength, 0.0f), 1.0f);
++    const Delta& d = s_state.delta;
++
++    for (int i = 0; i < 3; i++) {
++        out.gain[i] = 1.0f + k * d.gain[i];
++        out.lift[i] = k * d.lift[i];
++    }
++
++    out.invGamma = 1.0f + k * d.invGamma;
++    out.contrast = 1.0f + k * d.contrast;
++    out.saturation = 1.0f + k * d.saturation;
++
++    return true;
++}
+diff --git a/Engine/Source/WolPost/WolPost.cpp b/Engine/Source/WolPost/WolPost.cpp
+index 537b521..4b40c59 100644
+--- a/Engine/Source/WolPost/WolPost.cpp
++++ b/Engine/Source/WolPost/WolPost.cpp
+@@ -1,5 +1,6 @@
+ #include "Engine/Source/WolPost/WolPost.h"
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
+@@ -20,7 +21,7 @@ namespace {
+     // The longest permutation of WolPost.bls is 587 instruction slots (fxc, AA 2 + TONEMAP 1): the device must declare at least 1024 (a ps_3_0 card
+     // declares 512 at the very least; DXVK and the AMD / NVIDIA drivers declare far more). A card that reports less (or the OpenGL stub, which reports 0) gets no pass.
+     constexpr uint32_t kMinPs30Slots = 1024;
+-    constexpr uint32_t kPermutations = 6;
++    constexpr uint32_t kPermutations = 12; // index = AA * 2 + TONEMAP + 6 * GRADE (brief E4)
+     constexpr uint32_t kMaxFailures = 3;
+ 
+     WolPost::Settings s_settings;
+@@ -40,11 +41,12 @@ namespace {
+         void Execute() override {}
+ 
+         // Writes the world viewport of the back buffer from `scene`, its copy. c0 = origin and size of the area in pixels, c1 = exposure,
+-        // saturation and one texel of the copy; the pixel constants c0 and c1 are put back as they were (they belong to whoever draws next).
+-        void Draw(CGxTex* scene, uint32_t permutation, float exposure, float saturation) {
++        // saturation and one texel of the copy; with a grade (brief E4, `grade` not null) c2 = gain and contrast, c3 = lift and saturation, c4 = invGamma.
++        // The pixel constants c0-c4 are put back as they were (they belong to whoever draws next).
++        void Draw(CGxTex* scene, uint32_t permutation, float exposure, float saturation, const WolPost::GradeParams* grade) {
+             this->SetPixelPermutation(permutation);
+ 
+-            float saved[8];
++            float saved[20];
+             std::memcpy(saved, CGxDevice::s_shadowConstants[0].constants, sizeof(saved));
+ 
+             const float c0[4] = { this->m_viewportPx[0], this->m_viewportPx[1], this->m_viewportPx[2], this->m_viewportPx[3] };
+@@ -57,6 +59,16 @@ namespace {
+ 
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, c0, 1);
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 1, c1, 1);
++
++            if (grade) {
++                const float c2[12] = {
++                    grade->gain[0], grade->gain[1], grade->gain[2], grade->contrast,
++                    grade->lift[0], grade->lift[1], grade->lift[2], grade->saturation,
++                    grade->invGamma, 0.0f, 0.0f, 0.0f
++                };
++                g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 2, c2, 3);
++            }
++
+             GxRsSet(GxRs_Texture0, scene); // sScene: bilinear, clamp (flags of the texture)
+ 
+             this->DrawQuad();
+@@ -64,6 +76,10 @@ namespace {
+ 
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 0, &saved[0], 1);
+             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 1, &saved[4], 1);
++
++            if (grade) {
++                g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 2, &saved[8], 3);
++            }
+         }
+     };
+ 
+@@ -150,8 +166,17 @@ void WolPost::SetSaturation(float value) {
+     s_settings.saturation = value;
+ }
+ 
++void WolPost::SetGradeDebug(int32_t value) {
++    s_settings.gradeDebug = value;
++}
++
++void WolPost::SetGradeStrength(float value) {
++    s_settings.gradeStrength = value;
++    s_generation++;
++}
++
+ bool WolPost::Active() {
+-    return s_settings.aa > 0 || s_settings.tonemap > 0;
++    return s_settings.aa > 0 || s_settings.tonemap > 0 || s_settings.gradeStrength > 0.0f;
+ }
+ 
+ void WolPost::Render() {
+@@ -209,7 +234,25 @@ void WolPost::Render() {
+ 
+     const int32_t aa = s_settings.aa;
+     const int32_t tonemap = s_settings.tonemap;
+-    const uint32_t permutation = static_cast<uint32_t>(aa * 2 + tonemap);
++    // Brief E4: with wolGradeStrength 0 (or a provider that fails) the grade permutation is never chosen, so the pass is exactly the one of E1.
++    WolPost::GradeParams grade;
++    const bool graded = WolPost::ComputeGrade(s_settings.gradeStrength, grade);
++    const uint32_t permutation = static_cast<uint32_t>(aa * 2 + tonemap) + (graded ? 6u : 0u);
++
++    if (s_settings.gradeDebug && s_settings.gradeStrength > 0.0f) {
++        // wolGradeDebug 1: the parameters of the frame twice a second (console and gx.log).
++        static std::chrono::steady_clock::time_point s_lastDebug;
++        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
++
++        if (now - s_lastDebug >= std::chrono::milliseconds(500)) {
++            s_lastDebug = now;
++            char line[240];
++            std::snprintf(line, sizeof(line), "WolPost grade: %s perm %u gain %.4f %.4f %.4f contrast %.4f lift %.4f %.4f %.4f sat %.4f invGamma %.4f", graded ? "on" : "OFF (no inputs)", permutation,
++                static_cast<double>(grade.gain[0]), static_cast<double>(grade.gain[1]), static_cast<double>(grade.gain[2]), static_cast<double>(grade.contrast),
++                static_cast<double>(grade.lift[0]), static_cast<double>(grade.lift[1]), static_cast<double>(grade.lift[2]), static_cast<double>(grade.saturation), static_cast<double>(grade.invGamma));
++            Say(line);
++        }
++    }
+ 
+     s_post.pass->SetPixelPermutation(permutation);
+ 
+@@ -269,7 +312,7 @@ void WolPost::Render() {
+ 
+     if (drawn) {
+         s_post.pass->SetViewport(static_cast<float>(x), static_cast<float>(y), static_cast<float>(width), static_cast<float>(height), windowWidth, windowHeight);
+-        s_post.pass->Draw(s_post.scene, permutation, s_settings.exposure, s_settings.saturation);
++        s_post.pass->Draw(s_post.scene, permutation, s_settings.exposure, s_settings.saturation, graded ? &grade : nullptr);
+         s_post.consecutiveFailures = 0;
+     } else if (++s_post.consecutiveFailures >= kMaxFailures) {
+         Disable("WolPost: the scene copy failed three frames in a row; wolAA and wolTonemap do nothing until the setting or the video mode changes.");
+diff --git a/Engine/Source/WolPost/WolPost.h b/Engine/Source/WolPost/WolPost.h
+index 41b28b7..89d2755 100644
+--- a/Engine/Source/WolPost/WolPost.h
++++ b/Engine/Source/WolPost/WolPost.h
+@@ -13,6 +13,8 @@ namespace WolPost {
+         int32_t tonemap = 0;        // wolTonemap 0-1: filmic tonemapping in linear light
+         float exposure = 1.0f;      // wolExposure 0.5-2.0
+         float saturation = 1.0f;    // wolSaturation 0.5-1.5
++        int32_t gradeDebug = 0;     // wolGradeDebug 0-1: 1 = the parameters of the grade to the console and gx.log every 0.5 s
++        float gradeStrength = 0.0f; // wolGradeStrength 0-1 (brief E4): 0 = no zone / time-of-day grading, the pass is exactly the E1 one
+     };
+ 
+     const Settings& GetSettings();
+@@ -20,14 +22,47 @@ namespace WolPost {
+     void SetTonemap(int32_t value);
+     void SetExposure(float value);
+     void SetSaturation(float value);
++    void SetGradeStrength(float value);
++    void SetGradeDebug(int32_t value);
+ 
+-    // True when Render() has something to draw (wolAA or wolTonemap above 0).
++    // Brief E4: what the zone / time-of-day grading reads each frame. Engine/ does not see DayNight, so the client (WoW/Source/WorldClient/WolPostWorld.cpp)
++    // installs a provider that fills this from DayNight::g_dnInfo.m_bands (the interpolated light bands of the zone and the hour, the same fields the
++    // fog reads). Colours are 0..255 sRGB.
++    struct GradeInputs {
++        float ambient[3];       // m_bands.m_ambient
++        float direct[3];        // m_bands.m_diffuse (sun or moon light)
++        float skyHigh[3];       // m_bands.m_skyColors[0]
++        float horizon[3];       // m_bands.m_skyColors[4]
++        float fog[3];           // final fog colour of the frame (DayNight::s_volFogSourceFog)
++        float fogEnd;           // m_bands.m_fogEnd, yards
++        float interior;         // m_interiorFogBlend 0..1 (inside a WMO)
++        bool underwater;        // the camera is in a liquid
++        uint32_t mapId;
++        float camPos[3];
++        float deltaSec;         // frame time
++    };
++    typedef bool (*GradeInputsProvider)(GradeInputs& out);
++    void SetGradeProvider(GradeInputsProvider provider);
++
++    // The grade as the shader takes it (identity: gain 1, lift 0, contrast 1, saturation 1, invGamma 1). See WolGrade.cpp for the model.
++    struct GradeParams {
++        float gain[3];
++        float contrast;
++        float lift[3];
++        float saturation;
++        float invGamma;
++    };
++
++    // Computes the grade of this frame (filtered in time, tau 1.5 s) for a strength in 0..1. Returns false (identity) when the strength is 0 or the provider fails.
++    bool ComputeGrade(float strength, GradeParams& out);
++
++    // True when Render() has something to draw (wolAA, wolTonemap or wolGradeStrength above 0).
+     bool Active();
+ 
+     // Draws the pass over the world viewport of CGWorldFrame::OnWorldRender, right after VolFog::Render() and before PlayerNameUpdateLate (so the 3D
+     // names and the interface, drawn afterwards, stay sharp and untouched). With wolAA 0 and wolTonemap 0 it returns at once: no scene copy, no draw,
+     // and the scene texture is released. Otherwise it copies the world viewport of the back buffer to a texture and draws one full-screen quad over
+-    // it with WolPost.bls (permutation wolAA * 2 + wolTonemap). Independent of wolVolFog.
++    // it with WolPost.bls (permutation wolAA * 2 + wolTonemap, plus 6 with the grade of brief E4). Independent of wolVolFog.
+     void Render();
+ }
+ 
+diff --git a/Shaders/WolPost/WolPost.cmake b/Shaders/WolPost/WolPost.cmake
+index e98319a..059657b 100644
+--- a/Shaders/WolPost/WolPost.cmake
++++ b/Shaders/WolPost/WolPost.cmake
+@@ -1,9 +1,12 @@
+ # Not in the original client (World of Legends): the post-processing shader of the native pass WolPost (wolAA, wolTonemap), brief E1.
+ # Included by Shaders/VolFog/CMakeLists.txt right before the patch-Z.MPQ command, so that it uses the same chain (volfog_shader: fxc ->
+ # Tools/VolFog/mkbls.py -> Tools/VolFog/mkmpq.py) and lands in the same MPQ. CMAKE_CURRENT_SOURCE_DIR is Shaders/VolFog here, hence the ../WolPost.
+-# WolPost.bls has six permutations, index = AA * 2 + TONEMAP (AA 0 off / 1 FXAA quality 12 / 2 FXAA high, TONEMAP 0 / 1); 0 is never drawn.
++# Brief E4: twelve permutations, index = AA * 2 + TONEMAP + 6 * GRADE (GRADE 0 / 1: zone grading, wolGradeStrength); the first six are the ones of E1. Before E4 it had six, index = AA * 2 + TONEMAP (AA 0 off / 1 FXAA quality 12 / 2 FXAA high, TONEMAP 0 / 1); 0 is never drawn.
+ # The vertex shader is the quad one of the fog (WolVolFogQuad, vf_fullscreen_vs.hlsl).
+ volfog_shader(WolPost ps ../WolPost/WolPost.hlsl PERMUTATIONS
+-    "AA=0,TONEMAP=0" "AA=0,TONEMAP=1"
+-    "AA=1,TONEMAP=0" "AA=1,TONEMAP=1"
+-    "AA=2,TONEMAP=0" "AA=2,TONEMAP=1")
++    "AA=0,TONEMAP=0,GRADE=0" "AA=0,TONEMAP=1,GRADE=0"
++    "AA=1,TONEMAP=0,GRADE=0" "AA=1,TONEMAP=1,GRADE=0"
++    "AA=2,TONEMAP=0,GRADE=0" "AA=2,TONEMAP=1,GRADE=0"
++    "AA=0,TONEMAP=0,GRADE=1" "AA=0,TONEMAP=1,GRADE=1"
++    "AA=1,TONEMAP=0,GRADE=1" "AA=1,TONEMAP=1,GRADE=1"
++    "AA=2,TONEMAP=0,GRADE=1" "AA=2,TONEMAP=1,GRADE=1")
+diff --git a/Shaders/WolPost/WolPost.hlsl b/Shaders/WolPost/WolPost.hlsl
+index efe74cf..d583b4a 100644
+--- a/Shaders/WolPost/WolPost.hlsl
++++ b/Shaders/WolPost/WolPost.hlsl
+@@ -14,12 +14,21 @@
+ #ifndef AA
+ #error AA must be 0, 1 or 2
+ #endif
++#ifndef GRADE
++#error GRADE must be 0 or 1
++#endif
++
+ #ifndef TONEMAP
+ #error TONEMAP must be 0 or 1
+ #endif
+ 
+ float4 cArea : register(c0); // xy origin of the copied area in the back buffer (pixels, from the top left), zw its size in pixels
+ float4 cLook : register(c1); // x exposure (0.5 - 2.0), y saturation (0.5 - 1.5), zw one texel of the copy (1 / width, 1 / height)
++#if GRADE == 1
++float4 cGradeA : register(c2); // xyz gain (tint of the lights), w contrast around 0.45
++float4 cGradeB : register(c3); // xyz lift (tint of the shadows), w saturation
++float4 cGradeC : register(c4); // x invGamma (above 1 it darkens a little: night)
++#endif
+ sampler2D sScene : register(s0);
+ 
+ float3 Fetch(float2 uv)
+@@ -191,6 +200,20 @@ float3 Tonemap(float3 rgb, float exposure, float saturation)
+ }
+ #endif
+ 
++#if GRADE == 1
++// Brief E4: zone / time-of-day grade, in gamma space after the tonemap. The constants come from WolGrade.cpp (derived every frame from the DayNight bands)
++// and already contain the strength: they are 1 + k * delta (gain, contrast, saturation, invGamma) and k * delta (lift), so strength 0 would be the
++// identity (the CPU does not even choose this permutation then, which keeps the pass byte for byte the one of E1).
++float3 Grade(float3 c)
++{
++    float3 x = saturate(c * cGradeA.xyz + cGradeB.xyz * (1.0 - c));
++    x = pow(x, cGradeC.x);
++    x = saturate((x - 0.45) * cGradeA.w + 0.45);
++    float luminance = dot(x, float3(0.2126, 0.7152, 0.0722));
++    return saturate(lerp(luminance.xxx, x, cGradeB.w));
++}
++#endif
++
+ float4 main(float2 pixel : VPOS) : COLOR0
+ {
+     float2 uv = (pixel + 0.5 - cArea.xy) / cArea.zw;
+@@ -201,6 +224,9 @@ float4 main(float2 pixel : VPOS) : COLOR0
+ #endif
+ #if TONEMAP == 1
+     rgb = Tonemap(rgb, cLook.x, cLook.y);
++#endif
++#if GRADE == 1
++    rgb = Grade(rgb);
+ #endif
+     return float4(rgb, 1.0);
+ }
+diff --git a/b/WoW/Source/WorldClient/WolPostWorld.cpp b/WoW/Source/WorldClient/WolPostWorld.cpp
+new file mode 100644
+index 0000000..dcbac0c
+--- /dev/null
++++ b/WoW/Source/WorldClient/WolPostWorld.cpp
+@@ -0,0 +1,53 @@
++#include "WoW/Source/WorldClient/WolPostWorld.h"
++
++#include "Engine/Source/WolPost/WolPost.h"
++#include "WoW/Source/UIUtil/Camera.h"
++#include "WoW/Source/Ui/WorldFrame.h"
++#include "WoW/Source/WorldClient/DayNight.h"
++#include "WoW/Source/WorldClient/DayNight__DNInfo.h"
++#include "WoW/Source/WorldClient/World.h"
++
++// Not in the original client (World of Legends): the zone / time-of-day grade of the native post pass (wolGradeStrength), brief E4.
++// Licensed under GPL-3.0-only. Reads the same DayNight fields as VolFogWorld.cpp: DNInfo::m_bands (already interpolated by DayNight for the hour and
++// the position), the final fog colour kept by UpdateFog (DayNight::s_volFogSourceFog) and the liquid state of the camera. WolPost::ComputeGrade calls it
++// every frame the grade is on, whether or not wolVolFog is.
++
++namespace {
++    void Rgb(const CImVector& color, float* out) {
++        out[0] = static_cast<float>(color.r);
++        out[1] = static_cast<float>(color.g);
++        out[2] = static_cast<float>(color.b);
++    }
++
++    bool ReadGradeInputs(WolPost::GradeInputs& out) {
++        CGCamera* camera = CGWorldFrame::GetActiveCamera();
++
++        if (!camera) {
++            return false;
++        }
++
++        const DayNight::DNInfo& info = DayNight::g_dnInfo;
++
++        Rgb(info.m_bands.m_ambient, out.ambient);
++        Rgb(info.m_bands.m_diffuse, out.direct);
++        Rgb(info.m_bands.m_skyColors[0], out.skyHigh);
++        Rgb(info.m_bands.m_skyColors[4], out.horizon);
++        Rgb(DayNight::s_volFogSourceFog.m_color, out.fog);
++        out.fogEnd = info.m_bands.m_fogEnd;
++        out.interior = info.m_interiorFogBlend;
++
++        float liquidDepth = 0.0f;
++        out.underwater = World::SceneCamLiquidStatus(&liquidDepth) != 0;
++        out.mapId = World::QueryMapId();
++        out.camPos[0] = camera->m_position.x;
++        out.camPos[1] = camera->m_position.y;
++        out.camPos[2] = camera->m_position.z;
++        out.deltaSec = info.m_deltaSec;
++
++        return true;
++    }
++}
++
++void WolPostWorld::Install() {
++    WolPost::SetGradeProvider(ReadGradeInputs);
++}
+diff --git a/b/WoW/Source/WorldClient/WolPostWorld.h b/WoW/Source/WorldClient/WolPostWorld.h
+new file mode 100644
+index 0000000..8ca9687
+--- /dev/null
++++ b/WoW/Source/WorldClient/WolPostWorld.h
+@@ -0,0 +1,12 @@
++#ifndef WOW_SOURCE_WORLDCLIENT_WOLPOSTWORLD_H
++#define WOW_SOURCE_WORLDCLIENT_WOLPOSTWORLD_H
++
++// Not in the original client (World of Legends): the reader of DayNight for the zone grading of the native post pass (wolGradeStrength), brief E4.
++// Licensed under GPL-3.0-only.
++
++namespace WolPostWorld {
++    // Installs WolPost::SetGradeProvider, so that Engine/Source/WolPost does not depend on WoW/. Called by CWorldParam::RegisterVolFogCVars.
++    void Install();
++}
++
++#endif
+diff --git a/WoW/Source/WorldClient/WorldParam.h b/WoW/Source/WorldClient/WorldParam.h
+index cd7e5d4..36a3d40 100644
+--- a/WoW/Source/WorldClient/WorldParam.h
++++ b/WoW/Source/WorldClient/WorldParam.h
+@@ -58,6 +58,8 @@ class CWorldParam {
+     static CVar* cvar_wolTonemap;
+     static CVar* cvar_wolExposure;
+     static CVar* cvar_wolSaturation;
++    static CVar* cvar_wolGradeStrength; // Not in the original client (brief E4)
++    static CVar* cvar_wolGradeDebug;
+     // Not in the original client (World of Legends): native ambient occlusion (brief E2), see patches-cliente/ao-nativo/README-ao.md.
+     static CVar* cvar_wolAO;
+     static CVar* cvar_wolAORadius;
+@@ -114,6 +116,9 @@ class CWorldParam {
+     static bool WolTonemapCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolExposureCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolSaturationCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    // Not in the original client (brief E4): zone / time-of-day grading strength, applied at once.
++    static bool WolGradeStrengthCallback(CVar* var, const char* oldValue, const char* value, void* arg);
++    static bool WolGradeDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     // Not in the original client (brief E2): wolAO arms the readable INTZ depth like wolVolFog (a gxRestart when it was not armed); the rest apply at once.
+     static bool WolAOCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+     static bool WolAORadiusCallback(CVar* var, const char* oldValue, const char* value, void* arg);
+diff --git a/WoW/Source/WorldClient/WorldParam_CVar.cpp b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+index cfc158e..60bff42 100644
+--- a/WoW/Source/WorldClient/WorldParam_CVar.cpp
++++ b/WoW/Source/WorldClient/WorldParam_CVar.cpp
+@@ -11,6 +11,7 @@
+ #include "Engine/Source/WolPost/WolPost.h" // Not in the original client (World of Legends)
+ #include "Engine/Source/WolAO/WolAO.h" // Not in the original client (World of Legends)
+ #include "WoW/Source/WorldClient/VolFogWorld.h" // Not in the original client (World of Legends)
++#include "WoW/Source/WorldClient/WolPostWorld.h" // Not in the original client (World of Legends)
+ #include "WoW/Common/AaBsp.h"
+ #include "WoW/Source/UIUtil/PortraitButton.h"
+ #include "WoW/Source/WorldClient/Map.h"
+@@ -138,6 +139,8 @@ CVar* CWorldParam::cvar_wolAA;
+ CVar* CWorldParam::cvar_wolTonemap;
+ CVar* CWorldParam::cvar_wolExposure;
+ CVar* CWorldParam::cvar_wolSaturation;
++CVar* CWorldParam::cvar_wolGradeStrength;
++CVar* CWorldParam::cvar_wolGradeDebug;
+ 
+ // Not in the original client (World of Legends): native ambient occlusion, brief E2.
+ CVar* CWorldParam::cvar_wolAO;
+@@ -1087,6 +1090,47 @@ bool CWorldParam::WolSaturationCallback(CVar* var, const char* oldValue, const c
+     return true;
+ }
+ 
++// Not in the original client (brief E4). wolGradeStrength 0-1 (default 0): colour grading of the post pass from the DayNight bands of the zone and the hour
++// (WolGrade.cpp); 0 is exactly the pass of E1. Read every frame (WolPost::Render), applied at once.
++bool CWorldParam::WolGradeStrengthCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    float strength = 0.0f;
++
++    if (!WolVolFogParseFloat(value, strength) || strength < 0.0f || strength > 1.0f) {
++        ConsoleWrite("wolGradeStrength must be in range 0.0 to 1.0.", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    WolPost::SetGradeStrength(strength);
++
++    if (oldValue && *oldValue) {
++        char buffer[128];
++
++        if (strength > 0.0f) {
++            SStrPrintf(buffer, sizeof(buffer), "wolGradeStrength: %.2f (zone and time-of-day grading from the DayNight light bands)", static_cast<double>(strength));
++        } else {
++            SStrPrintf(buffer, sizeof(buffer), "wolGradeStrength: 0 (off, the picture is the one of the post pass without grading)");
++        }
++
++        ConsoleWrite(buffer, DEFAULT_COLOR);
++    }
++
++    return true;
++}
++
++// Not in the original client (brief E4). wolGradeDebug 0-1 (default 0): 1 writes the parameters of the grade to the console and gx.log every 0.5 s (only while wolGradeStrength > 0).
++bool CWorldParam::WolGradeDebugCallback(CVar* var, const char* oldValue, const char* value, void* arg) {
++    if (!value || value[0] < '0' || value[0] > '1' || value[1] != '\0') {
++        ConsoleWrite("wolGradeDebug must be 0 (off) or 1 (log the grade parameters twice a second).", DEFAULT_COLOR);
++
++        return false;
++    }
++
++    WolPost::SetGradeDebug(value[0] - '0');
++
++    return true;
++}
++
+ // Not in the original client (brief E2). wolAO 0-2 (default 0): 0 off, 1 ambient occlusion at half resolution with 4 steps per direction, 2 with 6 steps and a
+ // wider blur. Above 0 it arms the readable INTZ depth like wolVolFog does (and drops MSAA, or keeps it with the RESZ copy under DXVK): turning it on or off
+ // for the first time needs a gxRestart, which the message says. Read every frame (WolAO::RenderMid / RenderLate).
+@@ -1204,6 +1248,8 @@ void CWorldParam::RegisterVolFogCVars() {
+     CWorldParam::cvar_wolTonemap = CVar::Register("wolTonemap", "Native filmic tonemapping in linear light (0 off, 1 on)", 1, "0", CWorldParam::WolTonemapCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolExposure = CVar::Register("wolExposure", "Tonemapping exposure (0.5 to 2.0), needs wolTonemap 1", 1, "1.0", CWorldParam::WolExposureCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     CWorldParam::cvar_wolSaturation = CVar::Register("wolSaturation", "Tonemapping saturation (0.5 to 1.5), needs wolTonemap 1", 1, "1.0", CWorldParam::WolSaturationCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolGradeStrength = CVar::Register("wolGradeStrength", "Zone and time-of-day colour grading (0.0 off to 1.0), from the DayNight light bands", 1, "0.0", CWorldParam::WolGradeStrengthCallback, CATEGORY_GRAPHICS, false, nullptr, false);
++    CWorldParam::cvar_wolGradeDebug = CVar::Register("wolGradeDebug", "Zone grading debug (0 off, 1 log the grade parameters twice a second)", 1, "0", CWorldParam::WolGradeDebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Not in the original client (brief E2): native ambient occlusion, saved in Config.wtf. Registered here, before the Gx device exists, so a saved
+     // wolAO > 0 arms the INTZ depth for the first device (no gxRestart needed at start-up), exactly like wolVolFog.
+     CWorldParam::cvar_wolAO = CVar::Register("wolAO", "Native ambient occlusion (0 off, 1 half resolution 4 steps, 2 half resolution 6 steps and wider blur); needs gxRestart to turn on or off", 1, "0", CWorldParam::WolAOCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+@@ -1212,6 +1258,8 @@ void CWorldParam::RegisterVolFogCVars() {
+     CWorldParam::cvar_wolAODebug = CVar::Register("wolAODebug", "Ambient occlusion debug view (0 off, 1 AO in grey, 2 linear depth, 3 normals, 4 raw AO)", 1, "0", CWorldParam::WolAODebugCallback, CATEGORY_GRAPHICS, false, nullptr, false);
+     // Brief B5: the reader of the frame inputs for the fog model (Engine/ does not depend on WoW/).
+     VolFogWorld::Install();
++    // Brief E4: the reader of the DayNight bands for the grade of the post pass.
++    WolPostWorld::Install();
+ }
+ 
+ // VERIFY: 9acf82a1 auto

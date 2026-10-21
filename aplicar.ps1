@@ -1,7 +1,7 @@
 <#
  aplicar.ps1 - applies the wol-volfog patches (volumetric fog and light shafts for the wowdecomp client) in order.
 
- usage:  .\aplicar.ps1 -Destino C:\path\to\wowdecomp                 all the patches of .\patches with "git apply", in order
+ usage:  .\aplicar.ps1 -Destino C:\path\to\wowdecomp                 all the patches (.\patches and .\patches\propios, 26 in total) with "git apply", in order
          .\aplicar.ps1 -Destino C:\path\to\wowdecomp -Consolidado    copy the module folders and apply cambios-cliente.diff with --reject
          .\aplicar.ps1 -Destino C:\path\to\wowdecomp -Revertir       "git apply -R" of all the patches, in reverse order
          add -Comprobar to only check (git apply --check): in the default mode only the first patch can be checked, because
@@ -26,7 +26,10 @@ $Orden = @(
     '00a-recordar-contrasena.patch', '00b-topes-2008.patch', '00c-sombras-4096.patch', '00d-ui-depth.patch', '00e-sin-consola.patch',
     '01-B1-formatos.patch', '02-B2-shaders-pase.patch', '03-B3-depth-intz.patch', '04-B3b-correcciones.patch',
     '05-B4B5-cvars-modelo.patch', '06-B6-marcha-composicion.patch', '07-B7-temporal.patch', '08-B6b-correcciones.patch',
-    '09-B8-luces.patch', '10-B9-haces.patch', '11-B10-interiores-ajustes.patch', '12-B13-msaa-resz.patch', '13-B13b-correcciones.patch'
+    '09-B8-luces.patch', '10-B9-haces.patch', '11-B10-interiores-ajustes.patch', '12-B13-msaa-resz.patch', '13-B13b-correcciones.patch',
+    # Cambios propios del cliente de World of Legends (carpeta patches\propios; 00e-sin-consola ya es la "sin-consola" de esa carpeta):
+    'propios\00f-filelog.patch', 'propios\E1-post-fxaa-tonemap.patch', 'propios\hd-cache.patch', 'propios\E3-sombras-pcf.patch',
+    'propios\E2-hbao.patch', 'propios\E2b-hbao-correccion.patch', 'propios\E4-gradacion-zona.patch', 'propios\cliente64.patch'
 )
 $Carpetas = @('Engine\Source\VolFog', 'Shaders\VolFog', 'Tools\VolFog')
 $Ficheros = @('WoW\Source\WorldClient\VolFogWorld.h', 'WoW\Source\WorldClient\VolFogWorld.cpp')
@@ -104,5 +107,5 @@ foreach ($p in $Orden) {
     }
     $hechos += $p
 }
-Write-Host 'all patches applied; now: cmake -S . -B build/x64 -G "Visual Studio 17 2022" -A x64 -DWOWDECOMP_DISABLE_SIGNATURE_CHECKS=ON'
+Write-Host 'all 26 patches applied; now: cmake -S . -B build/x64 -G "Visual Studio 17 2022" -A x64 -DWOWDECOMP_DISABLE_SIGNATURE_CHECKS=ON'
 exit 0

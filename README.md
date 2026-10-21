@@ -35,6 +35,7 @@ defecto; con 0 la imagen es la del cliente sin el módulo). Licencia: **GPL-3.0-
 ```
 LICENSE, NOTICE, README.md, aplicar.ps1, .gitattributes
 patches/                      18 parches en el orden de aplicación (00a-00e prerrequisitos WoL, 01-B1 ... 12-B13, 13-B13b)
+                              (`aplicar.ps1` aplica en total 26 parches: estos 18 y los 8 de patches/propios, 00f-filelog ... cliente64)
 patches/propios/              los demás cambios propios del cliente de la «noche de gráficos» (post-proceso FXAA y tonemapping, sombras suaves, caché de texturas HD, oclusión ambiental experimental, carpeta Data\WoL64), GPL-3.0-only: orden y licencias en README-propios.md
 cambios-cliente.diff          lo que los parches cambian FUERA del módulo (16 ficheros), en un solo diff
 Engine/Source/VolFog/         el módulo C++ (pase de niebla, modelo, luces, haces, entradas, volcado, textura INTZ)
@@ -60,7 +61,7 @@ Requisitos: Windows, Visual Studio 2022 (x64), CMake, Git, **Windows SDK** (para
    `02-B2` sobre un wowdecomp sin tocar (y se deshace sola): en ese caso usa `-Consolidado`.
 2. Aplica el módulo, de una de las dos formas:
    ```powershell
-   .\aplicar.ps1 -Destino C:\ruta\wowdecomp                 # los 11 parches en orden (git apply); si uno falla, deshace los anteriores
+   .\aplicar.ps1 -Destino C:\ruta\wowdecomp                 # los 26 parches en orden (18 de patches/ + 8 de patches/propios; git apply); si uno falla, deshace los anteriores
    .\aplicar.ps1 -Destino C:\ruta\wowdecomp -Consolidado    # copia el módulo y aplica cambios-cliente.diff con --reject (para un árbol distinto)
    .\aplicar.ps1 -Destino C:\ruta\wowdecomp -Revertir       # deshace los 11 en orden inverso (git apply -R)
    ```
